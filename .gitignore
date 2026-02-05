@@ -57,3 +57,4 @@ dkms.conf
 local.properties
 .idea/
 manager_app/
+.DS_Store

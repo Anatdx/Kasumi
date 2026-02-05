@@ -5,7 +5,6 @@ env:
   FEIL: gki
   ANDROID_VERSION: android16
   KERNEL_VERSION: 6.12
-  KPM: On
   proxy: On
   APPLY_HYMOFS: On
   APPLY_ADIOS: On
@@ -94,44 +93,6 @@ jobs:
 
           echo "✅ 内核配置完成"
 
-      # ====================== 内核定制阶段 ======================
-      - name: "⚡ Setup SukiSU Ultra"
-        run: |
-          cd kernel_workspace/kernel_platform
-
-          # 下载并执行设置脚本
-          echo "🛠️ 正在设置SukiSU Ultra..."
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/builtin/kernel/setup.sh" | bash -s tmp-builtin
-
-          echo "✅ SukiSU Ultra配置完成"
-          
-      - name: "🔧 Setup SUSFS | 配置 SUSFS"
-        run: |
-          cd kernel_workspace
-
-          echo "⬇️ 克隆所需补丁..."
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-          cd kernel_platform
-          echo "📝 复制补丁文件..."
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
-          cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
-          cd common
-          echo "📦 应用SUSFS补丁..."
-          patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-
-          echo "✅ 所有补丁应用完成"
-
-      - name: "⚙️ Apply Fixes"
-        run: |
-          ls
-          cd kernel_workspace/kernel_platform/common
-          
-          patch -p1 --forward < ${{ github.workspace }}/patch/sukisu_fix.patch || true
-          patch -p1 --forward < ${{ github.workspace }}/patch/unicode_bypass_fix.patch || true
-
-          echo "  [*] Fixed applied!"
-
       - name: "⚙️ Apply ADIOS Patch | 应用 ADIOS 补丁"
         if: ${{ env.APPLY_ADIOS == 'On' }}
         run: |
@@ -146,41 +107,27 @@ jobs:
         if: ${{ env.APPLY_HYMOFS == 'On' }}
         run: |
           cd kernel_workspace/kernel_platform/common
-
-          patch -p1 -F 3 < ${{ github.workspace }}/patch/hymofs_with_susfs.patch
-
+          patch -p1 -F 3 < ${{ github.workspace }}/patch/hymofs.patch
           echo "  [*] HymoFS 代码注入完成！"
-          
           
       - name: "⚙️ Configure Kernel Options | 配置内核选项"
         run: |
           cd kernel_workspace/kernel_platform
 
           echo "⚙️ 正在配置内核编译选项..."
-          
-          echo "📦 启用 KSU 支持..."
-          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
-          
-          if [ "${{ env.KPM }}" == "On" ]; then
-            echo "📦 启用 KPM..."
-            echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
-          fi
 
           if [ "${{ env.APPLY_HYMOFS }}" = "On" ]; then
             echo "CONFIG_HYMOFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_REVERSE_LOOKUP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_FORWARD_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_HIDE_ENTRIES=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_INJECT_ENTRIES=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_STAT_SPOOF=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_XATTR_FILTER=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_UNAME_SPOOF=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_CMDLINE_SPOOF=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HYMOFS_DEBUG=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
-          
-          echo "📦 启用 SUSFS 功能..."
-          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
 
           echo "📦 添加对 Mountify (backslashxx/mountify) 模块的支持"
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -237,19 +184,6 @@ jobs:
           tools/bazel run //common:kernel_aarch64_dist
           
           echo "✅ 内核编译完成"
-         
-      - name: "🧩 Patch Kernel Image (KPM) | KPM修补镜像"
-        if: ${{ env.KPM == 'On' }}
-        run: |
-          echo "🔧 正在应用KPM补丁..."
-          cd kernel_workspace/kernel_platform/out/kernel_aarch64/dist
-          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.2/patch_linux
-          chmod +x patch_linux
-          ./patch_linux
-          rm -f Image
-          mv oImage Image
-          cp Image $GITHUB_WORKSPACE/AnyKernel3/Image
-          echo "✅ KPM补丁应用完成"
 
       - name: "🧠 Set Artifact Name | 设置产物名称"
         id: set_name
