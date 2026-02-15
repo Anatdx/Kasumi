@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
+/*
+ * HymoFS - kernel path manipulation and hiding (in-tree / patch variant).
+ *
+ * License: Author's work under Apache-2.0; when built into or linked with
+ * the Linux kernel, GPL-2.0 applies for kernel compatibility.
+ */
+
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/file.h>
