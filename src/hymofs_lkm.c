@@ -663,17 +663,13 @@ static char * __maybe_unused hymofs_resolve_target(const char *pathname)
 
 	rcu_read_unlock();
 
-	/* Validate merge target exists */
-	if (target) {
-		struct path p;
-		if (hymo_kern_path(target, LOOKUP_FOLLOW, &p) == 0) {
-			path_put(&p);
-		} else {
-			kfree(target);
-			target = NULL;
-		}
-	}
-
+	/*
+	 * Skip kern_path validation here: this function is only called from
+	 * hymo_kp_getname_flags_pre (kprobe handler), which runs in atomic
+	 * context. kern_path -> d_alloc_parallel can sleep, causing
+	 * "BUG: scheduling while atomic". If the target does not exist, the
+	 * subsequent syscall will fail with -ENOENT.
+	 */
 	return target;
 }
 
