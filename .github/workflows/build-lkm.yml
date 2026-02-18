@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 使用 workflow_dispatch API 显式触发 build.yml，并传入 HymoFS 的 commit 信息供 TG 详情展示
-      - name: Trigger hymo workflow_dispatch
+      - name: Trigger hymo repository_dispatch
         env:
           HYMO_REPO: Anatdx/hymo
           HYMO_TRIGGER_TOKEN: ${{ secrets.HYMO_TRIGGER_TOKEN }}
@@ -67,15 +67,15 @@ jobs:
             echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
             exit 0
           fi
-          echo "Triggering $HYMO_REPO workflow build.yml (hymo ref=$HYMO_REF, hymofs ref=$HYMOFS_REF, sha=$HYMOFS_SHA)"
+          echo "Triggering $HYMO_REPO repository_dispatch build-lkm (hymofs ref=$HYMOFS_REF, sha=$HYMOFS_SHA)"
           payload=$(jq -n \
             --arg ref "$HYMO_REF" \
             --arg ref_name "$HYMOFS_REF" \
             --arg sha "$HYMOFS_SHA" \
             --arg msg "$HYMOFS_MSG" \
             --arg run_id "${GITHUB_RUN_ID}" \
-            '{ref: $ref, inputs: {hymofs_ref: $ref_name, hymofs_sha: $sha, hymofs_commit_message: $msg, hymofs_run_id: $run_id}}')
-          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
+            '{event_type: "build-lkm", client_payload: {ref: $ref, hymofs_ref: $ref_name, hymofs_sha: $sha, hymofs_commit_message: $msg, hymofs_run_id: $run_id}}')
+          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/dispatches" \
             -H "Authorization: token ${HYMO_TRIGGER_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/json" \
