@@ -1210,16 +1210,17 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		if (parent_dir)
 			hymofs_add_inject_rule(parent_dir);
-		if (src_inode) {
-			hymofs_mark_inode_hidden(src_inode);
+		/*
+		 * ADD_RULE: do NOT hide the source inode. The LKM has no inject
+		 * implementation (unlike the patch's hymofs_inject_entries).
+		 * Hiding would remove the entry from dir listing, making it
+		 * impossible to navigate to the redirected path. Keep it visible
+		 * so users see e.g. /system/app; open() will redirect via getname_flags.
+		 */
+		if (src_inode)
 			iput(src_inode);
-		}
-		if (parent_inode) {
-			if (parent_inode->i_mapping)
-				set_bit(AS_FLAGS_HYMO_DIR_HAS_HIDDEN,
-					&parent_inode->i_mapping->flags);
+		if (parent_inode)
 			iput(parent_inode);
-		}
 
 		spin_lock(&hymo_cfg_lock);
 		hymofs_enabled = true;
