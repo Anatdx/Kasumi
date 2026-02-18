@@ -77,6 +77,11 @@ static atomic_t hymo_hide_count = ATOMIC_INIT(0);
 static DEFINE_PER_CPU(unsigned int, hymo_kprobe_reent);
 static DEFINE_PER_CPU(char[HYMO_PATH_BUF], hymo_getname_path_buf);
 
+/* When non-zero, current->tgid is in hymofs ioctl (path resolution). Skip VFS hooks
+ * for that task to avoid re-entrancy / deadlock (e.g. metamount shell + hymod mount).
+ */
+static atomic_long_t hymo_ioctl_tgid = ATOMIC_LONG_INIT(0);
+
 /* Per-CPU for vfs_getattr kretprobe: save path and kstat at entry. */
 static DEFINE_PER_CPU(const struct path *, hymo_vfs_getattr_path);
 static DEFINE_PER_CPU(struct kstat *, hymo_vfs_getattr_stat);
@@ -1399,6 +1404,9 @@ del_done:
 static long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
+	long ret;
+
+	atomic_long_set(&hymo_ioctl_tgid, (long)task_tgid_vnr(current));
 	switch (cmd) {
 	case HYMO_IOC_GET_VERSION:
 	case HYMO_IOC_SET_ENABLED:
@@ -1414,10 +1422,14 @@ static long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
 	case HYMO_IOC_ADD_MERGE_RULE:
 	case HYMO_IOC_SET_MIRROR_PATH:
 	case HYMO_IOC_SET_UNAME:
-		return hymo_dispatch_cmd(cmd, (void __user *)arg);
+		ret = hymo_dispatch_cmd(cmd, (void __user *)arg);
+		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
+		break;
 	}
+	atomic_long_set(&hymo_ioctl_tgid, 0);
+	return ret;
 }
 
 /* ======================================================================
@@ -1809,6 +1821,9 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 
 	if (this_cpu_read(hymo_kprobe_reent))
 		return 0;
+	/* Skip when current is in ioctl path resolution (avoids reent / deadlock with metamount+hymod). */
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
 	filename_user = (const char __user *)HYMO_REG0(regs);
 	if (!filename_user)
 		return 0;
@@ -1858,6 +1873,8 @@ out:
 static int hymo_kp_vfs_getattr_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	(void)p;
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
 	this_cpu_write(hymo_vfs_getattr_path, (const struct path *)HYMO_REG0(regs));
 	this_cpu_write(hymo_vfs_getattr_stat, (struct kstat *)HYMO_REG1(regs));
 	return 0;
@@ -1896,6 +1913,8 @@ static int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_reg
 static int hymo_kp_d_path_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	(void)p;
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
 	this_cpu_write(hymo_d_path_buf, (char *)HYMO_REG1(regs));
 	this_cpu_write(hymo_d_path_bufsize, (int)HYMO_REG2(regs));
 	return 0;
@@ -1950,6 +1969,8 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	(void)p;
 	this_cpu_write(hymo_iterate_did_swap, 0);
 
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
 	if (!READ_ONCE(hymofs_enabled))
 		return 0;
 	if (uid_eq(current_uid(), GLOBAL_ROOT_UID))
