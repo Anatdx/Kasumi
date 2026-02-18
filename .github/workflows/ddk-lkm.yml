@@ -46,9 +46,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git make clang lld llvm \
+            git make clang lld llvm gcc \
             flex bison bc rsync cpio \
-            libelf-dev libssl-dev libdwarf-dev pahole zip
+            libelf-dev libssl-dev libdw-dev pahole zip
 
       - name: Fetch kernel tree
         run: |
@@ -86,17 +86,29 @@ jobs:
             exit 1
           fi
 
-          echo "Preparing kernel tree..."
-          make -C "$KERNEL_SRC" ARCH=arm64 LLVM=1 gki_defconfig || \
-            make -C "$KERNEL_SRC" ARCH=arm64 LLVM=1 defconfig
-          make -C "$KERNEL_SRC" ARCH=arm64 LLVM=1 modules_prepare
+          # 5.10: ubuntu clang has arm64 "sp" register issues; use GCC
+          if [[ "$KMI" == android12-5.10 ]] || [[ "$KMI" == android13-5.10 ]]; then
+            LLVM_ARGS=""
+          else
+            LLVM_ARGS="LLVM=1 LLVM_IAS=1"
+          fi
+
+          echo "Preparing kernel tree (KMI=$KMI, LLVM=$([ -n \"$LLVM_ARGS\" ] && echo 1 || echo 0))..."
+          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS gki_defconfig 2>/dev/null || \
+            make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS defconfig
+          # 6.12: disable gendwarfksyms to avoid dwarf.h dependency
+          if [[ "$KMI" == *"6.12"* ]] && [ -f "$KERNEL_SRC/scripts/config" ]; then
+            $KERNEL_SRC/scripts/config --file "$KERNEL_SRC/.config" -d GENDWARFKSYMS 2>/dev/null || true
+            make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS olddefconfig 2>/dev/null || true
+          fi
+          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS modules_prepare
 
           VERSION="${{ steps.parse_version.outputs.VERSION }}"
           echo "Building hymofs_lkm.ko (v0.1.${VERSION})..."
-          make -C "$KERNEL_SRC" ARCH=arm64 LLVM=1 M="$SRC" KBUILD_MODPOST_WARN=1 \
+          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS M="$SRC" KBUILD_MODPOST_WARN=1 \
             CFLAGS_MODULE="-DHYMOFS_VERSION=\\\"0.1.${VERSION}\\\"" modules
           ls -la "$SRC"/hymofs_lkm.ko
-          llvm-strip -d "$SRC"/hymofs_lkm.ko
+          llvm-strip -d "$SRC"/hymofs_lkm.ko 2>/dev/null || true
 
       - name: Prepare .ko artifact
         run: |
