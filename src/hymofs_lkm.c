@@ -39,11 +39,6 @@
 #include <linux/percpu.h>
 #include <linux/version.h>
 #include <linux/utsname.h>
-#include <linux/nsproxy.h>
-#include <linux/mnt_namespace.h>
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
-#include <linux/rbtree.h>
-#endif
 
 #include "hymofs_lkm.h"
 
@@ -831,107 +826,6 @@ static bool __maybe_unused hymofs_should_replace(const char *pathname)
 }
 
 /* ======================================================================
- * Part 14b: REORDER_MNT_ID and spoof_mounts (internal mount structures)
- * ====================================================================== */
-
-static void hymo_reorder_mnt_id_impl(void)
-{
-	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
-	struct mount *m;
-	int id = 1;
-	bool is_hymo_mount;
-
-	if (!ns)
-		return;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
-	{
-		struct mount *n;
-		if (ns->mounts.rb_node) {
-			struct rb_node *first_node = rb_first(&ns->mounts);
-			if (first_node) {
-				struct mount *first = rb_entry(first_node, struct mount, mnt_node);
-				if (first->mnt_id < 500000)
-					id = first->mnt_id;
-			}
-		}
-		rbtree_postorder_for_each_entry_safe(m, n, &ns->mounts, mnt_node) {
-#else
-	if (!list_empty(&ns->list)) {
-		struct mount *first = list_first_entry(&ns->list, struct mount, mnt_list);
-		if (first->mnt_id < 500000)
-			id = first->mnt_id;
-	}
-	list_for_each_entry(m, &ns->list, mnt_list) {
-#endif
-		is_hymo_mount = false;
-		if (m->mnt_devname && (
-		    strcmp(m->mnt_devname, hymo_current_mirror_path) == 0 ||
-		    strcmp(m->mnt_devname, hymo_current_mirror_name) == 0))
-			is_hymo_mount = true;
-
-		if (is_hymo_mount && hymo_stealth_enabled) {
-			if (m->mnt_id < 500000)
-				WRITE_ONCE(m->mnt_id, 500000 + (id % 1000));
-		} else {
-			if (m->mnt_id >= 500000)
-				continue;
-			WRITE_ONCE(m->mnt_id, id++);
-		}
-	}
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
-	}
-#endif
-}
-
-static void hymo_spoof_mounts_impl(void)
-{
-	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
-	struct mount *m;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
-	struct mount *n;
-#endif
-	char *system_devname = NULL;
-	struct path sys_path;
-
-	if (!ns || !hymo_stealth_enabled)
-		return;
-
-	if (kern_path("/system", LOOKUP_FOLLOW, &sys_path) == 0) {
-		struct mount *sys_mnt = real_mount(sys_path.mnt);
-		if (sys_mnt && sys_mnt->mnt_devname)
-			system_devname = kstrdup(sys_mnt->mnt_devname, GFP_KERNEL);
-		path_put(&sys_path);
-	}
-	if (!system_devname && kern_path("/", LOOKUP_FOLLOW, &sys_path) == 0) {
-		struct mount *sys_mnt = real_mount(sys_path.mnt);
-		if (sys_mnt && sys_mnt->mnt_devname)
-			system_devname = kstrdup(sys_mnt->mnt_devname, GFP_KERNEL);
-		path_put(&sys_path);
-	}
-	if (!system_devname)
-		return;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
-	rbtree_postorder_for_each_entry_safe(m, n, &ns->mounts, mnt_node) {
-#else
-	list_for_each_entry(m, &ns->list, mnt_list) {
-#endif
-		if (m->mnt_devname && (
-		    strcmp(m->mnt_devname, hymo_current_mirror_path) == 0 ||
-		    strcmp(m->mnt_devname, hymo_current_mirror_name) == 0)) {
-			const char *old_name = m->mnt_devname;
-			m->mnt_devname = kstrdup(system_devname, GFP_KERNEL);
-			if (m->mnt_devname)
-				kfree_const(old_name);
-			else
-				m->mnt_devname = old_name;
-		}
-	}
-	kfree(system_devname);
-}
-
-/* ======================================================================
  * Part 15: Dispatch Handler (ioctl only; all commands use HYMO_IOC_* from hymo_magic.h)
  * GET_FD is syscall-only -> hymofs_get_anon_fd()
  * ====================================================================== */
@@ -1007,9 +901,8 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == HYMO_IOC_REORDER_MNT_ID) {
-		hymo_spoof_mounts_impl();
-		hymo_reorder_mnt_id_impl();
-		return 0;
+		/* struct mnt_namespace/mount not exposed to LKM; only KPM (built-in) supports this */
+		return -EOPNOTSUPP;
 	}
 
 	if (cmd == HYMO_IOC_LIST_RULES) {
