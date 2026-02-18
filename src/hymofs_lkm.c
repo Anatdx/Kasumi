@@ -38,6 +38,12 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/version.h>
+#include <linux/utsname.h>
+#include <linux/nsproxy.h>
+#include <linux/mnt_namespace.h>
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+#include <linux/rbtree.h>
+#endif
 
 #include "hymofs_lkm.h"
 
@@ -166,6 +172,11 @@ static char hymo_mirror_path_buf[PATH_MAX] = HYMO_DEFAULT_MIRROR_PATH;
 static char hymo_mirror_name_buf[NAME_MAX] = HYMO_DEFAULT_MIRROR_NAME;
 static char *hymo_current_mirror_path = hymo_mirror_path_buf;
 static char *hymo_current_mirror_name = hymo_mirror_name_buf;
+
+/* uname spoofing: storage and lock */
+static struct hymo_spoof_uname hymo_spoof_uname_store;
+static DEFINE_SPINLOCK(hymo_uname_lock);
+static bool hymo_uname_spoof_active;
 
 static pid_t hymo_daemon_pid;
 static DEFINE_SPINLOCK(hymo_daemon_lock);
@@ -820,6 +831,107 @@ static bool __maybe_unused hymofs_should_replace(const char *pathname)
 }
 
 /* ======================================================================
+ * Part 14b: REORDER_MNT_ID and spoof_mounts (internal mount structures)
+ * ====================================================================== */
+
+static void hymo_reorder_mnt_id_impl(void)
+{
+	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+	struct mount *m;
+	int id = 1;
+	bool is_hymo_mount;
+
+	if (!ns)
+		return;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+	{
+		struct mount *n;
+		if (ns->mounts.rb_node) {
+			struct rb_node *first_node = rb_first(&ns->mounts);
+			if (first_node) {
+				struct mount *first = rb_entry(first_node, struct mount, mnt_node);
+				if (first->mnt_id < 500000)
+					id = first->mnt_id;
+			}
+		}
+		rbtree_postorder_for_each_entry_safe(m, n, &ns->mounts, mnt_node) {
+#else
+	if (!list_empty(&ns->list)) {
+		struct mount *first = list_first_entry(&ns->list, struct mount, mnt_list);
+		if (first->mnt_id < 500000)
+			id = first->mnt_id;
+	}
+	list_for_each_entry(m, &ns->list, mnt_list) {
+#endif
+		is_hymo_mount = false;
+		if (m->mnt_devname && (
+		    strcmp(m->mnt_devname, hymo_current_mirror_path) == 0 ||
+		    strcmp(m->mnt_devname, hymo_current_mirror_name) == 0))
+			is_hymo_mount = true;
+
+		if (is_hymo_mount && hymo_stealth_enabled) {
+			if (m->mnt_id < 500000)
+				WRITE_ONCE(m->mnt_id, 500000 + (id % 1000));
+		} else {
+			if (m->mnt_id >= 500000)
+				continue;
+			WRITE_ONCE(m->mnt_id, id++);
+		}
+	}
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+	}
+#endif
+}
+
+static void hymo_spoof_mounts_impl(void)
+{
+	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+	struct mount *m;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+	struct mount *n;
+#endif
+	char *system_devname = NULL;
+	struct path sys_path;
+
+	if (!ns || !hymo_stealth_enabled)
+		return;
+
+	if (kern_path("/system", LOOKUP_FOLLOW, &sys_path) == 0) {
+		struct mount *sys_mnt = real_mount(sys_path.mnt);
+		if (sys_mnt && sys_mnt->mnt_devname)
+			system_devname = kstrdup(sys_mnt->mnt_devname, GFP_KERNEL);
+		path_put(&sys_path);
+	}
+	if (!system_devname && kern_path("/", LOOKUP_FOLLOW, &sys_path) == 0) {
+		struct mount *sys_mnt = real_mount(sys_path.mnt);
+		if (sys_mnt && sys_mnt->mnt_devname)
+			system_devname = kstrdup(sys_mnt->mnt_devname, GFP_KERNEL);
+		path_put(&sys_path);
+	}
+	if (!system_devname)
+		return;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+	rbtree_postorder_for_each_entry_safe(m, n, &ns->mounts, mnt_node) {
+#else
+	list_for_each_entry(m, &ns->list, mnt_list) {
+#endif
+		if (m->mnt_devname && (
+		    strcmp(m->mnt_devname, hymo_current_mirror_path) == 0 ||
+		    strcmp(m->mnt_devname, hymo_current_mirror_name) == 0)) {
+			const char *old_name = m->mnt_devname;
+			m->mnt_devname = kstrdup(system_devname, GFP_KERNEL);
+			if (m->mnt_devname)
+				kfree_const(old_name);
+			else
+				m->mnt_devname = old_name;
+		}
+	}
+	kfree(system_devname);
+}
+
+/* ======================================================================
  * Part 15: Dispatch Handler (ioctl only; all commands use HYMO_IOC_* from hymo_magic.h)
  * GET_FD is syscall-only -> hymofs_get_anon_fd()
  * ====================================================================== */
@@ -895,8 +1007,9 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == HYMO_IOC_REORDER_MNT_ID) {
-		/* Mount operations not supported in LKM (needs internal mount.h) */
-		return -EOPNOTSUPP;
+		hymo_spoof_mounts_impl();
+		hymo_reorder_mnt_id_impl();
+		return 0;
 	}
 
 	if (cmd == HYMO_IOC_LIST_RULES) {
@@ -1000,8 +1113,17 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
-	if (cmd == HYMO_IOC_SET_UNAME)
-		return -EOPNOTSUPP; /* TODO: uname spoofing */
+	if (cmd == HYMO_IOC_SET_UNAME) {
+		struct hymo_spoof_uname u;
+		if (copy_from_user(&u, arg, sizeof(u)))
+			return -EFAULT;
+		spin_lock(&hymo_uname_lock);
+		memcpy(&hymo_spoof_uname_store, &u, sizeof(hymo_spoof_uname_store));
+		hymo_uname_spoof_active = (u.sysname[0] || u.nodename[0] || u.release[0] ||
+					   u.version[0] || u.machine[0] || u.domainname[0]);
+		spin_unlock(&hymo_uname_lock);
+		return 0;
+	}
 
 	/* Commands that use hymo_syscall_arg */
 	if (copy_from_user(&req, arg, sizeof(req)))
@@ -1649,6 +1771,72 @@ static struct kprobe hymo_kp_prctl = {
 static int hymo_prctl_kprobe_registered;
 
 /* ======================================================================
+ * uname spoofing: kretprobe on __arm64_sys_newuname / __x64_sys_newuname
+ * On return, kernel has filled user buf; we overwrite with spoofed values.
+ * ====================================================================== */
+
+static int hymo_uname_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	void __user *buf;
+#if defined(__aarch64__)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
+	struct pt_regs *real_regs = (struct pt_regs *)regs->regs[0];
+	buf = (void __user *)real_regs->regs[0];
+#else
+	buf = (void __user *)regs->regs[0];
+#endif
+#elif defined(__x86_64__)
+	buf = (void __user *)regs->di;
+#else
+	buf = NULL;
+#endif
+	*(void __user **)ri->data = buf;
+	return 0;
+}
+
+static int hymo_uname_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	void __user *buf = *(void __user **)ri->data;
+	struct new_utsname kbuf;
+	struct hymo_spoof_uname spoof;
+	pid_t pid;
+
+	if (!buf || !hymo_uname_spoof_active)
+		return 0;
+	pid = task_tgid_vnr(current);
+	if (hymo_daemon_pid > 0 && pid == hymo_daemon_pid)
+		return 0;
+	if (copy_from_user(&kbuf, buf, sizeof(kbuf)))
+		return 0;
+	spin_lock(&hymo_uname_lock);
+	spoof = hymo_spoof_uname_store;
+	spin_unlock(&hymo_uname_lock);
+	if (spoof.sysname[0])
+		strscpy(kbuf.sysname, spoof.sysname, sizeof(kbuf.sysname));
+	if (spoof.nodename[0])
+		strscpy(kbuf.nodename, spoof.nodename, sizeof(kbuf.nodename));
+	if (spoof.release[0])
+		strscpy(kbuf.release, spoof.release, sizeof(kbuf.release));
+	if (spoof.version[0])
+		strscpy(kbuf.version, spoof.version, sizeof(kbuf.version));
+	if (spoof.machine[0])
+		strscpy(kbuf.machine, spoof.machine, sizeof(kbuf.machine));
+	if (spoof.domainname[0])
+		strscpy(kbuf.domainname, spoof.domainname, sizeof(kbuf.domainname));
+	if (copy_to_user(buf, &kbuf, sizeof(kbuf)))
+		; /* ignore */
+	return 0;
+}
+
+static struct kretprobe hymo_krp_uname = {
+	.entry_handler = hymo_uname_entry,
+	.handler = hymo_uname_ret,
+	.data_size = sizeof(void __user *),
+	.maxactive = 64,
+};
+static int hymo_uname_kprobe_registered;
+
+/* ======================================================================
  * iterate_dir: filldir filter (runs in fs callback context, not kprobe)
  * ====================================================================== */
 
@@ -2099,6 +2287,35 @@ static int __init hymofs_lkm_init(void)
 		}
 	}
 
+	/* uname spoofing: kretprobe on newuname syscall */
+	{
+		static const char *uname_symbols[] = {
+#if defined(__aarch64__)
+			"__arm64_sys_newuname", "sys_newuname", NULL
+#elif defined(__x86_64__)
+			"__x64_sys_newuname", "sys_newuname", NULL
+#else
+			NULL
+#endif
+		};
+		void *uname_addr = NULL;
+		int i;
+
+		for (i = 0; uname_symbols[i]; i++) {
+			uname_addr = (void *)hymofs_lookup_name(uname_symbols[i]);
+			if (uname_addr)
+				break;
+		}
+		if (uname_addr) {
+			hymo_krp_uname.kp.addr = (kprobe_opcode_t *)uname_addr;
+			ret = register_kretprobe(&hymo_krp_uname);
+			if (ret == 0) {
+				pr_info("hymofs: uname spoofing via kretprobe on %s\n", uname_symbols[i]);
+				hymo_uname_kprobe_registered = 1;
+			}
+		}
+	}
+
 #if HYMOFS_VFS_KPROBES
 	/* Install VFS kprobes */
 	{
@@ -2174,6 +2391,8 @@ static void __exit hymofs_lkm_exit(void)
 {
 	pr_info("hymofs: shutting down\n");
 
+	if (hymo_uname_kprobe_registered)
+		unregister_kretprobe(&hymo_krp_uname);
 	if (hymo_prctl_kprobe_registered)
 		unregister_kprobe(&hymo_kp_prctl);
 	if (hymo_reboot_kprobe_registered) {
