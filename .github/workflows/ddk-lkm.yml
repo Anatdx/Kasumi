@@ -123,28 +123,3 @@ jobs:
         with:
           name: ${{ inputs.kmi }}_hymofs_lkm.ko
           path: out/${{ inputs.kmi }}_hymofs_lkm.ko
-
-      - name: Post to Telegram
-        if: github.event_name != 'pull_request'
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MESSAGE_THREAD_ID: ${{ secrets.KPM_MESSAGE_THREAD_ID }}
-          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TITLE: "HymoFS LKM (${{ inputs.kmi }})"
-          VERSION: ${{ steps.parse_version.outputs.VERSION }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-            echo "BOT_TOKEN/CHAT_ID not set, skipping."
-            exit 0
-          fi
-          pip install telethon==1.34.0
-          KO="out/${{ inputs.kmi }}_hymofs_lkm.ko"
-          if [ -f "$KO" ]; then
-            python3 scripts/hymobot.py "$KO"
-          else
-            echo "No .ko to upload"
-          fi
