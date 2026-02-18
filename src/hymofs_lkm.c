@@ -2192,7 +2192,7 @@ static int __init hymofs_lkm_init(void)
 #endif
 		};
 		void *uname_addr = NULL;
-		int i;
+		int i, ret;
 
 		for (i = 0; uname_symbols[i]; i++) {
 			uname_addr = (void *)hymofs_lookup_name(uname_symbols[i]);
