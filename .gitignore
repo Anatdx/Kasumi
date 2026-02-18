@@ -57,3 +57,6 @@ dkms.conf
 # Kernel source repository (development workspace, patches are in patch/)
 patch_workspace/
 .DS_Store
+
+# Telegram bot session (contains auth, do not commit)
+scripts/.hymobot_session

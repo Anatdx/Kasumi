@@ -40,6 +40,7 @@
 #include <linux/miscdevice.h>
 #include <linux/anon_inodes.h>
 #include <linux/jhash.h>
+#include <linux/percpu.h>
 #include <linux/version.h>
 #include <linux/xarray.h>
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
@@ -1349,6 +1350,9 @@ static int __init hymofs_init(void)
 fs_initcall(hymofs_init);
 
 #ifdef CONFIG_HYMOFS_FORWARD_REDIRECT
+/* Re-entry guard: kern_path() in merge verification triggers our hooks -> recursion -> hang/watchdog */
+static DEFINE_PER_CPU(int, hymo_resolve_depth);
+
 char *__hymofs_resolve_target(const char *pathname)
 {
     struct hymo_entry *entry;
@@ -1362,10 +1366,17 @@ char *__hymofs_resolve_target(const char *pathname)
 
     if (unlikely(!hymofs_enabled)) return NULL;
     if (unlikely(!pathname)) return NULL;
+
+    /* Prevent recursion: kern_path below triggers VFS lookup -> our hooks -> this function again */
+    if (this_cpu_inc_return(hymo_resolve_depth) > 1) {
+        this_cpu_dec(hymo_resolve_depth);
+        return NULL;
+    }
     
     /* Allow daemon process to bypass path resolution */
     current_pid = task_tgid_vnr(current);
     if (hymo_daemon_pid > 0 && current_pid == hymo_daemon_pid) {
+        this_cpu_dec(hymo_resolve_depth);
         return NULL;
     }
     
@@ -1383,6 +1394,7 @@ char *__hymofs_resolve_target(const char *pathname)
                 if (unlikely(entry->src_hash == hash && strcmp(entry->src, pathname) == 0)) {
                     target = kstrdup(entry->target, GFP_ATOMIC);
                     rcu_read_unlock();
+                    this_cpu_dec(hymo_resolve_depth);
                     return target;
                 }
             }
@@ -1420,8 +1432,8 @@ char *__hymofs_resolve_target(const char *pathname)
             struct path p;
             if (kern_path(cand->target, LOOKUP_FOLLOW, &p) == 0) {
                 path_put(&p);
-                target = cand->target; // Take ownership
-                cand->target = NULL;   // Prevent double free
+                target = cand->target; /* Take ownership */
+                cand->target = NULL;    /* Prevent double free */
             }
         }
         
@@ -1429,6 +1441,7 @@ char *__hymofs_resolve_target(const char *pathname)
         kfree(cand);
     }
 
+    this_cpu_dec(hymo_resolve_depth);
     return target;
 }
 EXPORT_SYMBOL(__hymofs_resolve_target);
