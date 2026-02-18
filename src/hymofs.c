@@ -189,7 +189,9 @@ static DEFINE_SPINLOCK(hymo_merge_lock);      /* hymo_merge_dirs */
 static DEFINE_SPINLOCK(hymo_inject_lock);    /* hymo_inject_dirs */
 static bool hymo_allowlist_loaded = false;
 static DEFINE_MUTEX(hymo_allowlist_lock);
-bool hymofs_enabled = true;
+/* Default false: only enable via HYMO_CMD_SET_ENABLED after daemon adds all rules.
+ * Prevents bootloop when first rule triggers hooks before mirror is ready. */
+bool hymofs_enabled = false;
 EXPORT_SYMBOL(hymofs_enabled);
 
 /* Use HYMO_BLOOM_BITS from hymofs.h to avoid redefinition */
@@ -935,9 +937,7 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
             spin_unlock(&hymo_merge_lock);
             if (!found && merge_entry)
                 hymofs_add_inject_rule(kstrdup(merge_entry->src, GFP_ATOMIC));
-            spin_lock(&hymo_cfg_lock);
-            hymofs_enabled = true;
-            spin_unlock(&hymo_cfg_lock);
+            /* Do NOT auto-enable here; daemon calls set_enabled(true) when ready */
             break;
         }
 
@@ -1090,9 +1090,7 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
                 iput(parent_inode);
             }
 
-            spin_lock(&hymo_cfg_lock);
-            hymofs_enabled = true;
-            spin_unlock(&hymo_cfg_lock);
+            /* Do NOT auto-enable here; daemon calls set_enabled(true) when ready */
             break;
         }
 
@@ -1174,9 +1172,7 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
                 }
             }
             spin_unlock(&hymo_hide_lock);
-            spin_lock(&hymo_cfg_lock);
-            hymofs_enabled = true;
-            spin_unlock(&hymo_cfg_lock);
+            /* Do NOT auto-enable here; daemon calls set_enabled(true) when ready */
             break;
         }
 
