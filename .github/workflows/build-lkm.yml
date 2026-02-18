@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - lkm
 
 jobs:
@@ -103,13 +104,12 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      # 使用 workflow_dispatch API 显式触发 build.yml，并传入 HymoFS 的 commit 信息供 TG 详情展示
-      - name: Trigger hymo repository_dispatch
+      # 使用 workflow_dispatch API 显式触发 build.yml（比 repository_dispatch 更可靠，可指定 ref）
+      - name: Trigger hymo workflow_dispatch
         env:
           HYMO_REPO: Anatdx/hymo
           HYMO_TRIGGER_TOKEN: ${{ secrets.HYMO_TRIGGER_TOKEN }}
           HYMOFS_REF: ${{ github.ref_name }}
-          HYMO_REF: ${{ github.ref_name }}
           HYMOFS_SHA: ${{ github.sha }}
           HYMOFS_MSG: ${{ github.event.head_commit.message }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -118,16 +118,16 @@ jobs:
             echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
             exit 0
           fi
-          echo "Triggering $HYMO_REPO repository_dispatch build-lkm (hymofs ref=$HYMOFS_REF, sha=$HYMOFS_SHA)"
+          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (hymofs ref=$HYMOFS_REF, sha=$HYMOFS_SHA)"
           payload=$(jq -n \
-            --arg ref "$HYMO_REF" \
-            --arg ref_name "$HYMOFS_REF" \
-            --arg sha "$HYMOFS_SHA" \
-            --arg msg "$HYMOFS_MSG" \
+            --arg ref "main" \
+            --arg hymofs_ref "$HYMOFS_REF" \
+            --arg hymofs_sha "$HYMOFS_SHA" \
+            --arg hymofs_msg "$HYMOFS_MSG" \
             --arg run_id "${GITHUB_RUN_ID}" \
-            '{event_type: "build-lkm", client_payload: {ref: $ref, hymofs_ref: $ref_name, hymofs_sha: $sha, hymofs_commit_message: $msg, hymofs_run_id: $run_id}}')
-          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/dispatches" \
-            -H "Authorization: token ${HYMO_TRIGGER_TOKEN}" \
+            '{ref: $ref, inputs: {hymofs_ref: $hymofs_ref, hymofs_sha: $hymofs_sha, hymofs_commit_message: $hymofs_msg, hymofs_run_id: $run_id}}')
+          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
+            -H "Authorization: Bearer ${HYMO_TRIGGER_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Content-Type: application/json" \
             -d "$payload")
