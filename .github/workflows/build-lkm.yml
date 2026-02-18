@@ -118,9 +118,9 @@ jobs:
             echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
             exit 0
           fi
-          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (ref=main, HymoFS ref=$HYMOFS_REF)"
+          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (ref=lkm, HymoFS ref=$HYMOFS_REF)"
           # Send only ref; do not send inputs unless hymo build.yml workflow_dispatch declares them (else HTTP 422).
-          payload=$(jq -n --arg ref "main" '{ref: $ref}')
+          payload=$(jq -n --arg ref "lkm" '{ref: $ref}')
           resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
             -H "Authorization: Bearer ${HYMO_TRIGGER_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
