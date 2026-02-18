@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git make clang lld llvm gcc \
+            git make clang lld llvm gcc gcc-aarch64-linux-gnu \
             flex bison bc rsync cpio \
             libelf-dev libssl-dev libdw-dev pahole zip
 
@@ -86,26 +86,28 @@ jobs:
             exit 1
           fi
 
-          # 5.10: ubuntu clang has arm64 "sp" register issues; use GCC
+          # 5.10: ubuntu clang has arm64 "sp" register issues; use GCC cross-compiler
           if [[ "$KMI" == android12-5.10 ]] || [[ "$KMI" == android13-5.10 ]]; then
             LLVM_ARGS=""
+            CROSS_ARGS="CROSS_COMPILE=aarch64-linux-gnu-"
           else
             LLVM_ARGS="LLVM=1 LLVM_IAS=1"
+            CROSS_ARGS=""
           fi
 
           echo "Preparing kernel tree (KMI=$KMI, LLVM=$([ -n \"$LLVM_ARGS\" ] && echo 1 || echo 0))..."
-          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS gki_defconfig 2>/dev/null || \
-            make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS defconfig
+          make -C "$KERNEL_SRC" ARCH=arm64 $CROSS_ARGS $LLVM_ARGS gki_defconfig 2>/dev/null || \
+            make -C "$KERNEL_SRC" ARCH=arm64 $CROSS_ARGS $LLVM_ARGS defconfig
           # 6.12: disable gendwarfksyms to avoid dwarf.h dependency
           if [[ "$KMI" == *"6.12"* ]] && [ -f "$KERNEL_SRC/scripts/config" ]; then
             $KERNEL_SRC/scripts/config --file "$KERNEL_SRC/.config" -d GENDWARFKSYMS 2>/dev/null || true
-            make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS olddefconfig 2>/dev/null || true
+            make -C "$KERNEL_SRC" ARCH=arm64 $CROSS_ARGS $LLVM_ARGS olddefconfig 2>/dev/null || true
           fi
-          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS modules_prepare
+          make -C "$KERNEL_SRC" ARCH=arm64 $CROSS_ARGS $LLVM_ARGS modules_prepare
 
           VERSION="${{ steps.parse_version.outputs.VERSION }}"
           echo "Building hymofs_lkm.ko (v0.1.${VERSION})..."
-          make -C "$KERNEL_SRC" ARCH=arm64 $LLVM_ARGS M="$SRC" KBUILD_MODPOST_WARN=1 \
+          make -C "$KERNEL_SRC" ARCH=arm64 $CROSS_ARGS $LLVM_ARGS M="$SRC" KBUILD_MODPOST_WARN=1 \
             CFLAGS_MODULE="-DHYMOFS_VERSION=\\\"0.1.${VERSION}\\\"" modules
           ls -la "$SRC"/hymofs_lkm.ko
           llvm-strip -d "$SRC"/hymofs_lkm.ko 2>/dev/null || true
