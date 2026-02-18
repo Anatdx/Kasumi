@@ -13,16 +13,42 @@ jobs:
       fail-fast: false
       matrix:
         kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
           - android15-6.6
+          - android16-6.12
     uses: ./.github/workflows/ddk-lkm.yml
     secrets: inherit
     with:
       kmi: ${{ matrix.kmi }}
       ddk_release: "20251104"
 
+  merge-lkm:
+    name: Merge all LKM artifacts
+    needs: build-lkm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all LKM artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Merge into lkm folder
+        run: |
+          mkdir -p lkm
+          find . -name "*.ko" -path "*hymofs_lkm*" -exec cp {} lkm/ \;
+          ls -la lkm/
+
+      - name: Upload combined LKM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymofs-lkm-all
+          path: lkm/
+
   trigger-hymo:
     name: Trigger hymo build-lkm
-    needs: build-lkm
+    needs: merge-lkm
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -35,6 +61,7 @@ jobs:
           HYMO_REF: ${{ github.ref_name }}
           HYMOFS_SHA: ${{ github.sha }}
           HYMOFS_MSG: ${{ github.event.head_commit.message }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           if [ -z "$HYMO_TRIGGER_TOKEN" ]; then
             echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
@@ -46,7 +73,8 @@ jobs:
             --arg ref_name "$HYMOFS_REF" \
             --arg sha "$HYMOFS_SHA" \
             --arg msg "$HYMOFS_MSG" \
-            '{ref: $ref, inputs: {hymofs_ref: $ref_name, hymofs_sha: $sha, hymofs_commit_message: $msg}}')
+            --arg run_id "${GITHUB_RUN_ID}" \
+            '{ref: $ref, inputs: {hymofs_ref: $ref_name, hymofs_sha: $sha, hymofs_commit_message: $msg, hymofs_run_id: $run_id}}')
           resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
             -H "Authorization: token ${HYMO_TRIGGER_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
