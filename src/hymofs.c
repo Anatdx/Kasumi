@@ -660,6 +660,7 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
         spin_lock(&hymo_merge_lock);
         spin_lock(&hymo_inject_lock);
         hymo_cleanup_locked();
+        hymofs_enabled = false;  /* Disable during rule reload; daemon calls set_enabled when ready */
         strscpy(hymo_mirror_path_buf, HYMO_DEFAULT_MIRROR_PATH, PATH_MAX);
         strscpy(hymo_mirror_name_buf, HYMO_DEFAULT_MIRROR_NAME, NAME_MAX);
         hymo_current_mirror_path = hymo_mirror_path_buf;
@@ -1202,9 +1203,6 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
                     }
                 }
                 spin_unlock(&hymo_xattr_sbs_lock);
-                spin_lock(&hymo_cfg_lock);
-                hymofs_enabled = true;
-                spin_unlock(&hymo_cfg_lock);
                 path_put(&path);
             } else {
                 ret = -ENOENT;
@@ -1249,9 +1247,6 @@ int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
             spin_unlock(&hymo_inject_lock);
             spin_unlock(&hymo_hide_lock);
             spin_unlock(&hymo_rules_lock);
-            spin_lock(&hymo_cfg_lock);
-            hymofs_enabled = true;
-            spin_unlock(&hymo_cfg_lock);
             break;
 
         case HYMO_CMD_REORDER_MNT_ID:

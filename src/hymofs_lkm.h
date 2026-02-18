@@ -162,13 +162,16 @@ struct hymo_app_profile {
 	};
 };
 
-/* iterate_dir: wrapper passed as second arg so kernel calls our filldir filter. */
+/* iterate_dir: wrapper passed as second arg so kernel runs our filldir filter. */
 struct hymofs_filldir_wrapper {
 	struct dir_context wrap_ctx;
 	struct dir_context *orig_ctx;
 	struct dentry *parent_dentry;
 	int dir_path_len;
 	bool dir_has_hidden;
+	const char *dir_path;	/* full path for inject lookup; points to per-CPU buf */
+	bool dir_has_inject;	/* merge/inject dir: inject entries before real ones */
+	bool inject_done;	/* inject already performed this iteration */
 };
 
 /* ======================================================================

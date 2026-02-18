@@ -23,6 +23,7 @@
 #include <linux/vmalloc.h>
 #include <linux/jhash.h>
 #include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/fdtable.h>
 #include <linux/namei.h>
 #include <linux/path.h>
@@ -91,6 +92,12 @@ static DEFINE_PER_CPU(int, hymo_d_path_bufsize);
 /* Per-CPU for iterate_dir: swap ctx so kernel runs our filldir filter. */
 static DEFINE_PER_CPU(struct hymofs_filldir_wrapper, hymo_iterate_wrapper);
 static DEFINE_PER_CPU(int, hymo_iterate_did_swap);
+static DEFINE_PER_CPU(char[PATH_MAX], hymo_iterate_dir_path);
+/* When set, we're inside hymofs_populate_injected_list; skip ctx swap in iterate_dir pre. */
+static DEFINE_PER_CPU(int, hymo_in_populate_inject);
+
+/* Offset base for injected entries (filldir pos); must not collide with real inode offsets. */
+#define HYMO_MAGIC_POS 0x1000000000000000ULL
 
 /* ======================================================================
  * Part 2: Symbol Resolution via kallsyms + kprobes (no kernel export needed)
@@ -470,6 +477,173 @@ static void hymofs_add_inject_rule(char *dir)
 		kfree(dir);
 	}
 	spin_unlock(&hymo_inject_lock);
+}
+
+/* ======================================================================
+ * Part 10b: Inject - populate list for merge/add rule dirs
+ * ====================================================================== */
+
+struct hymo_merge_ctx {
+	struct dir_context ctx;
+	struct list_head *head;
+	const char *dir_path;
+};
+
+static HYMO_FILLDIR_RET_TYPE hymo_merge_filldir(struct dir_context *ctx, const char *name,
+						int namlen, loff_t offset, u64 ino,
+						unsigned int d_type)
+{
+	struct hymo_merge_ctx *mctx = container_of(ctx, struct hymo_merge_ctx, ctx);
+	struct hymo_name_list *item;
+
+	if (namlen == 1 && name[0] == '.')
+		return HYMO_FILLDIR_CONTINUE;
+	if (namlen == 2 && name[0] == '.' && name[1] == '.')
+		return HYMO_FILLDIR_CONTINUE;
+	if (namlen == 8 && strncmp(name, ".replace", 8) == 0)
+		return HYMO_FILLDIR_CONTINUE;
+
+	/* Skip whiteout (char dev 0:0) */
+	if (d_type == DT_CHR && mctx->dir_path) {
+		char *path = kasprintf(GFP_KERNEL, "%s/%.*s", mctx->dir_path, namlen, name);
+		if (path) {
+			struct path p;
+			if (hymo_kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
+				struct kstat stat;
+				if (vfs_getattr(&p, &stat, STATX_TYPE, AT_STATX_SYNC_AS_STAT) == 0 &&
+				    S_ISCHR(stat.mode) && stat.rdev == 0) {
+					path_put(&p);
+					kfree(path);
+					return HYMO_FILLDIR_CONTINUE;
+				}
+				path_put(&p);
+			}
+			kfree(path);
+		}
+	}
+
+	/* Skip duplicates */
+	{
+		struct hymo_name_list *pos;
+		list_for_each_entry(pos, mctx->head, list) {
+			if ((size_t)namlen == strlen(pos->name) &&
+			    strncmp(pos->name, name, namlen) == 0)
+				return HYMO_FILLDIR_CONTINUE;
+		}
+	}
+
+	item = kmalloc(sizeof(*item), GFP_KERNEL);
+	if (item) {
+		item->name = kstrndup(name, namlen, GFP_KERNEL);
+		item->type = (unsigned char)d_type;
+		if (item->name)
+			list_add(&item->list, mctx->head);
+		else
+			kfree(item);
+	}
+	return HYMO_FILLDIR_CONTINUE;
+}
+
+static void hymofs_populate_injected_list(const char *dir_path, struct dentry *parent,
+					  struct list_head *head)
+{
+	struct hymo_entry *entry;
+	struct hymo_inject_entry *inject_entry;
+	struct hymo_merge_entry *merge_entry;
+	struct hymo_name_list *item;
+	struct hymo_merge_target_node *target_node, *tmp_node;
+	struct list_head merge_targets;
+	u32 hash;
+	int bkt;
+	bool should_inject = false;
+	size_t dir_len;
+
+	if (unlikely(!hymofs_enabled || !dir_path))
+		return;
+
+	INIT_LIST_HEAD(&merge_targets);
+	dir_len = strlen(dir_path);
+	hash = full_name_hash(NULL, dir_path, dir_len);
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(inject_entry,
+		&hymo_inject_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
+		if (strcmp(inject_entry->dir, dir_path) == 0) {
+			should_inject = true;
+			break;
+		}
+	}
+	hlist_for_each_entry_rcu(merge_entry,
+		&hymo_merge_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
+		if (strcmp(merge_entry->src, dir_path) == 0) {
+			target_node = kmalloc(sizeof(*target_node), GFP_ATOMIC);
+			if (target_node) {
+				target_node->target = kstrdup(merge_entry->target, GFP_ATOMIC);
+				target_node->target_dentry = NULL;
+				list_add_tail(&target_node->list, &merge_targets);
+			}
+			should_inject = true;
+		}
+	}
+
+	if (should_inject) {
+		hash_for_each_rcu(hymo_paths, bkt, entry, node) {
+			if (strncmp(entry->src, dir_path, dir_len) != 0)
+				continue;
+			{
+				char *name = NULL;
+				if (dir_len == 1 && dir_path[0] == '/')
+					name = (char *)entry->src + 1;
+				else if (entry->src[dir_len] == '/')
+					name = (char *)entry->src + dir_len + 1;
+
+				if (name && *name && !strchr(name, '/')) {
+					struct hymo_name_list *pos;
+					list_for_each_entry(pos, head, list) {
+						if (strcmp(pos->name, name) == 0)
+							goto next_entry;
+					}
+					item = kmalloc(sizeof(*item), GFP_ATOMIC);
+					if (item) {
+						item->name = kstrdup(name, GFP_ATOMIC);
+						item->type = entry->type;
+						if (item->name)
+							list_add(&item->list, head);
+						else
+							kfree(item);
+					}
+				}
+			}
+next_entry:
+			;
+		}
+	}
+	rcu_read_unlock();
+
+	list_for_each_entry_safe(target_node, tmp_node, &merge_targets, list) {
+		if (target_node->target && hymo_kern_path) {
+			struct path path;
+			if (hymo_kern_path(target_node->target, LOOKUP_FOLLOW, &path) == 0) {
+				struct file *f = dentry_open(&path, O_RDONLY | O_DIRECTORY,
+								current_cred());
+				if (!IS_ERR(f)) {
+					struct hymo_merge_ctx mctx = {
+						.ctx.actor = hymo_merge_filldir,
+						.head = head,
+						.dir_path = target_node->target,
+					};
+					this_cpu_write(hymo_in_populate_inject, 1);
+					iterate_dir(f, &mctx.ctx);
+					this_cpu_write(hymo_in_populate_inject, 0);
+					fput(f);
+				}
+				path_put(&path);
+			}
+			kfree(target_node->target);
+		}
+		list_del(&target_node->list);
+		kfree(target_node);
+	}
 }
 
 /* ======================================================================
@@ -1210,17 +1384,18 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		if (parent_dir)
 			hymofs_add_inject_rule(parent_dir);
-		/*
-		 * ADD_RULE: do NOT hide the source inode. The LKM has no inject
-		 * implementation (unlike the patch's hymofs_inject_entries).
-		 * Hiding would remove the entry from dir listing, making it
-		 * impossible to navigate to the redirected path. Keep it visible
-		 * so users see e.g. /system/app; open() will redirect via getname_flags.
-		 */
-		if (src_inode)
+
+		/* Inode marking: hide source in dir listing; mark parent for fast filldir skip. */
+		if (src_inode) {
+			hymofs_mark_inode_hidden(src_inode);
 			iput(src_inode);
-		if (parent_inode)
+		}
+		if (parent_inode) {
+			if (parent_inode->i_mapping)
+				set_bit(AS_FLAGS_HYMO_DIR_HAS_HIDDEN,
+					&parent_inode->i_mapping->flags);
 			iput(parent_inode);
+		}
 
 		spin_lock(&hymo_cfg_lock);
 		hymofs_enabled = true;
@@ -1748,6 +1923,37 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 {
 	struct hymofs_filldir_wrapper *w =
 		container_of(ctx, struct hymofs_filldir_wrapper, wrap_ctx);
+	HYMO_FILLDIR_RET_TYPE ret;
+
+	/* Inject: before first real entry, emit injected entries from merge/add rules. */
+	if (w->dir_has_inject && !w->inject_done && w->dir_path && w->parent_dentry) {
+		struct list_head head;
+		struct hymo_name_list *item, *tmp;
+		loff_t inj_pos = HYMO_MAGIC_POS;
+
+		w->inject_done = true;
+		INIT_LIST_HEAD(&head);
+		hymofs_populate_injected_list(w->dir_path, w->parent_dentry, &head);
+
+		list_for_each_entry_safe(item, tmp, &head, list) {
+			int nlen = strlen(item->name);
+			ret = w->orig_ctx->actor(w->orig_ctx, item->name, nlen,
+						 inj_pos, 1, item->type);
+			list_del(&item->list);
+			kfree(item->name);
+			kfree(item);
+			if (ret != HYMO_FILLDIR_CONTINUE) {
+				/* Free remaining and return stop */
+				list_for_each_entry_safe(item, tmp, &head, list) {
+					list_del(&item->list);
+					kfree(item->name);
+					kfree(item);
+				}
+				return ret;
+			}
+			inj_pos++;
+		}
+	}
 
 	if (unlikely(namlen <= 2 && name[0] == '.')) {
 		if (namlen == 1 || (namlen == 2 && name[1] == '.'))
@@ -1972,6 +2178,8 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 
 	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
+	if (this_cpu_read(hymo_in_populate_inject))
+		return 0;
 	if (!READ_ONCE(hymofs_enabled))
 		return 0;
 	if (uid_eq(current_uid(), GLOBAL_ROOT_UID))
@@ -1991,8 +2199,14 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	w->parent_dentry = file && file->f_path.dentry ? file->f_path.dentry : NULL;
 	w->dir_has_hidden = false;
 	w->dir_path_len = 0;
+	w->dir_path = NULL;
+	w->dir_has_inject = false;
+	w->inject_done = false;
 
-	if (w->parent_dentry) {
+	if (w->parent_dentry && file) {
+		char *path_buf = this_cpu_ptr(hymo_iterate_dir_path);
+		char *res;
+
 		dir_inode = d_inode(w->parent_dentry);
 		if (dir_inode && dir_inode->i_mapping)
 			w->dir_has_hidden = test_bit(AS_FLAGS_HYMO_DIR_HAS_HIDDEN,
@@ -2000,10 +2214,41 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 		dname = w->parent_dentry->d_name.name;
 		if (dname[0] == 'd' && dname[1] == 'e' && dname[2] == 'v' && dname[3] == '\0')
 			w->dir_path_len = 4;
+
+		/* Get full path for inject lookup; d_path may sleep but we're in process context. */
+		res = d_path(&file->f_path, path_buf, PATH_MAX);
+		if (!IS_ERR(res) && res[0] == '/') {
+			w->dir_path = res;
+			{
+				struct hymo_inject_entry *ie;
+				struct hymo_merge_entry *me;
+				u32 h = full_name_hash(NULL, res, strlen(res));
+
+				rcu_read_lock();
+				hlist_for_each_entry_rcu(ie,
+					&hymo_inject_dirs[hash_min(h, HYMO_HASH_BITS)], node) {
+					if (strcmp(ie->dir, res) == 0) {
+						w->dir_has_inject = true;
+						break;
+					}
+				}
+				if (!w->dir_has_inject) {
+					hlist_for_each_entry_rcu(me,
+						&hymo_merge_dirs[hash_min(h, HYMO_HASH_BITS)], node) {
+						if (strcmp(me->src, res) == 0) {
+							w->dir_has_inject = true;
+							break;
+						}
+					}
+				}
+				rcu_read_unlock();
+			}
+		}
 	}
 
-	/* Only swap ctx when we need filtering (avoids per-CPU reentrancy). */
-	if (!w->dir_has_hidden && (!hymo_stealth_enabled || w->dir_path_len != 4)) {
+	/* Only swap ctx when we need filtering or inject (avoids per-CPU reentrancy). */
+	if (!w->dir_has_hidden && !w->dir_has_inject &&
+	    (!hymo_stealth_enabled || w->dir_path_len != 4)) {
 		this_cpu_write(hymo_iterate_did_swap, 0);
 		return 0;
 	}
