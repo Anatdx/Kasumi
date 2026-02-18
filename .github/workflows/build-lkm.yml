@@ -118,14 +118,9 @@ jobs:
             echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
             exit 0
           fi
-          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (hymofs ref=$HYMOFS_REF, sha=$HYMOFS_SHA)"
-          payload=$(jq -n \
-            --arg ref "main" \
-            --arg hymofs_ref "$HYMOFS_REF" \
-            --arg hymofs_sha "$HYMOFS_SHA" \
-            --arg hymofs_msg "$HYMOFS_MSG" \
-            --arg run_id "${GITHUB_RUN_ID}" \
-            '{ref: $ref, inputs: {hymofs_ref: $hymofs_ref, hymofs_sha: $hymofs_sha, hymofs_commit_message: $hymofs_msg, hymofs_run_id: $run_id}}')
+          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (ref=main, HymoFS ref=$HYMOFS_REF)"
+          # Send only ref; do not send inputs unless hymo build.yml workflow_dispatch declares them (else HTTP 422).
+          payload=$(jq -n --arg ref "main" '{ref: $ref}')
           resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
             -H "Authorization: Bearer ${HYMO_TRIGGER_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
