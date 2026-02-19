@@ -245,6 +245,7 @@ static void hymo_merge_entry_free_rcu(struct rcu_head *head)
 	struct hymo_merge_entry *e = container_of(head, struct hymo_merge_entry, rcu);
 	kfree(e->src);
 	kfree(e->target);
+	kfree(e->resolved_src);
 	kfree(e);
 }
 
@@ -396,6 +397,8 @@ static void hymo_cleanup_locked(void)
 	}
 	hash_for_each_safe(hymo_merge_dirs, bkt, tmp, merge_entry, node) {
 		hlist_del_rcu(&merge_entry->node);
+		if (merge_entry->resolved_src)
+			hlist_del_rcu(&merge_entry->resolved_node);
 		call_rcu(&merge_entry->rcu, hymo_merge_entry_free_rcu);
 	}
 
@@ -537,6 +540,10 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	dir_len = strlen(dir_path);
 	hash = full_name_hash(NULL, dir_path, dir_len);
 
+	/* canonical_src: original path used for hymo_paths (materialize uses original) */
+	const char *canonical_src = dir_path;
+	size_t canonical_len = dir_len;
+
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(inject_entry,
 		&hymo_inject_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
@@ -547,27 +554,44 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	}
 	hlist_for_each_entry_rcu(merge_entry,
 		&hymo_merge_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
-		if (strcmp(merge_entry->src, dir_path) == 0) {
+		bool match = (strcmp(merge_entry->src, dir_path) == 0) ||
+			     (merge_entry->resolved_src &&
+			      strcmp(merge_entry->resolved_src, dir_path) == 0);
+		if (match) {
+			if (merge_entry->src != dir_path)
+				canonical_src = merge_entry->src;
+			canonical_len = strlen(canonical_src);
+			/* Dedup: avoid adding same target twice (e.g. from both buckets) */
+			list_for_each_entry(tmp_node, &merge_targets, list) {
+				if (tmp_node->target && merge_entry->target &&
+				    strcmp(tmp_node->target, merge_entry->target) == 0)
+					goto next_merge;
+			}
 			target_node = kmalloc(sizeof(*target_node), GFP_ATOMIC);
 			if (target_node) {
 				target_node->target = kstrdup(merge_entry->target, GFP_ATOMIC);
 				target_node->target_dentry = NULL;
-				list_add_tail(&target_node->list, &merge_targets);
+				if (target_node->target)
+					list_add_tail(&target_node->list, &merge_targets);
+				else
+					kfree(target_node);
 			}
 			should_inject = true;
 		}
+next_merge:
+		;
 	}
 
 	if (should_inject) {
 		hash_for_each_rcu(hymo_paths, bkt, entry, node) {
-			if (strncmp(entry->src, dir_path, dir_len) != 0)
+			if (strncmp(entry->src, canonical_src, canonical_len) != 0)
 				continue;
 			{
 				char *name = NULL;
-				if (dir_len == 1 && dir_path[0] == '/')
+				if (canonical_len == 1 && canonical_src[0] == '/')
 					name = (char *)entry->src + 1;
-				else if (entry->src[dir_len] == '/')
-					name = (char *)entry->src + dir_len + 1;
+				else if (entry->src[canonical_len] == '/')
+					name = (char *)entry->src + canonical_len + 1;
 
 				if (name && *name && !strchr(name, '/')) {
 					struct hymo_name_list *pos;
@@ -1250,10 +1274,9 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
-		/* Resolve symlinks to get canonical path for iterate_dir lookup.
-		 * Keep original src for hymo_paths/bloom (getname_flags matching).
-		 * Add resolved form separately to inject_dirs/merge_dirs so
-		 * iterate_dir (which uses d_absolute_path) can find the rule. */
+		/* Resolve symlinks for iterate_dir lookup. Keep original src for
+		 * hymo_paths/bloom. Store resolved_src in merge entry so we match
+		 * d_absolute_path output without duplicating merge entries. */
 		{
 			char *resolved_src = NULL;
 			struct path mpath;
@@ -1288,30 +1311,19 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 					mat_tgt = kstrdup(target, GFP_ATOMIC);
 					me->src = src;
 					me->target = target;
+					me->resolved_src = resolved_src;
+					resolved_src = NULL;
 					hlist_add_head_rcu(&me->node,
 						&hymo_merge_dirs[hash_min(hash, HYMO_HASH_BITS)]);
+					if (me->resolved_src) {
+						u32 rh = full_name_hash(NULL, me->resolved_src,
+									strlen(me->resolved_src));
+						hlist_add_head_rcu(&me->resolved_node,
+							&hymo_merge_dirs[hash_min(rh, HYMO_HASH_BITS)]);
+					}
 					src = NULL;
 					target = NULL;
 					hymo_merge_trie_build_locked();
-
-					if (resolved_src) {
-						struct hymo_merge_entry *rme;
-						u32 rh = full_name_hash(NULL, resolved_src,
-									strlen(resolved_src));
-						rme = kmalloc(sizeof(*rme), GFP_ATOMIC);
-						if (rme) {
-							rme->src = kstrdup(resolved_src, GFP_ATOMIC);
-							rme->target = kstrdup(me->target, GFP_ATOMIC);
-							if (rme->src && rme->target) {
-								hlist_add_head_rcu(&rme->node,
-									&hymo_merge_dirs[hash_min(rh, HYMO_HASH_BITS)]);
-							} else {
-								kfree(rme->src);
-								kfree(rme->target);
-								kfree(rme);
-							}
-						}
-					}
 				} else {
 					ret = -ENOMEM;
 				}
@@ -1322,8 +1334,8 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 			spin_unlock(&hymo_merge_lock);
 			if (!found && !ret) {
 				hymofs_add_inject_rule(kstrdup(me->src, GFP_KERNEL));
-				if (resolved_src)
-					hymofs_add_inject_rule(kstrdup(resolved_src, GFP_KERNEL));
+				if (me->resolved_src)
+					hymofs_add_inject_rule(kstrdup(me->resolved_src, GFP_KERNEL));
 				if (mat_src && mat_tgt)
 					hymofs_materialize_merge(mat_src, mat_tgt, 0);
 			}
@@ -2021,11 +2033,25 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 			int nlen = strlen(item->name);
 			ret = w->orig_ctx->actor(w->orig_ctx, item->name, nlen,
 						 inj_pos, 1, item->type);
+			/* Track emitted name to skip duplicate from real listing */
+			{
+				struct hymo_name_list *e = kmalloc(sizeof(*e), GFP_ATOMIC);
+				if (e && item->name) {
+					e->name = kstrdup(item->name, GFP_ATOMIC);
+					if (e->name) {
+						e->type = item->type;
+						list_add_tail(&e->list, &w->emitted_names);
+					} else {
+						kfree(e);
+					}
+				} else if (e) {
+					kfree(e);
+				}
+			}
 			list_del(&item->list);
 			kfree(item->name);
 			kfree(item);
 			if (ret != HYMO_FILLDIR_CONTINUE) {
-				/* Free remaining and return stop */
 				list_for_each_entry_safe(item, tmp, &head, list) {
 					list_del(&item->list);
 					kfree(item->name);
@@ -2034,6 +2060,16 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 				return ret;
 			}
 			inj_pos++;
+		}
+	}
+
+	/* Skip real entry if already emitted in inject phase (avoid duplicate) */
+	if (w->dir_has_inject && w->inject_done && namlen > 0) {
+		struct hymo_name_list *e;
+		list_for_each_entry(e, &w->emitted_names, list) {
+			if (e->name && (int)strlen(e->name) == namlen &&
+			    memcmp(e->name, name, namlen) == 0)
+				return HYMO_FILLDIR_CONTINUE;
 		}
 	}
 
@@ -2687,6 +2723,18 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 	w->dir_path = NULL;
 	w->dir_has_inject = false;
 	w->inject_done = false;
+	/* Free emitted_names from previous directory iteration (init first if uninitialized) */
+	if (!w->emitted_names.next && !w->emitted_names.prev)
+		INIT_LIST_HEAD(&w->emitted_names);
+	{
+		struct hymo_name_list *e, *t;
+		list_for_each_entry_safe(e, t, &w->emitted_names, list) {
+			list_del(&e->list);
+			kfree(e->name);
+			kfree(e);
+		}
+	}
+	INIT_LIST_HEAD(&w->emitted_names);
 
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
@@ -2734,7 +2782,8 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 					hlist_for_each_entry_rcu(me,
 						&hymo_merge_dirs[hash_min(h, HYMO_HASH_BITS)],
 						node) {
-						if (strcmp(me->src, dp) == 0) {
+						if (strcmp(me->src, dp) == 0 ||
+						    (me->resolved_src && strcmp(me->resolved_src, dp) == 0)) {
 							w->dir_has_inject = true;
 							break;
 						}

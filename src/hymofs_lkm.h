@@ -111,7 +111,9 @@ struct hymo_xattr_sb_entry {
 struct hymo_merge_entry {
 	char *src;
 	char *target;
+	char *resolved_src;	/* canonical path for iterate_dir lookup; NULL if same as src */
 	struct hlist_node node;
+	struct hlist_node resolved_node;	/* for resolved_src bucket when different from src */
 	struct rcu_head rcu;
 };
 
@@ -209,6 +211,7 @@ struct hymofs_filldir_wrapper {
 	const char *dir_path;	/* full path for inject lookup; points to per-CPU buf */
 	bool dir_has_inject;	/* merge/inject dir: inject entries before real ones */
 	bool inject_done;	/* inject already performed this iteration */
+	struct list_head emitted_names;	/* names already emitted in inject phase */
 };
 
 /* ======================================================================
