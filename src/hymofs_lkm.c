@@ -341,7 +341,7 @@ static void hymo_merge_trie_build_locked(void)
 }
 
 /* Longest-prefix lookup; caller must hold rcu_read_lock. */
-static struct hymo_merge_entry *
+static struct hymo_merge_entry * __maybe_unused
 hymo_merge_trie_lookup_longest(const char *pathname)
 {
 	struct hymo_merge_trie_node *root, *cur, *child;
