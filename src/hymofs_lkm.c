@@ -196,6 +196,8 @@ static DECLARE_BITMAP(hymo_hide_bloom, HYMO_BLOOM_SIZE);
 static int (*hymo_kern_path)(const char *, unsigned int, struct path *);
 static int (*hymo_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
 static struct file *(*hymo_dentry_open)(const struct path *, int, const struct cred *);
+/* Bypass d_path kprobe to avoid recursion when we need path inside iterate_dir/d_path handlers */
+static char *(*hymo_d_absolute_path)(const struct path *, char *, int);
 
 /* hymo_log macro is in hymofs_lkm.h */
 
@@ -2208,7 +2210,7 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	w->dir_has_inject = false;
 	w->inject_done = false;
 
-	if (w->parent_dentry && file) {
+	if (w->parent_dentry && file && hymo_d_absolute_path) {
 		char *path_buf = this_cpu_ptr(hymo_iterate_dir_path);
 		char *res;
 
@@ -2220,8 +2222,8 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 		if (dname[0] == 'd' && dname[1] == 'e' && dname[2] == 'v' && dname[3] == '\0')
 			w->dir_path_len = 4;
 
-		/* Get full path for inject lookup; d_path may sleep but we're in process context. */
-		res = d_path(&file->f_path, path_buf, HYMO_ITERATE_PATH_BUF);
+		/* Use d_absolute_path to bypass our d_path kprobe and avoid recursion. */
+		res = hymo_d_absolute_path(&file->f_path, path_buf, HYMO_ITERATE_PATH_BUF);
 		if (!IS_ERR(res) && res[0] == '/') {
 			w->dir_path = res;
 			{
@@ -2335,10 +2337,13 @@ static int __init hymofs_lkm_init(void)
 	hymo_kernel_read = (void *)hymofs_lookup_name("kernel_read");
 	hymo_vfs_getattr = (void *)hymofs_lookup_name("vfs_getattr");
 	hymo_dentry_open = (void *)hymofs_lookup_name("dentry_open");
+	hymo_d_absolute_path = (void *)hymofs_lookup_name("d_absolute_path");
 	if (!hymo_filp_open || !hymo_kernel_read)
 		pr_warn("hymofs: filp_open/kernel_read not found, allowlist disabled\n");
 	if (!hymo_vfs_getattr || !hymo_dentry_open)
 		pr_warn("hymofs: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
+	if (!hymo_d_absolute_path)
+		pr_warn("hymofs: d_absolute_path not found, iterate_dir inject lookup disabled (recursion risk)\n");
 
 	/* Initialize hash tables */
 	hash_init(hymo_paths);
