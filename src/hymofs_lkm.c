@@ -554,10 +554,6 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	 * (process context), so d_path is safe to call. Our d_path kretprobe
 	 * won't interfere since this directory is not a redirect target. */
 	if (parent) {
-		struct path dp = { .dentry = parent, .mnt = NULL };
-		/* Try to recover vfsmount from parent's superblock;
-		 * the caller (filldir) has file->f_path but we only get dentry.
-		 * Use kern_path on dir_path to get a proper struct path. */
 		if (hymo_kern_path) {
 			struct path resolved;
 			if (hymo_kern_path(dir_path, LOOKUP_FOLLOW, &resolved) == 0) {
