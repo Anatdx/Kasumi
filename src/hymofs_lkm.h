@@ -74,6 +74,9 @@
 /* Allowlist UID marker */
 #define HYMO_UID_ALLOW_MARKER ((void *)1)
 
+/* SELinux context to spoof for redirected files */
+#define HYMO_SYSTEM_SELINUX_CTX "u:object_r:system_file:s0"
+
 /* ======================================================================
  * Data Structures
  * ====================================================================== */
@@ -170,6 +173,29 @@ struct hymo_app_profile {
 			struct hymo_non_root_profile profile;
 		} nrp_config;
 	};
+};
+
+/* kretprobe instance data for vfs_getattr stat spoofing */
+struct hymo_getattr_ri_data {
+	struct kstat *stat;
+	struct address_space *mapping;
+	bool is_target;
+};
+
+/* kretprobe instance data for vfs_getxattr SELinux context spoofing */
+struct hymo_getxattr_ri_data {
+	void *value_buf;
+	size_t value_size;
+	bool spoof_selinux;
+};
+
+/* kretprobe instance data for d_path reverse mapping */
+#define HYMO_D_PATH_SRC_MAX 256
+struct hymo_d_path_ri_data {
+	char *buf;
+	int buflen;
+	bool is_target;
+	char src_path[HYMO_D_PATH_SRC_MAX];
 };
 
 /* iterate_dir: wrapper passed as second arg so kernel runs our filldir filter. */

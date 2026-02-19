@@ -84,12 +84,7 @@ static DEFINE_PER_CPU(char[HYMO_PATH_BUF], hymo_getname_path_buf);
  */
 static atomic_long_t hymo_ioctl_tgid = ATOMIC_LONG_INIT(0);
 
-/* Per-CPU for vfs_getattr kretprobe: save path and kstat at entry. */
-static DEFINE_PER_CPU(const struct path *, hymo_vfs_getattr_path);
-static DEFINE_PER_CPU(struct kstat *, hymo_vfs_getattr_stat);
-/* Per-CPU for d_path kretprobe: save buf and bufsize at entry. */
-static DEFINE_PER_CPU(char *, hymo_d_path_buf);
-static DEFINE_PER_CPU(int, hymo_d_path_bufsize);
+/* (d_path per-CPU vars removed: now uses kretprobe ri->data) */
 /* Per-CPU for iterate_dir: swap ctx so kernel runs our filldir filter. */
 static DEFINE_PER_CPU(struct hymofs_filldir_wrapper, hymo_iterate_wrapper);
 static DEFINE_PER_CPU(int, hymo_iterate_did_swap);
@@ -193,6 +188,9 @@ static DEFINE_SPINLOCK(hymo_daemon_lock);
 static DECLARE_BITMAP(hymo_path_bloom, HYMO_BLOOM_SIZE);
 static DECLARE_BITMAP(hymo_hide_bloom, HYMO_BLOOM_SIZE);
 /* hymo_rule_count and hymo_hide_count declared above */
+
+/* /system partition device number for stat spoofing on redirected files */
+static dev_t hymo_system_dev;
 
 /* VFS symbols resolved at init; forward-declared for use in merge/inject before init. */
 static int (*hymo_kern_path)(const char *, unsigned int, struct path *);
@@ -2035,6 +2033,7 @@ passthrough:
 #define HYMO_REG1(regs)		((regs)->regs[1])
 #define HYMO_REG2(regs)		((regs)->regs[2])
 #define HYMO_REG3(regs)		((regs)->regs[3])
+#define HYMO_REG4(regs)		((regs)->regs[4])
 #define HYMO_LR(regs)		((regs)->regs[30])
 #define HYMO_POP_STACK(regs)	do { } while (0)
 #elif defined(__x86_64__)
@@ -2042,6 +2041,7 @@ passthrough:
 #define HYMO_REG1(regs)		((regs)->si)
 #define HYMO_REG2(regs)		((regs)->dx)
 #define HYMO_REG3(regs)		((regs)->cx)
+#define HYMO_REG4(regs)		((regs)->r8)
 #define HYMO_LR(regs)		(*(unsigned long *)(regs)->sp)
 #define HYMO_POP_STACK(regs)	do { (regs)->sp += 8; } while (0)
 #else
@@ -2049,8 +2049,30 @@ passthrough:
 #define HYMO_REG1(regs)		(0)
 #define HYMO_REG2(regs)		(0)
 #define HYMO_REG3(regs)		(0)
+#define HYMO_REG4(regs)		(0)
 #define HYMO_LR(regs)		(0)
 #define HYMO_POP_STACK(regs)	do { } while (0)
+#endif
+
+/*
+ * vfs_getattr / vfs_getxattr argument positions across kernel versions.
+ * <5.12:  vfs_getattr(path, kstat, mask, flags)
+ * >=5.12: vfs_getattr(userns/idmap, path, kstat, mask, flags)
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0))
+#define HYMO_GETATTR_PATH_REG(regs) HYMO_REG1(regs)
+#define HYMO_GETATTR_STAT_REG(regs) HYMO_REG2(regs)
+#define HYMO_GETXATTR_DENTRY_REG(regs) HYMO_REG1(regs)
+#define HYMO_GETXATTR_NAME_REG(regs)   HYMO_REG2(regs)
+#define HYMO_GETXATTR_VALUE_REG(regs)  HYMO_REG3(regs)
+#define HYMO_GETXATTR_SIZE_REG(regs)   HYMO_REG4(regs)
+#else
+#define HYMO_GETATTR_PATH_REG(regs) HYMO_REG0(regs)
+#define HYMO_GETATTR_STAT_REG(regs) HYMO_REG1(regs)
+#define HYMO_GETXATTR_DENTRY_REG(regs) HYMO_REG0(regs)
+#define HYMO_GETXATTR_NAME_REG(regs)   HYMO_REG1(regs)
+#define HYMO_GETXATTR_VALUE_REG(regs)  HYMO_REG2(regs)
+#define HYMO_GETXATTR_SIZE_REG(regs)   HYMO_REG3(regs)
 #endif
 
 /*
@@ -2135,71 +2157,314 @@ static HYMO_NOCFI int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs
 	return 0;
 }
 
-/* vfs_getattr: pre saves path and kstat for kretprobe. */
+/* vfs_getattr kprobe pre: nop (stat spoofing is done in kretprobe entry/ret). */
 static int hymo_kp_vfs_getattr_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	(void)p;
-	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
-		return 0;
-	this_cpu_write(hymo_vfs_getattr_path, (const struct path *)HYMO_REG0(regs));
-	this_cpu_write(hymo_vfs_getattr_stat, (struct kstat *)HYMO_REG1(regs));
+	(void)p; (void)regs;
 	return 0;
-}
-
-static inline bool hymofs_needs_stat_check(const struct path *path)
-{
-	const char *name;
-
-	if (!path || !path->dentry)
-		return false;
-	name = path->dentry->d_name.name;
-	if (name[0] == 'd' && name[1] == 'e' && name[2] == 'v' && name[3] == '\0')
-		return false;
-	if (name[0] == 'p' && !strncmp(name, "proc", 4))
-		return false;
-	if (name[0] == 's' && !strncmp(name, "sys", 3))
-		return false;
-	return true;
 }
 
 /*
- * vfs_getattr kretprobe: stat spoofing (ino/mtime) is disabled.
- * Per-CPU path/kstat is unsafe here: return can run on a different CPU than
- * entry (task migration), so we would dereference stale/invalid pointers and
- * fault. Re-enable only when using per-task or per-instance storage.
+ * Reverse-lookup helper: check if a resolved path is a redirect target.
+ * Returns the matching hymo_entry (under rcu_read_lock) or NULL.
+ * Caller must hold rcu_read_lock.
  */
-static int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static struct hymo_entry *hymofs_reverse_lookup_target(const char *path_str)
 {
-	(void)ri;
-	(void)regs;
+	struct hymo_entry *entry;
+	u32 hash;
+
+	if (!path_str || !*path_str)
+		return NULL;
+	hash = full_name_hash(NULL, path_str, strlen(path_str));
+	hlist_for_each_entry_rcu(entry,
+		&hymo_targets[hash_min(hash, HYMO_HASH_BITS)], target_node) {
+		if (strcmp(entry->target, path_str) == 0)
+			return entry;
+	}
+	return NULL;
+}
+
+/*
+ * vfs_getattr kretprobe entry: resolve path, check hymo_targets.
+ * Uses ri->data (migration-safe) instead of per-CPU storage.
+ */
+static HYMO_NOCFI int hymo_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
+						  struct pt_regs *regs)
+{
+	struct hymo_getattr_ri_data *d = (void *)ri->data;
+	const struct path *p;
+	char buf[256];
+	char *dp;
+
+	d->is_target = false;
+	d->stat = NULL;
+	d->mapping = NULL;
+
+	if (!READ_ONCE(hymofs_enabled))
+		return 0;
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
+	if (this_cpu_read(hymo_in_populate_inject))
+		return 0;
+	if (atomic_read(&hymo_rule_count) == 0)
+		return 0;
+
+	p = (const struct path *)HYMO_GETATTR_PATH_REG(regs);
+	d->stat = (struct kstat *)HYMO_GETATTR_STAT_REG(regs);
+
+	if (!p || !p->dentry || !d->stat)
+		return 0;
+
+	if (d_inode(p->dentry) && d_inode(p->dentry)->i_mapping)
+		d->mapping = d_inode(p->dentry)->i_mapping;
+
+	/* Fast path: inode already marked from a previous redirect match */
+	if (d->mapping && test_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &d->mapping->flags)) {
+		d->is_target = true;
+		return 0;
+	}
+
+	dp = ERR_PTR(-ENOENT);
+	if (hymo_d_absolute_path)
+		dp = hymo_d_absolute_path(p, buf, sizeof(buf));
+	if (IS_ERR(dp) && hymo_dentry_path_raw)
+		dp = hymo_dentry_path_raw(p->dentry, buf, sizeof(buf));
+	if (IS_ERR_OR_NULL(dp) || dp[0] != '/')
+		return 0;
+
+	rcu_read_lock();
+	if (hymofs_reverse_lookup_target(dp))
+		d->is_target = true;
+	rcu_read_unlock();
+
 	return 0;
 }
 
-/* d_path: pre saves buf and bufsize for kretprobe. */
+/*
+ * vfs_getattr kretprobe ret: spoof kstat for redirect targets.
+ * Makes the file appear to belong to /system with root ownership.
+ */
+static int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri,
+				    struct pt_regs *regs)
+{
+	struct hymo_getattr_ri_data *d = (void *)ri->data;
+	struct kstat *stat;
+	int ret_val;
+
+	if (!d->is_target || !d->stat)
+		return 0;
+
+#if defined(__aarch64__)
+	ret_val = (int)regs->regs[0];
+#elif defined(__x86_64__)
+	ret_val = (int)regs->ax;
+#else
+	ret_val = 0;
+#endif
+	if (ret_val != 0)
+		return 0;
+
+	stat = d->stat;
+	if (hymo_system_dev)
+		stat->dev = hymo_system_dev;
+	stat->uid = GLOBAL_ROOT_UID;
+	stat->gid = GLOBAL_ROOT_GID;
+	stat->ino = (u64)jhash(stat, sizeof(stat->ino), 0x48594D4F) | 0x100000ULL;
+	if (S_ISREG(stat->mode))
+		stat->nlink = 1;
+
+	/* Mark inode so xattr and future stat calls use fast O(1) check */
+	if (d->mapping)
+		set_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &d->mapping->flags);
+
+	return 0;
+}
+
+/*
+ * vfs_getxattr kretprobe entry: check if querying security.selinux on a
+ * redirect target.  Uses the AS_FLAGS_HYMO_SPOOF_KSTAT inode flag set by
+ * the vfs_getattr ret handler on first stat() of a redirected file.
+ */
+static HYMO_NOCFI int hymo_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
+						   struct pt_regs *regs)
+{
+	struct hymo_getxattr_ri_data *d = (void *)ri->data;
+	struct dentry *dentry;
+	const char *xattr_name;
+	struct inode *inode;
+
+	d->spoof_selinux = false;
+	d->value_buf = NULL;
+	d->value_size = 0;
+
+	if (!READ_ONCE(hymofs_enabled))
+		return 0;
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
+	if (atomic_read(&hymo_rule_count) == 0)
+		return 0;
+
+	xattr_name = (const char *)HYMO_GETXATTR_NAME_REG(regs);
+	if (!xattr_name)
+		return 0;
+	if (strcmp(xattr_name, "security.selinux") != 0)
+		return 0;
+
+	dentry = (struct dentry *)HYMO_GETXATTR_DENTRY_REG(regs);
+	if (!dentry)
+		return 0;
+
+	inode = d_inode(dentry);
+	if (!inode || !inode->i_mapping)
+		return 0;
+	if (!test_bit(AS_FLAGS_HYMO_SPOOF_KSTAT, &inode->i_mapping->flags))
+		return 0;
+
+	d->value_buf = (void *)HYMO_GETXATTR_VALUE_REG(regs);
+	d->value_size = (size_t)HYMO_GETXATTR_SIZE_REG(regs);
+	d->spoof_selinux = true;
+
+	return 0;
+}
+
+/*
+ * vfs_getxattr kretprobe ret: overwrite value buffer with spoofed SELinux
+ * context and fix return value to the new length.
+ */
+static int hymo_krp_vfs_getxattr_ret(struct kretprobe_instance *ri,
+				     struct pt_regs *regs)
+{
+	struct hymo_getxattr_ri_data *d = (void *)ri->data;
+	long ret_val;
+	size_t ctx_len;
+
+	if (!d->spoof_selinux || !d->value_buf)
+		return 0;
+
+#if defined(__aarch64__)
+	ret_val = (long)regs->regs[0];
+#elif defined(__x86_64__)
+	ret_val = (long)regs->ax;
+#else
+	ret_val = 0;
+#endif
+	if (ret_val <= 0)
+		return 0;
+
+	ctx_len = sizeof(HYMO_SYSTEM_SELINUX_CTX);
+	if (d->value_size < ctx_len)
+		return 0;
+	memcpy(d->value_buf, HYMO_SYSTEM_SELINUX_CTX, ctx_len);
+
+#if defined(__aarch64__)
+	regs->regs[0] = (unsigned long)(ctx_len - 1);
+#elif defined(__x86_64__)
+	regs->ax = (unsigned long)(ctx_len - 1);
+#endif
+
+	return 0;
+}
+
+/* d_path: kprobe pre now a nop; entry handler below does the real work. */
 static int hymo_kp_d_path_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	(void)p;
-	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
-		return 0;
-	this_cpu_write(hymo_d_path_buf, (char *)HYMO_REG1(regs));
-	this_cpu_write(hymo_d_path_bufsize, (int)HYMO_REG2(regs));
+	(void)p; (void)regs;
 	return 0;
 }
 
 /*
- * d_path kretprobe: reverse lookup disabled.
- * Per-CPU buf/bufsize is unsafe: kretprobe return can run on a different CPU
- * than the pre-handler (task migration during d_path which may sleep), so we
- * would dereference stale/invalid pointers and corrupt memory.
- * Additionally, d_path returns a pointer *inside* the caller's buffer, so
- * writing to buf[0] would not update the returned pointer, corrupting the
- * result the caller sees.
- * Re-enable only when using kretprobe instance data (ri->data).
+ * d_path kretprobe entry: save buf/buflen from regs, resolve the struct path
+ * to see if it's a redirect target.  d_path signature:
+ *   char *d_path(const struct path *path, char *buf, int buflen)
  */
-static int hymo_krp_d_path_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static HYMO_NOCFI int hymo_krp_d_path_entry(struct kretprobe_instance *ri,
+					     struct pt_regs *regs)
 {
-	(void)ri;
-	(void)regs;
+	struct hymo_d_path_ri_data *d = (void *)ri->data;
+	const struct path *p;
+	char tmp[256];
+	char *dp;
+	struct hymo_entry *entry;
+
+	d->is_target = false;
+	d->buf = (char *)HYMO_REG1(regs);
+	d->buflen = (int)HYMO_REG2(regs);
+	d->src_path[0] = '\0';
+
+	if (!READ_ONCE(hymofs_enabled))
+		return 0;
+	if (atomic_long_read(&hymo_ioctl_tgid) == (long)task_tgid_vnr(current))
+		return 0;
+	if (atomic_read(&hymo_rule_count) == 0)
+		return 0;
+
+	p = (const struct path *)HYMO_REG0(regs);
+	if (!p || !p->dentry)
+		return 0;
+
+	dp = ERR_PTR(-ENOENT);
+	if (hymo_d_absolute_path)
+		dp = hymo_d_absolute_path(p, tmp, sizeof(tmp));
+	if (IS_ERR(dp) && hymo_dentry_path_raw)
+		dp = hymo_dentry_path_raw(p->dentry, tmp, sizeof(tmp));
+	if (IS_ERR_OR_NULL(dp) || dp[0] != '/')
+		return 0;
+
+	rcu_read_lock();
+	entry = hymofs_reverse_lookup_target(dp);
+	if (entry && strlen(entry->src) < HYMO_D_PATH_SRC_MAX) {
+		d->is_target = true;
+		strlcpy(d->src_path, entry->src, HYMO_D_PATH_SRC_MAX);
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+/*
+ * d_path kretprobe ret: if the resolved path was a redirect target,
+ * overwrite the result so /proc/pid/fd/N shows /system/... instead of
+ * /data/adb/modules/xxx/...
+ *
+ * d_path() returns a pointer INSIDE the caller's buffer (buf + offset).
+ * We write the source path into the buffer from the end and update the
+ * return value register to point to the new start.
+ */
+static int hymo_krp_d_path_ret(struct kretprobe_instance *ri,
+			       struct pt_regs *regs)
+{
+	struct hymo_d_path_ri_data *d = (void *)ri->data;
+	char *ret_ptr;
+	size_t src_len;
+	char *new_start;
+
+	if (!d->is_target || !d->src_path[0] || !d->buf || d->buflen <= 0)
+		return 0;
+
+#if defined(__aarch64__)
+	ret_ptr = (char *)regs->regs[0];
+#elif defined(__x86_64__)
+	ret_ptr = (char *)regs->ax;
+#else
+	ret_ptr = NULL;
+#endif
+	if (IS_ERR_OR_NULL(ret_ptr))
+		return 0;
+
+	src_len = strlen(d->src_path);
+	if ((int)src_len + 1 > d->buflen)
+		return 0;
+
+	new_start = d->buf + d->buflen - src_len - 1;
+	memcpy(new_start, d->src_path, src_len + 1);
+
+#if defined(__aarch64__)
+	regs->regs[0] = (unsigned long)new_start;
+#elif defined(__x86_64__)
+	regs->ax = (unsigned long)new_start;
+#endif
+
 	return 0;
 }
 
@@ -2357,6 +2622,8 @@ static struct kprobe hymofs_kprobes[HYMOFS_VFS_HOOK_COUNT];
 static struct kretprobe hymo_krp_vfs_getattr;
 static struct kretprobe hymo_krp_d_path;
 static struct kretprobe hymo_krp_iterate_dir;
+static struct kretprobe hymo_krp_vfs_getxattr;
+static int hymo_getxattr_kprobe_registered;
 
 /* ======================================================================
  * Part 24: Module Init / Exit
@@ -2418,6 +2685,19 @@ static int __init hymofs_lkm_init(void)
 
 	/* Resolve kallsyms first so all lookups can use it (no kernel exports needed). */
 	hymofs_resolve_kallsyms_lookup();
+
+	/* Resolve /system device number for stat spoofing */
+	if (hymo_kern_path) {
+		struct path sys_path;
+		if (hymo_kern_path("/system", LOOKUP_FOLLOW, &sys_path) == 0) {
+			hymo_system_dev = sys_path.dentry->d_sb->s_dev;
+			pr_info("hymofs: /system dev=%u:%u\n",
+				MAJOR(hymo_system_dev), MINOR(hymo_system_dev));
+			path_put(&sys_path);
+		} else {
+			pr_warn("hymofs: could not resolve /system for stat spoofing\n");
+		}
+	}
 
 	/* GET_FD: kprobe+kretprobe on ni_syscall; no sys_call_table patch. */
 	if (hymo_syscall_nr_param <= 0) {
@@ -2580,7 +2860,9 @@ static int __init hymofs_lkm_init(void)
 
 		/* kretprobes for vfs_getattr and d_path (modify after return) */
 		hymo_krp_vfs_getattr.kp.addr = hymofs_kprobes[HYMOFS_VFS_IDX_GETATTR].addr;
+		hymo_krp_vfs_getattr.entry_handler = hymo_krp_vfs_getattr_entry;
 		hymo_krp_vfs_getattr.handler = hymo_krp_vfs_getattr_ret;
+		hymo_krp_vfs_getattr.data_size = sizeof(struct hymo_getattr_ri_data);
 		hymo_krp_vfs_getattr.maxactive = 64;
 		ret = register_kretprobe(&hymo_krp_vfs_getattr);
 		if (ret) {
@@ -2590,7 +2872,9 @@ static int __init hymofs_lkm_init(void)
 			return ret;
 		}
 		hymo_krp_d_path.kp.addr = hymofs_kprobes[HYMOFS_VFS_IDX_DPATH].addr;
+		hymo_krp_d_path.entry_handler = hymo_krp_d_path_entry;
 		hymo_krp_d_path.handler = hymo_krp_d_path_ret;
+		hymo_krp_d_path.data_size = sizeof(struct hymo_d_path_ri_data);
 		hymo_krp_d_path.maxactive = 64;
 		ret = register_kretprobe(&hymo_krp_d_path);
 		if (ret) {
@@ -2615,6 +2899,27 @@ static int __init hymofs_lkm_init(void)
 			return ret;
 		}
 		pr_info("hymofs: kretprobes vfs_getattr, d_path, iterate_dir registered\n");
+
+		/* vfs_getxattr kretprobe for SELinux context spoofing (optional) */
+		{
+			unsigned long xattr_addr = hymofs_lookup_name("vfs_getxattr");
+			if (xattr_addr) {
+				hymo_krp_vfs_getxattr.kp.addr = (kprobe_opcode_t *)xattr_addr;
+				hymo_krp_vfs_getxattr.entry_handler = hymo_krp_vfs_getxattr_entry;
+				hymo_krp_vfs_getxattr.handler = hymo_krp_vfs_getxattr_ret;
+				hymo_krp_vfs_getxattr.data_size = sizeof(struct hymo_getxattr_ri_data);
+				hymo_krp_vfs_getxattr.maxactive = 64;
+				ret = register_kretprobe(&hymo_krp_vfs_getxattr);
+				if (ret == 0) {
+					hymo_getxattr_kprobe_registered = 1;
+					pr_info("hymofs: kretprobe vfs_getxattr registered (SELinux spoof)\n");
+				} else {
+					pr_warn("hymofs: register_kretprobe(vfs_getxattr) failed: %d\n", ret);
+				}
+			} else {
+				pr_warn("hymofs: vfs_getxattr not found, SELinux context spoofing disabled\n");
+			}
+		}
 	}
 	pr_info("hymofs: initialized (%d VFS kprobes + 3 kretprobes + GET_FD)\n",
 		HYMOFS_VFS_HOOK_COUNT);
@@ -2640,6 +2945,8 @@ static void __exit hymofs_lkm_exit(void)
 	unregister_kprobe(&hymo_kp_ni);
 
 #if HYMOFS_VFS_KPROBES
+	if (hymo_getxattr_kprobe_registered)
+		unregister_kretprobe(&hymo_krp_vfs_getxattr);
 	unregister_kretprobe(&hymo_krp_iterate_dir);
 	unregister_kretprobe(&hymo_krp_d_path);
 	unregister_kretprobe(&hymo_krp_vfs_getattr);
