@@ -618,8 +618,9 @@ next_entry:
 		if (target_node->target && hymo_kern_path && hymo_dentry_open) {
 			struct path path;
 			if (hymo_kern_path(target_node->target, LOOKUP_FOLLOW, &path) == 0) {
+				const struct cred *cred = get_task_cred(&init_task);
 				struct file *f = hymo_dentry_open(&path, O_RDONLY | O_DIRECTORY,
-								current_cred());
+								cred);
 				if (!IS_ERR(f)) {
 					struct hymo_merge_ctx mctx = {
 						.ctx.actor = hymo_merge_filldir,
@@ -631,6 +632,7 @@ next_entry:
 					this_cpu_write(hymo_in_populate_inject, 0);
 					fput(f);
 				}
+				put_cred(cred);
 				path_put(&path);
 			}
 			kfree(target_node->target);
