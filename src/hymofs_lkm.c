@@ -2384,14 +2384,19 @@ static HYMO_NOCFI int hymo_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
 
 	/* Resolve source path (bypass redirect) and get its actual SELinux context.
 	 * When source file doesn't exist (e.g. overlay dir is empty), try parent
-	 * directories until we find one with a valid context (e.g. /system/product/overlay). */
+	 * directories. Use d_absolute_path on resolved parent to get symlink-resolved
+	 * path (e.g. /system/product -> /product), then try resolved+remainder. */
 	atomic_long_set(&hymo_xattr_source_tgid, (long)task_tgid_vnr(current));
 	if (hymo_kern_path) {
 		char parent[256];
+		char resolved[256];
+		char alt[512];
 		const char *try_path = entry->src;
 		size_t len = strlen(entry->src);
+		size_t parent_len;
 
 		while (try_path && len > 1) {
+			/* Try logical path (LOOKUP_FOLLOW resolves symlinks) */
 			if (hymo_kern_path(try_path, LOOKUP_FOLLOW, &src_path) == 0) {
 				ret = hymo_get_selinux_ctx_from_path(&src_path, d->src_ctx, HYMO_SELINUX_CTX_MAX);
 				path_put(&src_path);
@@ -2402,7 +2407,8 @@ static HYMO_NOCFI int hymo_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
 					break;
 				}
 			}
-			/* Try parent directory: strip last component */
+			/* Logical path failed: try parent, get resolved path via d_absolute_path,
+			 * then try resolved+remainder (handles any symlink, not just /system/product). */
 			if (len >= sizeof(parent))
 				break;
 			memcpy(parent, try_path, len + 1);
@@ -2411,9 +2417,44 @@ static HYMO_NOCFI int hymo_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
 				if (!slash || slash == parent)
 					break;
 				*slash = '\0';
-				try_path = parent;
-				len = slash - parent;
+				parent_len = slash - parent;
 			}
+			if (hymo_kern_path(parent, LOOKUP_FOLLOW, &src_path) == 0) {
+				char *res = NULL;
+				bool got_ctx = false;
+				if (hymo_d_absolute_path)
+					res = hymo_d_absolute_path(&src_path, resolved, sizeof(resolved));
+				if (IS_ERR_OR_NULL(res) && hymo_dentry_path_raw)
+					res = hymo_dentry_path_raw(src_path.dentry, resolved, sizeof(resolved));
+				if (res && !IS_ERR(res) && res[0] == '/' &&
+				    parent_len < len && try_path[parent_len] == '/') {
+					const char *remainder = try_path + parent_len;
+					if (snprintf(alt, sizeof(alt), "%s%s", res, remainder) < (int)sizeof(alt) &&
+					    strcmp(alt, try_path) != 0) {
+						struct path alt_path;
+						if (hymo_kern_path(alt, LOOKUP_FOLLOW, &alt_path) == 0) {
+							ret = hymo_get_selinux_ctx_from_path(&alt_path, d->src_ctx, HYMO_SELINUX_CTX_MAX);
+							path_put(&alt_path);
+							if (ret > 0 && (size_t)ret < HYMO_SELINUX_CTX_MAX)
+								got_ctx = true;
+						}
+					}
+				}
+				if (!got_ctx) {
+					ret = hymo_get_selinux_ctx_from_path(&src_path, d->src_ctx, HYMO_SELINUX_CTX_MAX);
+					if (ret > 0 && (size_t)ret < HYMO_SELINUX_CTX_MAX)
+						got_ctx = true;
+				}
+				path_put(&src_path);
+				if (got_ctx) {
+					d->src_ctx_len = (size_t)ret;
+					d->src_ctx[d->src_ctx_len] = '\0';
+					d->spoof_selinux = true;
+					break;
+				}
+			}
+			try_path = parent;
+			len = parent_len;
 		}
 	}
 	atomic_long_set(&hymo_xattr_source_tgid, 0);
