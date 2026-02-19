@@ -194,6 +194,8 @@ static DECLARE_BITMAP(hymo_hide_bloom, HYMO_BLOOM_SIZE);
 
 /* VFS symbols resolved at init; forward-declared for use in merge/inject before init. */
 static int (*hymo_kern_path)(const char *, unsigned int, struct path *);
+static int (*hymo_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
+static struct file *(*hymo_dentry_open)(const struct path *, int, const struct cred *);
 
 /* hymo_log macro is in hymofs_lkm.h */
 
@@ -708,9 +710,7 @@ static void hymo_add_allow_uid(uid_t uid)
 static struct file *(*hymo_filp_open)(const char *, int, umode_t);
 static int (*hymo_filp_close)(struct file *, fl_owner_t);
 static ssize_t (*hymo_kernel_read)(struct file *, void *, size_t, loff_t *);
-static int (*hymo_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
-static struct file *(*hymo_dentry_open)(const struct path *, int, const struct cred *);
-/* hymo_kern_path declared above (used by merge/inject before init) */
+/* hymo_kern_path, hymo_vfs_getattr, hymo_dentry_open declared above (merge/inject) */
 static char *(*hymo_strndup_user)(const char __user *, long);
 static struct filename *(*hymo_getname_kernel)(const char *);
 static void (*hymo_ihold)(struct inode *);
