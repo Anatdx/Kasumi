@@ -534,6 +534,14 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	int bkt;
 	bool should_inject = false;
 	size_t dir_len;
+	/* d_path-resolved form of dir_path for matching rules stored via d_path.
+	 * iterate_dir gives us d_absolute_path output, but ADD_RULE/ADD_MERGE_RULE
+	 * store paths using d_path. These can differ (e.g. /product/overlay vs
+	 * /system/product/overlay) due to bind mounts / symlinks. */
+	char *dpath_buf = NULL;
+	const char *dpath_dir = NULL;
+	size_t dpath_dir_len = 0;
+	u32 dpath_hash = 0;
 
 	if (unlikely(!hymofs_enabled || !dir_path))
 		return;
@@ -542,7 +550,35 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	dir_len = strlen(dir_path);
 	hash = full_name_hash(NULL, dir_path, dir_len);
 
+	/* Resolve the d_path form of this directory. We're in filldir callback
+	 * (process context), so d_path is safe to call. Our d_path kretprobe
+	 * won't interfere since this directory is not a redirect target. */
+	if (parent) {
+		struct path dp = { .dentry = parent, .mnt = NULL };
+		/* Try to recover vfsmount from parent's superblock;
+		 * the caller (filldir) has file->f_path but we only get dentry.
+		 * Use kern_path on dir_path to get a proper struct path. */
+		if (hymo_kern_path) {
+			struct path resolved;
+			if (hymo_kern_path(dir_path, LOOKUP_FOLLOW, &resolved) == 0) {
+				dpath_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+				if (dpath_buf) {
+					char *p = d_path(&resolved, dpath_buf, PATH_MAX);
+					if (!IS_ERR(p) && p[0] == '/' &&
+					    strcmp(p, dir_path) != 0) {
+						dpath_dir = p;
+						dpath_dir_len = strlen(p);
+						dpath_hash = full_name_hash(NULL, p, dpath_dir_len);
+					}
+				}
+				path_put(&resolved);
+			}
+		}
+	}
+
 	rcu_read_lock();
+
+	/* Try both d_absolute_path form and d_path form for inject_dirs */
 	hlist_for_each_entry_rcu(inject_entry,
 		&hymo_inject_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
 		if (strcmp(inject_entry->dir, dir_path) == 0) {
@@ -550,14 +586,25 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 			break;
 		}
 	}
+	if (!should_inject && dpath_dir) {
+		hlist_for_each_entry_rcu(inject_entry,
+			&hymo_inject_dirs[hash_min(dpath_hash, HYMO_HASH_BITS)], node) {
+			if (strcmp(inject_entry->dir, dpath_dir) == 0) {
+				should_inject = true;
+				break;
+			}
+		}
+	}
 
-	/* Merge rules are few (typically 1-5). Scan all buckets to match
-	 * against both me->src and me->resolved_src, since dir_path from
-	 * d_absolute_path may be the canonical form. */
+	/* Scan all merge entries to match both src and resolved_src against
+	 * both path forms. */
 	hash_for_each_rcu(hymo_merge_dirs, bkt, merge_entry, node) {
 		if (strcmp(merge_entry->src, dir_path) == 0 ||
 		    (merge_entry->resolved_src &&
-		     strcmp(merge_entry->resolved_src, dir_path) == 0)) {
+		     strcmp(merge_entry->resolved_src, dir_path) == 0) ||
+		    (dpath_dir && strcmp(merge_entry->src, dpath_dir) == 0) ||
+		    (dpath_dir && merge_entry->resolved_src &&
+		     strcmp(merge_entry->resolved_src, dpath_dir) == 0)) {
 			if (!match_src) {
 				match_src = merge_entry->src;
 				match_src_len = strlen(match_src);
@@ -576,10 +623,13 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	}
 
 	if (should_inject) {
-		/* Use original src path for hymo_paths prefix scan
-		 * (materialize_merge stores entries under original src) */
-		const char *pfx = match_src ? match_src : dir_path;
-		size_t pfx_len = match_src ? match_src_len : dir_len;
+		/* Use original src path for hymo_paths prefix scan.
+		 * Prefer match_src (from merge rule), then dpath_dir (d_path form
+		 * matching ADD_RULE entries), then dir_path as fallback. */
+		const char *pfx = match_src ? match_src :
+				  dpath_dir ? dpath_dir : dir_path;
+		size_t pfx_len = match_src ? match_src_len :
+				 dpath_dir ? dpath_dir_len : dir_len;
 
 		hash_for_each_rcu(hymo_paths, bkt, entry, node) {
 			if (strncmp(entry->src, pfx, pfx_len) != 0)
@@ -640,6 +690,7 @@ next_entry:
 		list_del(&target_node->list);
 		kfree(target_node);
 	}
+	kfree(dpath_buf);
 }
 
 /* ======================================================================
