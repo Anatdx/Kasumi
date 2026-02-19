@@ -340,48 +340,6 @@ static void hymo_merge_trie_build_locked(void)
 	spin_unlock(&hymo_merge_trie_lock);
 }
 
-/* Longest-prefix lookup; caller must hold rcu_read_lock. */
-static struct hymo_merge_entry * __maybe_unused
-hymo_merge_trie_lookup_longest(const char *pathname)
-{
-	struct hymo_merge_trie_node *root, *cur, *child;
-	const char *path, *start;
-	size_t comp_len;
-	struct hymo_merge_entry *last = NULL;
-
-	root = rcu_dereference(hymo_merge_trie_root);
-	if (!root)
-		return NULL;
-	path = pathname;
-	while (*path == '/')
-		path++;
-	cur = root;
-	while (*path) {
-		start = path;
-		while (*path && *path != '/')
-			path++;
-		comp_len = (size_t)(path - start);
-		if (comp_len == 0) {
-			if (*path) path++;
-			continue;
-		}
-		for (child = rcu_dereference(cur->first_child); child;
-		     child = rcu_dereference(child->next_sibling)) {
-			if (child->comp_len == comp_len &&
-			    memcmp(child->comp, start, comp_len) == 0)
-				break;
-		}
-		if (!child)
-			return last;
-		cur = child;
-		if (cur->entry)
-			last = cur->entry;
-		if (*path == '/')
-			path++;
-	}
-	return last;
-}
-
 /* ======================================================================
  * Part 8: Inode Marking
  * ====================================================================== */
