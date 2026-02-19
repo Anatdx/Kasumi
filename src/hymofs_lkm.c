@@ -2029,14 +2029,12 @@ passthrough:
  * Resolved dynamically via kallsyms (not exported on GKI).
  */
 static long (*hymo_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
-static long (*hymo_copy_to_user_nofault)(void __user *dst, const void *src, long count);
 
 /* getname_flags pre-handler: only modify user path and regs; return 0 to run original. */
 static HYMO_NOCFI int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	const char __user *filename_user;
 	char *buf;
-	size_t len;
 	char *target;
 
 	(void)p;
@@ -2080,25 +2078,29 @@ static HYMO_NOCFI int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs
 		return 1;
 	}
 
-	/* Redirect: overwrite user path in place so original getname_flags sees it */
+	/* Redirect: use getname_kernel to build a struct filename from the target
+	 * path, then skip the original getname_flags entirely.  This avoids
+	 * writing back to user memory (which may be read-only, too small, or
+	 * cause PAN/MTE faults in atomic context). */
 	if (buf[0] != '/')
 		return 0;
 	target = hymofs_resolve_target(buf);
 	if (!target)
 		return 0;
-	len = strlen(target);
-	if (len >= HYMO_PATH_BUF)
-		goto out;
-	if (hymo_copy_to_user_nofault) {
-		if (hymo_copy_to_user_nofault((void __user *)filename_user, target, len + 1))
-			goto out;
-	} else {
-		if (copy_to_user((void __user *)filename_user, target, len + 1))
-			goto out;
+	if (hymo_getname_kernel) {
+		struct filename *fname;
+
+		this_cpu_write(hymo_kprobe_reent, 1);
+		fname = hymo_getname_kernel(target);
+		this_cpu_write(hymo_kprobe_reent, 0);
+		kfree(target);
+		if (IS_ERR(fname))
+			return 0;
+		HYMO_REG0(regs) = (unsigned long)fname;
+		instruction_pointer_set(regs, HYMO_LR(regs));
+		HYMO_POP_STACK(regs);
+		return 1;
 	}
-	kfree(target);
-	return 0;
-out:
 	kfree(target);
 	return 0;
 }
@@ -2154,40 +2156,20 @@ static int hymo_kp_d_path_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * d_path kretprobe: reverse lookup disabled.
+ * Per-CPU buf/bufsize is unsafe: kretprobe return can run on a different CPU
+ * than the pre-handler (task migration during d_path which may sleep), so we
+ * would dereference stale/invalid pointers and corrupt memory.
+ * Additionally, d_path returns a pointer *inside* the caller's buffer, so
+ * writing to buf[0] would not update the returned pointer, corrupting the
+ * result the caller sees.
+ * Re-enable only when using kretprobe instance data (ri->data).
+ */
 static int hymo_krp_d_path_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	char *buf;
-	int bufsize;
-	char *res;
-	char temp[256];
-	int len;
-
 	(void)ri;
-#if defined(__aarch64__)
-	res = (char *)regs->regs[0];
-#elif defined(__x86_64__)
-	res = (char *)regs->ax;
-#else
-	res = NULL;
-#endif
-	if (IS_ERR(res))
-		return 0;
-	if (uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return 0;
-	if (hymo_daemon_pid > 0 && task_tgid_vnr(current) == hymo_daemon_pid)
-		return 0;
-	if (hash_empty(hymo_targets) && hash_empty(hymo_merge_dirs))
-		return 0;
-
-	buf = this_cpu_read(hymo_d_path_buf);
-	bufsize = this_cpu_read(hymo_d_path_bufsize);
-	if (!buf || bufsize <= 0)
-		return 0;
-
-	len = hymofs_reverse_lookup(res, temp, sizeof(temp));
-	if (len > 0 && len < bufsize) {
-		memcpy(buf, temp, len + 1);
-	}
+	(void)regs;
 	return 0;
 }
 
@@ -2258,16 +2240,26 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
-/* After iterate_dir returns, copy wrapper pos back to original ctx when we swapped. */
+struct hymo_iterate_ri_data {
+	int did_swap;
+	struct hymofs_filldir_wrapper *wrapper;
+};
+
+static int hymo_krp_iterate_dir_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct hymo_iterate_ri_data *d = (void *)ri->data;
+	(void)regs;
+	d->did_swap = this_cpu_read(hymo_iterate_did_swap);
+	d->wrapper = d->did_swap ? this_cpu_ptr(&hymo_iterate_wrapper) : NULL;
+	return 0;
+}
+
 static int hymo_krp_iterate_dir_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct hymofs_filldir_wrapper *w = this_cpu_ptr(&hymo_iterate_wrapper);
-
+	struct hymo_iterate_ri_data *d = (void *)ri->data;
 	(void)regs;
-	(void)ri;
-	if (this_cpu_read(hymo_iterate_did_swap) && w->orig_ctx)
-		w->orig_ctx->pos = w->wrap_ctx.pos;
-	this_cpu_write(hymo_iterate_did_swap, 0);
+	if (d->did_swap && d->wrapper && d->wrapper->orig_ctx)
+		d->wrapper->orig_ctx->pos = d->wrapper->wrap_ctx.pos;
 	return 0;
 }
 
@@ -2332,9 +2324,8 @@ static int __init hymofs_lkm_init(void)
 	hymo_dentry_open = (void *)hymofs_lookup_name("dentry_open");
 	hymo_d_absolute_path = (void *)hymofs_lookup_name("d_absolute_path");
 	hymo_strncpy_from_user_nofault = (void *)hymofs_lookup_name("strncpy_from_user_nofault");
-	hymo_copy_to_user_nofault = (void *)hymofs_lookup_name("copy_to_user_nofault");
-	if (!hymo_strncpy_from_user_nofault || !hymo_copy_to_user_nofault)
-		pr_warn("hymofs: nofault user access not found, falling back to copy_from/to_user\n");
+	if (!hymo_strncpy_from_user_nofault)
+		pr_warn("hymofs: strncpy_from_user_nofault not found, falling back to copy_from_user\n");
 	if (!hymo_filp_open || !hymo_kernel_read)
 		pr_warn("hymofs: filp_open/kernel_read not found, allowlist disabled\n");
 	if (!hymo_vfs_getattr || !hymo_dentry_open)
@@ -2535,7 +2526,9 @@ static int __init hymofs_lkm_init(void)
 			return ret;
 		}
 		hymo_krp_iterate_dir.kp.addr = hymofs_kprobes[HYMOFS_VFS_IDX_ITERDIR].addr;
+		hymo_krp_iterate_dir.entry_handler = hymo_krp_iterate_dir_entry;
 		hymo_krp_iterate_dir.handler = hymo_krp_iterate_dir_ret;
+		hymo_krp_iterate_dir.data_size = sizeof(struct hymo_iterate_ri_data);
 		hymo_krp_iterate_dir.maxactive = 64;
 		ret = register_kretprobe(&hymo_krp_iterate_dir);
 		if (ret) {
