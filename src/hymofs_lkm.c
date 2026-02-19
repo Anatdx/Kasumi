@@ -2382,15 +2382,38 @@ static HYMO_NOCFI int hymo_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
 	if (!entry || !entry->src)
 		return 0;
 
-	/* Resolve source path (bypass redirect) and get its actual SELinux context */
+	/* Resolve source path (bypass redirect) and get its actual SELinux context.
+	 * When source file doesn't exist (e.g. overlay dir is empty), try parent
+	 * directories until we find one with a valid context (e.g. /system/product/overlay). */
 	atomic_long_set(&hymo_xattr_source_tgid, (long)task_tgid_vnr(current));
-	if (hymo_kern_path && hymo_kern_path(entry->src, LOOKUP_FOLLOW, &src_path) == 0) {
-		ret = hymo_get_selinux_ctx_from_path(&src_path, d->src_ctx, HYMO_SELINUX_CTX_MAX);
-		path_put(&src_path);
-		if (ret > 0 && (size_t)ret < HYMO_SELINUX_CTX_MAX) {
-			d->src_ctx_len = (size_t)ret;
-			d->src_ctx[d->src_ctx_len] = '\0';
-			d->spoof_selinux = true;
+	if (hymo_kern_path) {
+		char parent[256];
+		const char *try_path = entry->src;
+		size_t len = strlen(entry->src);
+
+		while (try_path && len > 1) {
+			if (hymo_kern_path(try_path, LOOKUP_FOLLOW, &src_path) == 0) {
+				ret = hymo_get_selinux_ctx_from_path(&src_path, d->src_ctx, HYMO_SELINUX_CTX_MAX);
+				path_put(&src_path);
+				if (ret > 0 && (size_t)ret < HYMO_SELINUX_CTX_MAX) {
+					d->src_ctx_len = (size_t)ret;
+					d->src_ctx[d->src_ctx_len] = '\0';
+					d->spoof_selinux = true;
+					break;
+				}
+			}
+			/* Try parent directory: strip last component */
+			if (len >= sizeof(parent))
+				break;
+			memcpy(parent, try_path, len + 1);
+			{
+				char *slash = strrchr(parent, '/');
+				if (!slash || slash == parent)
+					break;
+				*slash = '\0';
+				try_path = parent;
+				len = slash - parent;
+			}
 		}
 	}
 	atomic_long_set(&hymo_xattr_source_tgid, 0);
