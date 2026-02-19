@@ -860,61 +860,6 @@ static char * __maybe_unused hymofs_resolve_target(const char *pathname)
 }
 
 /* ======================================================================
- * Part 13: Reverse Lookup (for d_path kretprobe)
- * ====================================================================== */
-
-static int hymofs_reverse_lookup(const char *pathname, char *buf, size_t buflen)
-{
-	struct hymo_entry *entry;
-	struct hymo_merge_entry *me;
-	u32 hash;
-	int bkt, ret = -1;
-
-	if (unlikely(!hymofs_enabled || !pathname || !buf))
-		return -1;
-
-	hash = full_name_hash(NULL, pathname, strlen(pathname));
-
-	rcu_read_lock();
-
-	hlist_for_each_entry_rcu(entry,
-		&hymo_targets[hash_min(hash, HYMO_HASH_BITS)], target_node) {
-		if (strcmp(entry->target, pathname) == 0) {
-			ret = strscpy(buf, entry->src, buflen);
-			if (ret < 0)
-				ret = -ENAMETOOLONG;
-			else
-				ret = (int)strlen(buf);
-			goto out;
-		}
-	}
-
-	hash_for_each_rcu(hymo_merge_dirs, bkt, me, node) {
-		size_t target_len = strlen(me->target);
-
-		if (strncmp(pathname, me->target, target_len) == 0 &&
-		    (pathname[target_len] == '/' || pathname[target_len] == '\0')) {
-			size_t src_len = strlen(me->src);
-			size_t suffix_len = strlen(pathname) - target_len;
-
-			if (src_len + suffix_len + 1 > buflen) {
-				ret = -ENAMETOOLONG;
-			} else {
-				memcpy(buf, me->src, src_len);
-				memcpy(buf + src_len, pathname + target_len, suffix_len);
-				buf[src_len + suffix_len] = '\0';
-				ret = (int)(src_len + suffix_len);
-			}
-			goto out;
-		}
-	}
-
-out:
-	rcu_read_unlock();
-	return ret;
-}
-
-/* ======================================================================
  * Part 14: Hide Logic
  * ====================================================================== */
 
