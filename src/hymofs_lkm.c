@@ -54,9 +54,11 @@ MODULE_VERSION(HYMOFS_VERSION);
 /*
  * Set to 1 to register VFS kprobes (path/stat/dir hooks). Set to 0 for GET_FD only
  * if the LKM causes bootloop on your kernel.
+ * Default 0: VFS hooks can trigger zygote SIGSEGV during early boot on some devices.
+ * Build with -DHYMOFS_VFS_KPROBES=1 to enable full path/stat/dir hijacking.
  */
 #ifndef HYMOFS_VFS_KPROBES
-#define HYMOFS_VFS_KPROBES 1
+#define HYMOFS_VFS_KPROBES 0
 #endif
 
 /*
