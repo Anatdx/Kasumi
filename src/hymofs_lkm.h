@@ -49,6 +49,8 @@
 
 /* Max path length in getname_flags pre-handler buffer. */
 #define HYMO_PATH_BUF               512
+/* iterate_dir path buffer; keep small to avoid percpu OOM on low-mem devices */
+#define HYMO_ITERATE_PATH_BUF       512
 
 /* dir_context.actor return type: 6.1+ uses bool */
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))

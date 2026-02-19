@@ -92,7 +92,7 @@ static DEFINE_PER_CPU(int, hymo_d_path_bufsize);
 /* Per-CPU for iterate_dir: swap ctx so kernel runs our filldir filter. */
 static DEFINE_PER_CPU(struct hymofs_filldir_wrapper, hymo_iterate_wrapper);
 static DEFINE_PER_CPU(int, hymo_iterate_did_swap);
-static DEFINE_PER_CPU(char[PATH_MAX], hymo_iterate_dir_path);
+static DEFINE_PER_CPU(char[HYMO_ITERATE_PATH_BUF], hymo_iterate_dir_path);
 /* When set, we're inside hymofs_populate_injected_list; skip ctx swap in iterate_dir pre. */
 static DEFINE_PER_CPU(int, hymo_in_populate_inject);
 
@@ -2219,7 +2219,7 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 			w->dir_path_len = 4;
 
 		/* Get full path for inject lookup; d_path may sleep but we're in process context. */
-		res = d_path(&file->f_path, path_buf, PATH_MAX);
+		res = d_path(&file->f_path, path_buf, HYMO_ITERATE_PATH_BUF);
 		if (!IS_ERR(res) && res[0] == '/') {
 			w->dir_path = res;
 			{
