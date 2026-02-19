@@ -2415,7 +2415,7 @@ static HYMO_NOCFI int hymo_krp_d_path_entry(struct kretprobe_instance *ri,
 	entry = hymofs_reverse_lookup_target(dp);
 	if (entry && strlen(entry->src) < HYMO_D_PATH_SRC_MAX) {
 		d->is_target = true;
-		strlcpy(d->src_path, entry->src, HYMO_D_PATH_SRC_MAX);
+		strscpy(d->src_path, entry->src, HYMO_D_PATH_SRC_MAX);
 	}
 	rcu_read_unlock();
 
