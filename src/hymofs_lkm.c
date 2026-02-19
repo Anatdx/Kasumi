@@ -243,6 +243,8 @@ static void hymo_xattr_sb_entry_free_rcu(struct rcu_head *head)
 static void hymo_merge_entry_free_rcu(struct rcu_head *head)
 {
 	struct hymo_merge_entry *e = container_of(head, struct hymo_merge_entry, rcu);
+	if (e->target_dentry)
+		dput(e->target_dentry);
 	kfree(e->src);
 	kfree(e->target);
 	kfree(e->resolved_src);
@@ -397,8 +399,6 @@ static void hymo_cleanup_locked(void)
 	}
 	hash_for_each_safe(hymo_merge_dirs, bkt, tmp, merge_entry, node) {
 		hlist_del_rcu(&merge_entry->node);
-		if (merge_entry->resolved_src)
-			hlist_del_rcu(&merge_entry->resolved_node);
 		call_rcu(&merge_entry->rcu, hymo_merge_entry_free_rcu);
 	}
 
@@ -528,6 +528,8 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	struct hymo_name_list *item;
 	struct hymo_merge_target_node *target_node, *tmp_node;
 	struct list_head merge_targets;
+	const char *match_src = NULL;
+	size_t match_src_len = 0;
 	u32 hash;
 	int bkt;
 	bool should_inject = false;
@@ -540,10 +542,6 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 	dir_len = strlen(dir_path);
 	hash = full_name_hash(NULL, dir_path, dir_len);
 
-	/* canonical_src: original path used for hymo_paths (materialize uses original) */
-	const char *canonical_src = dir_path;
-	size_t canonical_len = dir_len;
-
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(inject_entry,
 		&hymo_inject_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
@@ -552,20 +550,17 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 			break;
 		}
 	}
-	hlist_for_each_entry_rcu(merge_entry,
-		&hymo_merge_dirs[hash_min(hash, HYMO_HASH_BITS)], node) {
-		bool match = (strcmp(merge_entry->src, dir_path) == 0) ||
-			     (merge_entry->resolved_src &&
-			      strcmp(merge_entry->resolved_src, dir_path) == 0);
-		if (match) {
-			if (merge_entry->src != dir_path)
-				canonical_src = merge_entry->src;
-			canonical_len = strlen(canonical_src);
-			/* Dedup: avoid adding same target twice (e.g. from both buckets) */
-			list_for_each_entry(tmp_node, &merge_targets, list) {
-				if (tmp_node->target && merge_entry->target &&
-				    strcmp(tmp_node->target, merge_entry->target) == 0)
-					goto next_merge;
+
+	/* Merge rules are few (typically 1-5). Scan all buckets to match
+	 * against both me->src and me->resolved_src, since dir_path from
+	 * d_absolute_path may be the canonical form. */
+	hash_for_each_rcu(hymo_merge_dirs, bkt, merge_entry, node) {
+		if (strcmp(merge_entry->src, dir_path) == 0 ||
+		    (merge_entry->resolved_src &&
+		     strcmp(merge_entry->resolved_src, dir_path) == 0)) {
+			if (!match_src) {
+				match_src = merge_entry->src;
+				match_src_len = strlen(match_src);
 			}
 			target_node = kmalloc(sizeof(*target_node), GFP_ATOMIC);
 			if (target_node) {
@@ -578,20 +573,23 @@ static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struc
 			}
 			should_inject = true;
 		}
-next_merge:
-		;
 	}
 
 	if (should_inject) {
+		/* Use original src path for hymo_paths prefix scan
+		 * (materialize_merge stores entries under original src) */
+		const char *pfx = match_src ? match_src : dir_path;
+		size_t pfx_len = match_src ? match_src_len : dir_len;
+
 		hash_for_each_rcu(hymo_paths, bkt, entry, node) {
-			if (strncmp(entry->src, canonical_src, canonical_len) != 0)
+			if (strncmp(entry->src, pfx, pfx_len) != 0)
 				continue;
 			{
 				char *name = NULL;
-				if (canonical_len == 1 && canonical_src[0] == '/')
+				if (pfx_len == 1 && pfx[0] == '/')
 					name = (char *)entry->src + 1;
-				else if (entry->src[canonical_len] == '/')
-					name = (char *)entry->src + canonical_len + 1;
+				else if (entry->src[pfx_len] == '/')
+					name = (char *)entry->src + pfx_len + 1;
 
 				if (name && *name && !strchr(name, '/')) {
 					struct hymo_name_list *pos;
@@ -1274,12 +1272,15 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
-		/* Resolve symlinks for iterate_dir lookup. Keep original src for
-		 * hymo_paths/bloom. Store resolved_src in merge entry so we match
-		 * d_absolute_path output without duplicating merge entries. */
+		/* Resolve symlinks: d_absolute_path in iterate_dir returns
+		 * canonical paths (e.g. /product/overlay), while userspace sends
+		 * symlink paths (e.g. /system/product/overlay). Store the
+		 * canonical form as resolved_src for iterate_dir matching. */
 		{
 			char *resolved_src = NULL;
+			struct dentry *tgt_dentry = NULL;
 			struct path mpath;
+
 			if (hymo_kern_path(src, LOOKUP_FOLLOW, &mpath) == 0) {
 				char *rbuf = kmalloc(PATH_MAX, GFP_KERNEL);
 				if (rbuf) {
@@ -1289,6 +1290,10 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 						resolved_src = kstrdup(res, GFP_KERNEL);
 					kfree(rbuf);
 				}
+				path_put(&mpath);
+			}
+			if (hymo_kern_path(target, LOOKUP_FOLLOW, &mpath) == 0) {
+				tgt_dentry = dget(mpath.dentry);
 				path_put(&mpath);
 			}
 
@@ -1312,15 +1317,11 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 					me->src = src;
 					me->target = target;
 					me->resolved_src = resolved_src;
+					me->target_dentry = tgt_dentry;
 					resolved_src = NULL;
+					tgt_dentry = NULL;
 					hlist_add_head_rcu(&me->node,
 						&hymo_merge_dirs[hash_min(hash, HYMO_HASH_BITS)]);
-					if (me->resolved_src) {
-						u32 rh = full_name_hash(NULL, me->resolved_src,
-									strlen(me->resolved_src));
-						hlist_add_head_rcu(&me->resolved_node,
-							&hymo_merge_dirs[hash_min(rh, HYMO_HASH_BITS)]);
-					}
 					src = NULL;
 					target = NULL;
 					hymo_merge_trie_build_locked();
@@ -1340,6 +1341,8 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 					hymofs_materialize_merge(mat_src, mat_tgt, 0);
 			}
 			kfree(resolved_src);
+			if (tgt_dentry)
+				dput(tgt_dentry);
 			kfree(mat_src);
 			kfree(mat_tgt);
 		}
@@ -2020,6 +2023,8 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 		container_of(ctx, struct hymofs_filldir_wrapper, wrap_ctx);
 	HYMO_FILLDIR_RET_TYPE ret;
 
+	/* Inject phase: before first real entry, emit entries from merge targets
+	 * and hymo_paths into the directory listing. */
 	if (w->dir_has_inject && !w->inject_done && w->dir_path && w->parent_dentry) {
 		struct list_head head;
 		struct hymo_name_list *item, *tmp;
@@ -2033,21 +2038,6 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 			int nlen = strlen(item->name);
 			ret = w->orig_ctx->actor(w->orig_ctx, item->name, nlen,
 						 inj_pos, 1, item->type);
-			/* Track emitted name to skip duplicate from real listing */
-			{
-				struct hymo_name_list *e = kmalloc(sizeof(*e), GFP_ATOMIC);
-				if (e && item->name) {
-					e->name = kstrdup(item->name, GFP_ATOMIC);
-					if (e->name) {
-						e->type = item->type;
-						list_add_tail(&e->list, &w->emitted_names);
-					} else {
-						kfree(e);
-					}
-				} else if (e) {
-					kfree(e);
-				}
-			}
 			list_del(&item->list);
 			kfree(item->name);
 			kfree(item);
@@ -2063,16 +2053,6 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 		}
 	}
 
-	/* Skip real entry if already emitted in inject phase (avoid duplicate) */
-	if (w->dir_has_inject && w->inject_done && namlen > 0) {
-		struct hymo_name_list *e;
-		list_for_each_entry(e, &w->emitted_names, list) {
-			if (e->name && (int)strlen(e->name) == namlen &&
-			    memcmp(e->name, name, namlen) == 0)
-				return HYMO_FILLDIR_CONTINUE;
-		}
-	}
-
 	if (unlikely(namlen <= 2 && name[0] == '.')) {
 		if (namlen == 1 || (namlen == 2 && name[1] == '.'))
 			goto passthrough;
@@ -2083,6 +2063,22 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 		if ((unsigned int)namlen == mlen &&
 		    memcmp(name, hymo_current_mirror_name, namlen) == 0)
 			return HYMO_FILLDIR_CONTINUE;
+	}
+
+	/* Hide real entries that also exist in merge targets. This prevents
+	 * duplicates: the injected version (from populate_injected_list)
+	 * replaces the original, just like original hymofs.c does. */
+	if (w->merge_target_count > 0) {
+		int i;
+		for (i = 0; i < w->merge_target_count; i++) {
+			struct dentry *child = d_hash_and_lookup(
+				w->merge_target_dentries[i],
+				&(struct qstr)QSTR_INIT(name, namlen));
+			if (child) {
+				dput(child);
+				return HYMO_FILLDIR_CONTINUE;
+			}
+		}
 	}
 
 	if (w->dir_has_hidden && w->parent_dentry &&
@@ -2723,18 +2719,7 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 	w->dir_path = NULL;
 	w->dir_has_inject = false;
 	w->inject_done = false;
-	/* Free emitted_names from previous directory iteration (init first if uninitialized) */
-	if (!w->emitted_names.next && !w->emitted_names.prev)
-		INIT_LIST_HEAD(&w->emitted_names);
-	{
-		struct hymo_name_list *e, *t;
-		list_for_each_entry_safe(e, t, &w->emitted_names, list) {
-			list_del(&e->list);
-			kfree(e->name);
-			kfree(e);
-		}
-	}
-	INIT_LIST_HEAD(&w->emitted_names);
+	w->merge_target_count = 0;
 
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
@@ -2765,6 +2750,7 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 				struct hymo_inject_entry *ie;
 				struct hymo_merge_entry *me;
 				u32 h;
+				int mbkt;
 
 				w->dir_path = dp;
 				h = full_name_hash(NULL, dp, strlen(dp));
@@ -2778,15 +2764,17 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 						break;
 					}
 				}
-				if (!w->dir_has_inject) {
-					hlist_for_each_entry_rcu(me,
-						&hymo_merge_dirs[hash_min(h, HYMO_HASH_BITS)],
-						node) {
-						if (strcmp(me->src, dp) == 0 ||
-						    (me->resolved_src && strcmp(me->resolved_src, dp) == 0)) {
-							w->dir_has_inject = true;
-							break;
-						}
+				/* Scan all merge entries (few) to match both
+				 * src and resolved_src; cache target dentries. */
+				hash_for_each_rcu(hymo_merge_dirs, mbkt, me, node) {
+					if (strcmp(me->src, dp) == 0 ||
+					    (me->resolved_src &&
+					     strcmp(me->resolved_src, dp) == 0)) {
+						w->dir_has_inject = true;
+						if (me->target_dentry &&
+						    w->merge_target_count < HYMO_MAX_MERGE_TARGETS)
+							w->merge_target_dentries[w->merge_target_count++] =
+								me->target_dentry;
 					}
 				}
 				rcu_read_unlock();
