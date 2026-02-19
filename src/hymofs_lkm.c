@@ -2026,11 +2026,10 @@ passthrough:
 /*
  * Atomic-safe user access for kprobe pre-handler (cannot sleep).
  * copy_from_user/copy_to_user may sleep on page fault -> use nofault variants.
- * strncpy_from_user_nofault, copy_to_user_nofault: 5.11+
+ * Resolved dynamically via kallsyms (not exported on GKI).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-#define HYMOFS_HAVE_USER_NOFAULT 1
-#endif
+static long (*hymo_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
+static long (*hymo_copy_to_user_nofault)(void __user *dst, const void *src, long count);
 
 /* getname_flags pre-handler: only modify user path and regs; return 0 to run original. */
 static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
@@ -2052,18 +2051,16 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 
 	buf = this_cpu_ptr(hymo_getname_path_buf);
-#if defined(HYMOFS_HAVE_USER_NOFAULT)
-	{
-		long ret = strncpy_from_user_nofault(buf, filename_user, HYMO_PATH_BUF - 1);
+	if (hymo_strncpy_from_user_nofault) {
+		long ret = hymo_strncpy_from_user_nofault(buf, filename_user, HYMO_PATH_BUF - 1);
 		if (ret < 0)
 			return 0;
 		buf[ret < (long)(HYMO_PATH_BUF - 1) ? ret : (HYMO_PATH_BUF - 1)] = '\0';
+	} else {
+		if (copy_from_user(buf, filename_user, HYMO_PATH_BUF - 1))
+			return 0;
+		buf[HYMO_PATH_BUF - 1] = '\0';
 	}
-#else
-	if (copy_from_user(buf, filename_user, HYMO_PATH_BUF - 1))
-		return 0;
-	buf[HYMO_PATH_BUF - 1] = '\0';
-#endif
 
 	if (likely(hash_empty(hymo_paths) &&
 		   hash_empty(hymo_hide_paths) &&
@@ -2092,13 +2089,13 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 	len = strlen(target);
 	if (len >= HYMO_PATH_BUF)
 		goto out;
-#if defined(HYMOFS_HAVE_USER_NOFAULT)
-	if (copy_to_user_nofault((void __user *)filename_user, target, len + 1))
-		goto out;
-#else
-	if (copy_to_user((void __user *)filename_user, target, len + 1))
-		goto out;
-#endif
+	if (hymo_copy_to_user_nofault) {
+		if (hymo_copy_to_user_nofault((void __user *)filename_user, target, len + 1))
+			goto out;
+	} else {
+		if (copy_to_user((void __user *)filename_user, target, len + 1))
+			goto out;
+	}
 	kfree(target);
 	return 0;
 out:
@@ -2334,6 +2331,10 @@ static int __init hymofs_lkm_init(void)
 	hymo_vfs_getattr = (void *)hymofs_lookup_name("vfs_getattr");
 	hymo_dentry_open = (void *)hymofs_lookup_name("dentry_open");
 	hymo_d_absolute_path = (void *)hymofs_lookup_name("d_absolute_path");
+	hymo_strncpy_from_user_nofault = (void *)hymofs_lookup_name("strncpy_from_user_nofault");
+	hymo_copy_to_user_nofault = (void *)hymofs_lookup_name("copy_to_user_nofault");
+	if (!hymo_strncpy_from_user_nofault || !hymo_copy_to_user_nofault)
+		pr_warn("hymofs: nofault user access not found, falling back to copy_from/to_user\n");
 	if (!hymo_filp_open || !hymo_kernel_read)
 		pr_warn("hymofs: filp_open/kernel_read not found, allowlist disabled\n");
 	if (!hymo_vfs_getattr || !hymo_dentry_open)
