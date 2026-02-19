@@ -2039,7 +2039,6 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 	char *buf;
 	size_t len;
 	char *target;
-	long ret;
 
 	(void)p;
 
@@ -2054,10 +2053,12 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 
 	buf = this_cpu_ptr(hymo_getname_path_buf);
 #if defined(HYMOFS_HAVE_USER_NOFAULT)
-	ret = strncpy_from_user_nofault(buf, filename_user, HYMO_PATH_BUF - 1);
-	if (ret < 0)
-		return 0;
-	buf[ret < (long)(HYMO_PATH_BUF - 1) ? ret : (HYMO_PATH_BUF - 1)] = '\0';
+	{
+		long ret = strncpy_from_user_nofault(buf, filename_user, HYMO_PATH_BUF - 1);
+		if (ret < 0)
+			return 0;
+		buf[ret < (long)(HYMO_PATH_BUF - 1) ? ret : (HYMO_PATH_BUF - 1)] = '\0';
+	}
 #else
 	if (copy_from_user(buf, filename_user, HYMO_PATH_BUF - 1))
 		return 0;
