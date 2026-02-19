@@ -12,6 +12,11 @@ obj-m += hymofs_lkm.o
 # Override -gz=zstd when host compiler does not support it.
 ccflags-y += -gz=none
 
+# Disable CFI for this out-of-tree module: all indirect calls to dynamically
+# resolved kernel symbols (via kallsyms/kprobe) will have mismatched CFI type
+# hashes and trigger CFI failures otherwise.
+ccflags-y += $(call cc-option,-fno-sanitize=cfi)
+
 clean:
 	rm -rf .tmp_versions
 	@# Delete all files in this dir except source, Makefile, .md, .gitignore
