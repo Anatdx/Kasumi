@@ -657,6 +657,139 @@ next_entry:
 }
 
 /* ======================================================================
+ * Part 10c: Materialize merge rule into individual hymo_paths entries
+ *
+ * Called from HYMO_IOC_ADD_MERGE_RULE ioctl (process context, can sleep).
+ * Recursively scans the merge target directory and creates exact-match
+ * redirect rules so getname_flags works without blind trie redirect.
+ * ====================================================================== */
+
+static void hymofs_materialize_merge(const char *src_prefix,
+				     const char *target_dir, int depth);
+
+static void hymofs_add_path_entry(const char *src, const char *tgt,
+				  unsigned char type)
+{
+	struct hymo_entry *e;
+	u32 hash = full_name_hash(NULL, src, strlen(src));
+	bool found = false;
+
+	spin_lock(&hymo_rules_lock);
+	hlist_for_each_entry(e, &hymo_paths[hash_min(hash, HYMO_HASH_BITS)], node) {
+		if (e->src_hash == hash && strcmp(e->src, src) == 0) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		e = kmalloc(sizeof(*e), GFP_ATOMIC);
+		if (e) {
+			e->src = kstrdup(src, GFP_ATOMIC);
+			e->target = kstrdup(tgt, GFP_ATOMIC);
+			e->type = type;
+			e->src_hash = hash;
+			if (e->src && e->target) {
+				unsigned long h1, h2;
+
+				hlist_add_head_rcu(&e->node,
+					&hymo_paths[hash_min(hash, HYMO_HASH_BITS)]);
+				hlist_add_head_rcu(&e->target_node,
+					&hymo_targets[hash_min(
+						full_name_hash(NULL, e->target,
+							strlen(e->target)),
+						HYMO_HASH_BITS)]);
+				h1 = jhash(src, strlen(src), 0) & (HYMO_BLOOM_SIZE - 1);
+				h2 = jhash(src, strlen(src), 1) & (HYMO_BLOOM_SIZE - 1);
+				set_bit(h1, hymo_path_bloom);
+				set_bit(h2, hymo_path_bloom);
+				atomic_inc(&hymo_rule_count);
+			} else {
+				kfree(e->src);
+				kfree(e->target);
+				kfree(e);
+			}
+		}
+	}
+	spin_unlock(&hymo_rules_lock);
+}
+
+struct hymo_mat_ctx {
+	struct dir_context ctx;
+	const char *src_prefix;
+	const char *target_dir;
+	int depth;
+};
+
+static HYMO_NOCFI HYMO_FILLDIR_RET_TYPE
+hymo_mat_filldir(struct dir_context *ctx, const char *name,
+		 int namlen, loff_t offset, u64 ino, unsigned int d_type)
+{
+	struct hymo_mat_ctx *mc = container_of(ctx, struct hymo_mat_ctx, ctx);
+	char *src_path, *tgt_path, *inj_dir;
+
+	(void)offset; (void)ino;
+
+	if (namlen <= 2 && name[0] == '.') {
+		if (namlen == 1 || (namlen == 2 && name[1] == '.'))
+			return HYMO_FILLDIR_CONTINUE;
+	}
+	if (namlen == 8 && memcmp(name, ".replace", 8) == 0)
+		return HYMO_FILLDIR_CONTINUE;
+
+	src_path = kasprintf(GFP_KERNEL, "%s/%.*s", mc->src_prefix, namlen, name);
+	tgt_path = kasprintf(GFP_KERNEL, "%s/%.*s", mc->target_dir, namlen, name);
+	if (!src_path || !tgt_path) {
+		kfree(src_path);
+		kfree(tgt_path);
+		return HYMO_FILLDIR_CONTINUE;
+	}
+
+	hymofs_add_path_entry(src_path, tgt_path, d_type);
+
+	inj_dir = kstrdup(mc->src_prefix, GFP_KERNEL);
+	if (inj_dir)
+		hymofs_add_inject_rule(inj_dir);
+
+	if (d_type == DT_DIR && mc->depth < 8)
+		hymofs_materialize_merge(src_path, tgt_path, mc->depth + 1);
+
+	kfree(src_path);
+	kfree(tgt_path);
+	return HYMO_FILLDIR_CONTINUE;
+}
+
+static HYMO_NOCFI void hymofs_materialize_merge(const char *src_prefix,
+						const char *target_dir,
+						int depth)
+{
+	struct path path;
+	struct file *f;
+	struct hymo_mat_ctx mctx;
+
+	if (!hymo_kern_path || !hymo_dentry_open || depth > 8)
+		return;
+	if (hymo_kern_path(target_dir, LOOKUP_FOLLOW, &path) != 0)
+		return;
+
+	f = hymo_dentry_open(&path, O_RDONLY | O_DIRECTORY, current_cred());
+	if (IS_ERR(f)) {
+		path_put(&path);
+		return;
+	}
+
+	mctx.ctx.actor = hymo_mat_filldir;
+	mctx.ctx.pos = 0;
+	mctx.src_prefix = src_prefix;
+	mctx.target_dir = target_dir;
+	mctx.depth = depth;
+
+	iterate_dir(f, &mctx.ctx);
+
+	fput(f);
+	path_put(&path);
+}
+
+/* ======================================================================
  * Part 11: Core Logic - Privileged Check / Allowlist
  * ====================================================================== */
 
@@ -793,7 +926,6 @@ bad:
 static char * __maybe_unused hymofs_resolve_target(const char *pathname)
 {
 	struct hymo_entry *entry;
-	struct hymo_merge_entry *me;
 	u32 hash;
 	char *target = NULL;
 	size_t path_len;
@@ -829,36 +961,20 @@ static char * __maybe_unused hymofs_resolve_target(const char *pathname)
 		}
 	}
 
-	/* Longest-prefix merge match via trie */
-	me = hymo_merge_trie_lookup_longest(pathname);
-	if (me) {
-		size_t src_len = strlen(me->src);
-		const char *suffix = pathname + src_len;
-
-		if (suffix[0] != '\0' &&
-		    strcmp(suffix, "/.") != 0 &&
-		    strcmp(suffix, "/..") != 0) {
-			size_t target_len = strlen(me->target);
-			size_t suffix_len = path_len - src_len;
-
-			target = kmalloc(target_len + suffix_len + 1, GFP_ATOMIC);
-			if (target) {
-				memcpy(target, me->target, target_len);
-				memcpy(target + target_len, suffix, suffix_len);
-				target[target_len + suffix_len] = '\0';
-			}
-		}
-	}
+	/*
+	 * Merge trie is NOT consulted here for path redirect. Merge rules
+	 * only affect directory listing (inject via iterate_dir). Individual
+	 * file redirects are materialized into hymo_paths at ADD_MERGE_RULE
+	 * time, so the bloom+hash exact match above handles them.
+	 *
+	 * The KPM version validated merge targets with kern_path() before
+	 * redirecting. In LKM kprobe context we cannot sleep, so blind
+	 * merge-trie redirect would send EVERY path under the merge prefix
+	 * to the module dir — including original system files that don't
+	 * exist there — breaking PMS and causing bootloop.
+	 */
 
 	rcu_read_unlock();
-
-	/*
-	 * Skip kern_path validation here: this function is only called from
-	 * hymo_kp_getname_flags_pre (kprobe handler), which runs in atomic
-	 * context. kern_path -> d_alloc_parallel can sleep, causing
-	 * "BUG: scheduling while atomic". If the target does not exist, the
-	 * subsequent syscall will fail with -ENOENT.
-	 */
 	return target;
 }
 
@@ -1168,6 +1284,7 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 	switch (cmd) {
 	case HYMO_IOC_ADD_MERGE_RULE: {
 		struct hymo_merge_entry *me;
+		char *mat_src = NULL, *mat_tgt = NULL;
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
@@ -1186,6 +1303,8 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (!found) {
 			me = kmalloc(sizeof(*me), GFP_ATOMIC);
 			if (me) {
+				mat_src = kstrdup(src, GFP_ATOMIC);
+				mat_tgt = kstrdup(target, GFP_ATOMIC);
 				me->src = src;
 				me->target = target;
 				hlist_add_head_rcu(&me->node,
@@ -1201,8 +1320,13 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 		spin_unlock(&hymo_inject_lock);
 		spin_unlock(&hymo_merge_lock);
-		if (!found && !ret)
+		if (!found && !ret) {
 			hymofs_add_inject_rule(kstrdup(me->src, GFP_ATOMIC));
+			if (mat_src && mat_tgt)
+				hymofs_materialize_merge(mat_src, mat_tgt, 0);
+		}
+		kfree(mat_src);
+		kfree(mat_tgt);
 		spin_lock(&hymo_cfg_lock);
 		hymofs_enabled = true;
 		spin_unlock(&hymo_cfg_lock);
