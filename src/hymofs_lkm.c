@@ -54,11 +54,10 @@ MODULE_VERSION(HYMOFS_VERSION);
 /*
  * Set to 1 to register VFS kprobes (path/stat/dir hooks). Set to 0 for GET_FD only
  * if the LKM causes bootloop on your kernel.
- * Default 0: VFS hooks can trigger zygote SIGSEGV during early boot on some devices.
- * Build with -DHYMOFS_VFS_KPROBES=1 to enable full path/stat/dir hijacking.
+ * Build with -DHYMOFS_VFS_KPROBES=0 to disable if needed.
  */
 #ifndef HYMOFS_VFS_KPROBES
-#define HYMOFS_VFS_KPROBES 0
+#define HYMOFS_VFS_KPROBES 1
 #endif
 
 /*
@@ -2025,6 +2024,15 @@ passthrough:
 #define HYMO_POP_STACK(regs)	do { } while (0)
 #endif
 
+/*
+ * Atomic-safe user access for kprobe pre-handler (cannot sleep).
+ * copy_from_user/copy_to_user may sleep on page fault -> use nofault variants.
+ * strncpy_from_user_nofault, copy_to_user_nofault: 5.11+
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#define HYMOFS_HAVE_USER_NOFAULT 1
+#endif
+
 /* getname_flags pre-handler: only modify user path and regs; return 0 to run original. */
 static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -2032,6 +2040,7 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 	char *buf;
 	size_t len;
 	char *target;
+	long ret;
 
 	(void)p;
 
@@ -2045,9 +2054,16 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 
 	buf = this_cpu_ptr(hymo_getname_path_buf);
+#if defined(HYMOFS_HAVE_USER_NOFAULT)
+	ret = strncpy_from_user_nofault(buf, filename_user, HYMO_PATH_BUF - 1);
+	if (ret < 0)
+		return 0;
+	buf[ret < (long)(HYMO_PATH_BUF - 1) ? ret : (HYMO_PATH_BUF - 1)] = '\0';
+#else
 	if (copy_from_user(buf, filename_user, HYMO_PATH_BUF - 1))
 		return 0;
 	buf[HYMO_PATH_BUF - 1] = '\0';
+#endif
 
 	if (likely(hash_empty(hymo_paths) &&
 		   hash_empty(hymo_hide_paths) &&
@@ -2076,8 +2092,13 @@ static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 	len = strlen(target);
 	if (len >= HYMO_PATH_BUF)
 		goto out;
+#if defined(HYMOFS_HAVE_USER_NOFAULT)
+	if (copy_to_user_nofault((void __user *)filename_user, target, len + 1))
+		goto out;
+#else
 	if (copy_to_user((void __user *)filename_user, target, len + 1))
 		goto out;
+#endif
 	kfree(target);
 	return 0;
 out:
@@ -2212,10 +2233,13 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	w->dir_has_inject = false;
 	w->inject_done = false;
 
-	if (w->parent_dentry && file && hymo_d_absolute_path) {
-		char *path_buf = this_cpu_ptr(hymo_iterate_dir_path);
-		char *res;
-
+	/*
+	 * dir_has_hidden from inode flags - safe in atomic context (no sleep).
+	 * Skip d_absolute_path: it takes dcache locks and can sleep.
+	 * inject/merge lookup needs full path - dir_has_inject stays false here.
+	 * Hide (dir_has_hidden) and /dev stealth (dir_path_len) still work.
+	 */
+	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
 		if (dir_inode && dir_inode->i_mapping)
 			w->dir_has_hidden = test_bit(AS_FLAGS_HYMO_DIR_HAS_HIDDEN,
@@ -2223,36 +2247,6 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 		dname = w->parent_dentry->d_name.name;
 		if (dname[0] == 'd' && dname[1] == 'e' && dname[2] == 'v' && dname[3] == '\0')
 			w->dir_path_len = 4;
-
-		/* Use d_absolute_path to bypass our d_path kprobe and avoid recursion. */
-		res = hymo_d_absolute_path(&file->f_path, path_buf, HYMO_ITERATE_PATH_BUF);
-		if (!IS_ERR(res) && res[0] == '/') {
-			w->dir_path = res;
-			{
-				struct hymo_inject_entry *ie;
-				struct hymo_merge_entry *me;
-				u32 h = full_name_hash(NULL, res, strlen(res));
-
-				rcu_read_lock();
-				hlist_for_each_entry_rcu(ie,
-					&hymo_inject_dirs[hash_min(h, HYMO_HASH_BITS)], node) {
-					if (strcmp(ie->dir, res) == 0) {
-						w->dir_has_inject = true;
-						break;
-					}
-				}
-				if (!w->dir_has_inject) {
-					hlist_for_each_entry_rcu(me,
-						&hymo_merge_dirs[hash_min(h, HYMO_HASH_BITS)], node) {
-						if (strcmp(me->src, res) == 0) {
-							w->dir_has_inject = true;
-							break;
-						}
-					}
-				}
-				rcu_read_unlock();
-			}
-		}
 	}
 
 	/* Only swap ctx when we need filtering or inject (avoids per-CPU reentrancy). */

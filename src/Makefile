@@ -3,9 +3,8 @@
 # From kernel source root:
 #   make ARCH=arm64 LLVM=1 M=/path/to/HymoFS/src modules
 #
-# Bootloop workaround: VFS kprobes disabled by default (GET_FD + uname only).
-# To enable full path/stat/dir hooks (may cause zygote crash on some devices):
-#   make ... ccflags-y="-DHYMOFS_VFS_KPROBES=1"  (or add to EXTRA_CFLAGS)
+# To disable VFS kprobes if bootloop (GET_FD + uname only):
+#   make ... ccflags-y="-DHYMOFS_VFS_KPROBES=0"  (or add to EXTRA_CFLAGS)
 #
 
 obj-m += hymofs_lkm.o
