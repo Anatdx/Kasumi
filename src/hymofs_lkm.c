@@ -2032,7 +2032,7 @@ static long (*hymo_strncpy_from_user_nofault)(char *dst, const void __user *src,
 static long (*hymo_copy_to_user_nofault)(void __user *dst, const void *src, long count);
 
 /* getname_flags pre-handler: only modify user path and regs; return 0 to run original. */
-static int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
+static HYMO_NOCFI int hymo_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	const char __user *filename_user;
 	char *buf;

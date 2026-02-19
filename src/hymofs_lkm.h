@@ -25,6 +25,13 @@
 
 #include "hymo_magic.h"
 
+/* Bypass CFI for indirect calls to dynamically resolved kernel symbols. */
+#if defined(__clang__)
+#define HYMO_NOCFI __attribute__((no_sanitize("cfi")))
+#else
+#define HYMO_NOCFI
+#endif
+
 /* ======================================================================
  * Configuration & Constants
  * ====================================================================== */
