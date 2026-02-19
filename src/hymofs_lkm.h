@@ -74,8 +74,6 @@
 /* Allowlist UID marker */
 #define HYMO_UID_ALLOW_MARKER ((void *)1)
 
-/* SELinux context to spoof for redirected files */
-#define HYMO_SYSTEM_SELINUX_CTX "u:object_r:system_file:s0"
 
 /* ======================================================================
  * Data Structures
@@ -183,10 +181,13 @@ struct hymo_getattr_ri_data {
 };
 
 /* kretprobe instance data for vfs_getxattr SELinux context spoofing */
+#define HYMO_SELINUX_CTX_MAX 96
 struct hymo_getxattr_ri_data {
 	void *value_buf;
 	size_t value_size;
 	bool spoof_selinux;
+	char src_ctx[HYMO_SELINUX_CTX_MAX];
+	size_t src_ctx_len;
 };
 
 /* kretprobe instance data for d_path reverse mapping */
