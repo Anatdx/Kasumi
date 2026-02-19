@@ -93,7 +93,6 @@ static DEFINE_PER_CPU(int, hymo_d_path_bufsize);
 /* Per-CPU for iterate_dir: swap ctx so kernel runs our filldir filter. */
 static DEFINE_PER_CPU(struct hymofs_filldir_wrapper, hymo_iterate_wrapper);
 static DEFINE_PER_CPU(int, hymo_iterate_did_swap);
-static DEFINE_PER_CPU(char[HYMO_ITERATE_PATH_BUF], hymo_iterate_dir_path);
 /* When set, we're inside hymofs_populate_injected_list; skip ctx swap in iterate_dir pre. */
 static DEFINE_PER_CPU(int, hymo_in_populate_inject);
 
