@@ -95,6 +95,8 @@ static DEFINE_PER_CPU(struct hymofs_filldir_wrapper, hymo_iterate_wrapper);
 static DEFINE_PER_CPU(int, hymo_iterate_did_swap);
 /* When set, we're inside hymofs_populate_injected_list; skip ctx swap in iterate_dir pre. */
 static DEFINE_PER_CPU(int, hymo_in_populate_inject);
+/* Per-CPU path buffer for iterate_dir inject/merge path lookup. */
+static DEFINE_PER_CPU(char[HYMO_ITERATE_PATH_BUF], hymo_iterate_dir_path);
 
 /* Offset base for injected entries (filldir pos); must not collide with real inode offsets. */
 #define HYMO_MAGIC_POS 0x1000000000000000ULL
@@ -198,6 +200,7 @@ static int (*hymo_vfs_getattr)(const struct path *, struct kstat *, u32, unsigne
 static struct file *(*hymo_dentry_open)(const struct path *, int, const struct cred *);
 /* Bypass d_path kprobe to avoid recursion when we need path inside iterate_dir/d_path handlers */
 static char *(*hymo_d_absolute_path)(const struct path *, char *, int);
+static char *(*hymo_dentry_path_raw)(const struct dentry *, char *, int);
 
 /* hymo_log macro is in hymofs_lkm.h */
 
@@ -2118,8 +2121,11 @@ static int hymo_krp_d_path_ret(struct kretprobe_instance *ri, struct pt_regs *re
 	return 0;
 }
 
-/* iterate_dir: pre swaps ctx to our wrapper so kernel runs filldir filter. */
-static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
+/*
+ * iterate_dir: pre swaps ctx to our wrapper so kernel runs filldir filter.
+ * HYMO_NOCFI: indirect calls to hymo_d_absolute_path / hymo_dentry_path_raw.
+ */
+static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct file *file;
 	struct hymofs_filldir_wrapper *w;
@@ -2157,12 +2163,6 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 	w->dir_has_inject = false;
 	w->inject_done = false;
 
-	/*
-	 * dir_has_hidden from inode flags - safe in atomic context (no sleep).
-	 * Skip d_absolute_path: it takes dcache locks and can sleep.
-	 * inject/merge lookup needs full path - dir_has_inject stays false here.
-	 * Hide (dir_has_hidden) and /dev stealth (dir_path_len) still work.
-	 */
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
 		if (dir_inode && dir_inode->i_mapping)
@@ -2171,6 +2171,53 @@ static int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs)
 		dname = w->parent_dentry->d_name.name;
 		if (dname[0] == 'd' && dname[1] == 'e' && dname[2] == 'v' && dname[3] == '\0')
 			w->dir_path_len = 4;
+
+		/*
+		 * Build full directory path for inject/merge rule lookup.
+		 * d_absolute_path / dentry_path_raw use only seqlocks + rcu
+		 * (non-sleeping on non-PREEMPT_RT); safe in kprobe pre-handler.
+		 */
+		if (atomic_read(&hymo_rule_count) > 0) {
+			char *buf = this_cpu_ptr(hymo_iterate_dir_path);
+			char *dp = ERR_PTR(-ENOENT);
+
+			if (hymo_d_absolute_path)
+				dp = hymo_d_absolute_path(&file->f_path, buf,
+							  HYMO_ITERATE_PATH_BUF);
+			if (IS_ERR(dp) && hymo_dentry_path_raw)
+				dp = hymo_dentry_path_raw(w->parent_dentry, buf,
+							  HYMO_ITERATE_PATH_BUF);
+
+			if (!IS_ERR_OR_NULL(dp) && *dp == '/') {
+				struct hymo_inject_entry *ie;
+				struct hymo_merge_entry *me;
+				u32 h;
+
+				w->dir_path = dp;
+				h = full_name_hash(NULL, dp, strlen(dp));
+
+				rcu_read_lock();
+				hlist_for_each_entry_rcu(ie,
+					&hymo_inject_dirs[hash_min(h, HYMO_HASH_BITS)],
+					node) {
+					if (strcmp(ie->dir, dp) == 0) {
+						w->dir_has_inject = true;
+						break;
+					}
+				}
+				if (!w->dir_has_inject) {
+					hlist_for_each_entry_rcu(me,
+						&hymo_merge_dirs[hash_min(h, HYMO_HASH_BITS)],
+						node) {
+						if (strcmp(me->src, dp) == 0) {
+							w->dir_has_inject = true;
+							break;
+						}
+					}
+				}
+				rcu_read_unlock();
+			}
+		}
 	}
 
 	/* Only swap ctx when we need filtering or inject (avoids per-CPU reentrancy). */
@@ -2268,6 +2315,7 @@ static int __init hymofs_lkm_init(void)
 	hymo_vfs_getattr = (void *)hymofs_lookup_name("vfs_getattr");
 	hymo_dentry_open = (void *)hymofs_lookup_name("dentry_open");
 	hymo_d_absolute_path = (void *)hymofs_lookup_name("d_absolute_path");
+	hymo_dentry_path_raw = (void *)hymofs_lookup_name("dentry_path_raw");
 	hymo_strncpy_from_user_nofault = (void *)hymofs_lookup_name("strncpy_from_user_nofault");
 	if (!hymo_strncpy_from_user_nofault)
 		pr_warn("hymofs: strncpy_from_user_nofault not found, falling back to copy_from_user\n");
@@ -2275,8 +2323,8 @@ static int __init hymofs_lkm_init(void)
 		pr_warn("hymofs: filp_open/kernel_read not found, allowlist disabled\n");
 	if (!hymo_vfs_getattr || !hymo_dentry_open)
 		pr_warn("hymofs: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
-	if (!hymo_d_absolute_path)
-		pr_warn("hymofs: d_absolute_path not found, iterate_dir inject lookup disabled (recursion risk)\n");
+	if (!hymo_d_absolute_path && !hymo_dentry_path_raw)
+		pr_warn("hymofs: neither d_absolute_path nor dentry_path_raw found, inject/merge listing disabled\n");
 
 	/* Initialize hash tables */
 	hash_init(hymo_paths);
