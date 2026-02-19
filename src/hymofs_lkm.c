@@ -2297,22 +2297,18 @@ static int hymo_krp_vfs_getattr_ret(struct kretprobe_instance *ri,
  */
 static HYMO_NOCFI ssize_t hymo_get_selinux_ctx_from_path(struct path *path, char *buf, size_t buflen)
 {
-	typedef ssize_t (*vfs_getxattr_5_10_fn)(struct dentry *, const char *, void *, size_t);
-	typedef ssize_t (*vfs_getxattr_5_12_fn)(struct user_namespace *, struct dentry *, const char *, void *, size_t);
-	typedef ssize_t (*vfs_getxattr_6_3_fn)(struct mnt_idmap *, struct dentry *, const char *, void *, size_t);
-
 	if (!hymo_vfs_getxattr_addr || buflen < 2)
 		return -ENOENT;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-	return ((vfs_getxattr_6_3_fn)hymo_vfs_getxattr_addr)(mnt_idmap(path->mnt),
-		path->dentry, "security.selinux", buf, buflen);
+	return ((ssize_t (*)(void *, struct dentry *, const char *, void *, size_t))hymo_vfs_getxattr_addr)(
+		mnt_idmap(path->mnt), path->dentry, "security.selinux", buf, buflen);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-	return ((vfs_getxattr_5_12_fn)hymo_vfs_getxattr_addr)(mnt_user_ns(path->mnt),
-		path->dentry, "security.selinux", buf, buflen);
+	return ((ssize_t (*)(void *, struct dentry *, const char *, void *, size_t))hymo_vfs_getxattr_addr)(
+		mnt_user_ns(path->mnt), path->dentry, "security.selinux", buf, buflen);
 #else
-	return ((vfs_getxattr_5_10_fn)hymo_vfs_getxattr_addr)(path->dentry,
-		"security.selinux", buf, buflen);
+	return ((ssize_t (*)(struct dentry *, const char *, void *, size_t))hymo_vfs_getxattr_addr)(
+		path->dentry, "security.selinux", buf, buflen);
 #endif
 }
 
