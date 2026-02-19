@@ -2347,7 +2347,8 @@ static int __init hymofs_lkm_init(void)
 
 	/* GET_FD: kprobe+kretprobe on ni_syscall; no sys_call_table patch. */
 	if (hymo_syscall_nr_param <= 0) {
-		pr_err("hymofs: hymo_syscall_nr must be positive and passed at insmod (e.g. hymo_syscall_nr=142)\n");
+		pr_err("hymofs: hymo_syscall_nr must be positive (got %d), pass at insmod e.g. hymo_syscall_nr=448\n",
+		       hymo_syscall_nr_param);
 		return -EINVAL;
 	}
 	{
@@ -2368,13 +2369,14 @@ static int __init hymofs_lkm_init(void)
 		hymo_krp_ni.kp.addr = (kprobe_opcode_t *)ni_addr;
 		ret = register_kprobe(&hymo_kp_ni);
 		if (ret) {
-			pr_err("hymofs: register_kprobe(ni_syscall) failed: %d\n", ret);
+			pr_err("hymofs: register_kprobe(ni_syscall@%px) failed: %d (errno %d)\n",
+			       (void *)ni_addr, ret, -ret);
 			return ret;
 		}
 		ret = register_kretprobe(&hymo_krp_ni);
 		if (ret) {
 			unregister_kprobe(&hymo_kp_ni);
-			pr_err("hymofs: register_kretprobe(ni_syscall) failed: %d\n", ret);
+			pr_err("hymofs: register_kretprobe(ni_syscall) failed: %d (errno %d)\n", ret, -ret);
 			return ret;
 		}
 		pr_info("hymofs: GET_FD via kprobe on ni_syscall (syscall nr=%d)\n", hymo_syscall_nr_param);
