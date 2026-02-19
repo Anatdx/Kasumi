@@ -111,7 +111,7 @@ static unsigned long (*hymofs_kallsyms_lookup_name)(const char *name);
  * anything: first try to get kallsyms_lookup_name itself via kprobe, then
  * use it for fast lookup; else fall back to per-symbol kprobe resolution.
  */
-static unsigned long hymofs_lookup_name(const char *name)
+static HYMO_NOCFI unsigned long hymofs_lookup_name(const char *name)
 {
 	if (hymofs_kallsyms_lookup_name) {
 		unsigned long addr = hymofs_kallsyms_lookup_name(name);
@@ -496,9 +496,9 @@ struct hymo_merge_ctx {
 	const char *dir_path;
 };
 
-static HYMO_FILLDIR_RET_TYPE hymo_merge_filldir(struct dir_context *ctx, const char *name,
-						int namlen, loff_t offset, u64 ino,
-						unsigned int d_type)
+static HYMO_NOCFI HYMO_FILLDIR_RET_TYPE hymo_merge_filldir(struct dir_context *ctx, const char *name,
+					int namlen, loff_t offset, u64 ino,
+					unsigned int d_type)
 {
 	struct hymo_merge_ctx *mctx = container_of(ctx, struct hymo_merge_ctx, ctx);
 	struct hymo_name_list *item;
@@ -551,7 +551,7 @@ static HYMO_FILLDIR_RET_TYPE hymo_merge_filldir(struct dir_context *ctx, const c
 	return HYMO_FILLDIR_CONTINUE;
 }
 
-static void hymofs_populate_injected_list(const char *dir_path, struct dentry *parent,
+static HYMO_NOCFI void hymofs_populate_injected_list(const char *dir_path, struct dentry *parent,
 					  struct list_head *head)
 {
 	struct hymo_entry *entry;
@@ -717,7 +717,7 @@ static char *(*hymo_strndup_user)(const char __user *, long);
 static struct filename *(*hymo_getname_kernel)(const char *);
 static void (*hymo_ihold)(struct inode *);
 
-static bool hymo_reload_ksu_allowlist(void)
+static HYMO_NOCFI bool hymo_reload_ksu_allowlist(void)
 {
 	struct file *fp;
 	loff_t off = 0;
@@ -1584,7 +1584,7 @@ del_done:
  * Part 16: Ioctl Handler
  * ====================================================================== */
 
-static long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
+static HYMO_NOCFI long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
 	long ret;
