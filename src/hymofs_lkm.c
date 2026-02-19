@@ -507,13 +507,13 @@ static HYMO_FILLDIR_RET_TYPE hymo_merge_filldir(struct dir_context *ctx, const c
 		return HYMO_FILLDIR_CONTINUE;
 
 	/* Skip whiteout (char dev 0:0) */
-	if (d_type == DT_CHR && mctx->dir_path) {
+	if (d_type == DT_CHR && mctx->dir_path && hymo_vfs_getattr) {
 		char *path = kasprintf(GFP_KERNEL, "%s/%.*s", mctx->dir_path, namlen, name);
 		if (path) {
 			struct path p;
 			if (hymo_kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
 				struct kstat stat;
-				if (vfs_getattr(&p, &stat, STATX_TYPE, AT_STATX_SYNC_AS_STAT) == 0 &&
+				if (hymo_vfs_getattr(&p, &stat, STATX_TYPE, AT_STATX_SYNC_AS_STAT) == 0 &&
 				    S_ISCHR(stat.mode) && stat.rdev == 0) {
 					path_put(&p);
 					kfree(path);
@@ -624,10 +624,10 @@ next_entry:
 	rcu_read_unlock();
 
 	list_for_each_entry_safe(target_node, tmp_node, &merge_targets, list) {
-		if (target_node->target && hymo_kern_path) {
+		if (target_node->target && hymo_kern_path && hymo_dentry_open) {
 			struct path path;
 			if (hymo_kern_path(target_node->target, LOOKUP_FOLLOW, &path) == 0) {
-				struct file *f = dentry_open(&path, O_RDONLY | O_DIRECTORY,
+				struct file *f = hymo_dentry_open(&path, O_RDONLY | O_DIRECTORY,
 								current_cred());
 				if (!IS_ERR(f)) {
 					struct hymo_merge_ctx mctx = {
@@ -708,6 +708,8 @@ static void hymo_add_allow_uid(uid_t uid)
 static struct file *(*hymo_filp_open)(const char *, int, umode_t);
 static int (*hymo_filp_close)(struct file *, fl_owner_t);
 static ssize_t (*hymo_kernel_read)(struct file *, void *, size_t, loff_t *);
+static int (*hymo_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
+static struct file *(*hymo_dentry_open)(const struct path *, int, const struct cred *);
 /* hymo_kern_path declared above (used by merge/inject before init) */
 static char *(*hymo_strndup_user)(const char __user *, long);
 static struct filename *(*hymo_getname_kernel)(const char *);
@@ -2331,8 +2333,12 @@ static int __init hymofs_lkm_init(void)
 	hymo_filp_open = (void *)hymofs_lookup_name("filp_open");
 	hymo_filp_close = (void *)hymofs_lookup_name("filp_close");
 	hymo_kernel_read = (void *)hymofs_lookup_name("kernel_read");
+	hymo_vfs_getattr = (void *)hymofs_lookup_name("vfs_getattr");
+	hymo_dentry_open = (void *)hymofs_lookup_name("dentry_open");
 	if (!hymo_filp_open || !hymo_kernel_read)
 		pr_warn("hymofs: filp_open/kernel_read not found, allowlist disabled\n");
+	if (!hymo_vfs_getattr || !hymo_dentry_open)
+		pr_warn("hymofs: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
 
 	/* Initialize hash tables */
 	hash_init(hymo_paths);
