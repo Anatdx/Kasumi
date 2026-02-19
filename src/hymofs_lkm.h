@@ -209,6 +209,8 @@ struct hymofs_filldir_wrapper {
 	const char *dir_path;	/* full path for inject lookup; points to per-CPU buf */
 	bool dir_has_inject;	/* merge/inject dir: inject entries before real ones */
 	bool inject_done;	/* inject already performed this iteration */
+	bool is_redirect_target; /* directory is a redirect target; inject lower layer */
+	const char *lower_src;	/* source (lower layer) path when is_redirect_target */
 };
 
 /* ======================================================================

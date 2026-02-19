@@ -1250,6 +1250,27 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
+		/* Resolve symlinks in src (e.g. /system/product -> /product) so
+		 * the stored path matches d_absolute_path output at lookup time. */
+		{
+			struct path mpath;
+			if (hymo_kern_path(src, LOOKUP_FOLLOW, &mpath) == 0) {
+				char *rbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+				if (rbuf) {
+					char *res = d_path(&mpath, rbuf, PATH_MAX);
+					if (!IS_ERR(res) && res[0] == '/' && strcmp(res, src) != 0) {
+						char *new_src = kstrdup(res, GFP_KERNEL);
+						if (new_src) {
+							kfree(src);
+							src = new_src;
+						}
+					}
+					kfree(rbuf);
+				}
+				path_put(&mpath);
+			}
+		}
+
 		hash = full_name_hash(NULL, src, strlen(src));
 		spin_lock(&hymo_merge_lock);
 		spin_lock(&hymo_inject_lock);
@@ -1966,15 +1987,21 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 		container_of(ctx, struct hymofs_filldir_wrapper, wrap_ctx);
 	HYMO_FILLDIR_RET_TYPE ret;
 
-	/* Inject: before first real entry, emit injected entries from merge/add rules. */
+	/* Inject: before first real entry, emit injected entries from merge/add rules.
+	 * When is_redirect_target, use lower_src (original source path) for rule lookup
+	 * so the lower-layer (original system) content gets injected. */
 	if (w->dir_has_inject && !w->inject_done && w->dir_path && w->parent_dentry) {
 		struct list_head head;
 		struct hymo_name_list *item, *tmp;
 		loff_t inj_pos = HYMO_MAGIC_POS;
+		const char *inject_lookup_path = w->dir_path;
+
+		if (w->is_redirect_target && w->lower_src)
+			inject_lookup_path = w->lower_src;
 
 		w->inject_done = true;
 		INIT_LIST_HEAD(&head);
-		hymofs_populate_injected_list(w->dir_path, w->parent_dentry, &head);
+		hymofs_populate_injected_list(inject_lookup_path, w->parent_dentry, &head);
 
 		list_for_each_entry_safe(item, tmp, &head, list) {
 			int nlen = strlen(item->name);
@@ -2646,6 +2673,8 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 	w->dir_path = NULL;
 	w->dir_has_inject = false;
 	w->inject_done = false;
+	w->is_redirect_target = false;
+	w->lower_src = NULL;
 
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
@@ -2675,6 +2704,7 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 			if (!IS_ERR_OR_NULL(dp) && *dp == '/') {
 				struct hymo_inject_entry *ie;
 				struct hymo_merge_entry *me;
+				struct hymo_entry *re;
 				u32 h;
 
 				w->dir_path = dp;
@@ -2697,6 +2727,18 @@ static HYMO_NOCFI int hymo_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *
 							w->dir_has_inject = true;
 							break;
 						}
+					}
+				}
+				/* If this directory is a redirect target (upper layer),
+				 * inject entries from the source (lower layer) directory.
+				 * This ensures original system content remains visible
+				 * even when getname_flags redirected the directory. */
+				if (!w->dir_has_inject) {
+					re = hymofs_reverse_lookup_target(dp);
+					if (re && re->src) {
+						w->dir_has_inject = true;
+						w->is_redirect_target = true;
+						w->lower_src = re->src;
 					}
 				}
 				rcu_read_unlock();
