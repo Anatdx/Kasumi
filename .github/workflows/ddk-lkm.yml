@@ -66,6 +66,9 @@ jobs:
           restore-keys: |
             kernel-hymofs-${{ inputs.kmi }}-
 
+      - name: Ensure cache dirs exist (avoid "Path does not exist" on save)
+        run: mkdir -p ~/.ccache kernel
+
       - name: Fetch kernel tree
         run: |
           set -euo pipefail
