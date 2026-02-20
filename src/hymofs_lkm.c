@@ -2122,16 +2122,24 @@ hymofs_filldir_filter(struct dir_context *ctx, const char *name,
 
 	/* Hide real entries that also exist in merge targets. This prevents
 	 * duplicates: the injected version (from populate_injected_list)
-	 * replaces the original, just like original hymofs.c does. */
-	if (w->merge_target_count > 0) {
+	 * replaces the original, just like original hymofs.c does.
+	 * Skip when merge target IS the dir we're listing (e.g. target path
+	 * resolved to same inode via symlink) - otherwise we'd hide everything. */
+	if (w->merge_target_count > 0 && w->parent_dentry) {
 		int i;
 		for (i = 0; i < w->merge_target_count; i++) {
-			struct dentry *child = d_hash_and_lookup(
-				w->merge_target_dentries[i],
-				&(struct qstr)QSTR_INIT(name, namlen));
-			if (child) {
-				dput(child);
-				return HYMO_FILLDIR_CONTINUE;
+			struct dentry *tgt = w->merge_target_dentries[i];
+			if (!tgt || tgt == w->parent_dentry)
+				continue;
+			if (d_inode(tgt) && d_inode(tgt) == d_inode(w->parent_dentry))
+				continue;
+			{
+				struct dentry *child = d_hash_and_lookup(tgt,
+					&(struct qstr)QSTR_INIT(name, namlen));
+				if (child) {
+					dput(child);
+					return HYMO_FILLDIR_CONTINUE;
+				}
 			}
 		}
 	}
