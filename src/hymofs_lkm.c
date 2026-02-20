@@ -1196,8 +1196,8 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 			return -EFAULT;
 
 		buf_size = list_arg.size;
-		if (buf_size > 16 * 1024)
-			buf_size = 16 * 1024;
+		if (buf_size > 64 * 1024)
+			buf_size = 64 * 1024;
 
 		kbuf = kzalloc(buf_size, GFP_KERNEL);
 		if (!kbuf)
@@ -1223,6 +1223,12 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 			if (written >= buf_size) break;
 			written += scnprintf(kbuf + written, buf_size - written,
 					     "inject %s\n", inject_entry->dir);
+		}
+		hash_for_each_rcu(hymo_merge_dirs, bkt, merge_entry, node) {
+			if (written >= buf_size) break;
+			written += scnprintf(kbuf + written, buf_size - written,
+					     "merge %s %s\n", merge_entry->src,
+					     merge_entry->target);
 		}
 		hash_for_each_rcu(hymo_merge_dirs, bkt, merge_entry, node) {
 			if (written >= buf_size) break;
