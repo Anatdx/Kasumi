@@ -46,9 +46,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git make clang lld llvm gcc gcc-aarch64-linux-gnu \
+            git make clang lld llvm gcc gcc-aarch64-linux-gnu ccache \
             flex bison bc rsync cpio \
             libelf-dev libssl-dev libdw-dev pahole zip
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-hymofs-kernel-${{ inputs.kmi }}
+          restore-keys: |
+            ccache-hymofs-kernel-
+
+      - name: Cache kernel tree
+        uses: actions/cache@v4
+        with:
+          path: kernel
+          key: kernel-hymofs-${{ inputs.kmi }}-${{ inputs.kernel_ref || inputs.kmi }}
+          restore-keys: |
+            kernel-hymofs-${{ inputs.kmi }}-
 
       - name: Fetch kernel tree
         run: |
@@ -61,9 +77,13 @@ jobs:
           fi
 
           KERNEL_SRC="$GITHUB_WORKSPACE/kernel"
-          rm -rf "$KERNEL_SRC"
-          echo "Cloning kernel tree: $KERNEL_REPO_URL @$KERNEL_REF"
-          git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_REPO_URL" "$KERNEL_SRC"
+          if [ ! -f "$KERNEL_SRC/Makefile" ]; then
+            rm -rf "$KERNEL_SRC"
+            echo "Cloning kernel tree: $KERNEL_REPO_URL @$KERNEL_REF"
+            git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_REPO_URL" "$KERNEL_SRC"
+          else
+            echo "Using cached kernel tree at: $KERNEL_SRC"
+          fi
           test -f "$KERNEL_SRC/Makefile"
           echo "Kernel tree ready at: $KERNEL_SRC"
 
@@ -89,10 +109,10 @@ jobs:
           # 5.10: ubuntu clang has arm64 "sp" register issues; use GCC cross-compiler
           if [[ "$KMI" == android12-5.10 ]] || [[ "$KMI" == android13-5.10 ]]; then
             LLVM_ARGS=""
-            CROSS_ARGS="CROSS_COMPILE=aarch64-linux-gnu-"
+            CROSS_ARGS="CROSS_COMPILE=ccache aarch64-linux-gnu-"
           else
             LLVM_ARGS="LLVM=1 LLVM_IAS=1"
-            CROSS_ARGS=""
+            CROSS_ARGS="CC=ccache clang"
           fi
 
           echo "Preparing kernel tree (KMI=$KMI, LLVM=$([ -n \"$LLVM_ARGS\" ] && echo 1 || echo 0))..."
