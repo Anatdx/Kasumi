@@ -21,39 +21,11 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20251104
-      options: --privileged
-
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v6
-
-      - name: Build hymofs_lkm.ko
-        run: |
-          git config --global --add safe.directory $GITHUB_WORKSPACE
-          cd src
-
-          echo "=== Building hymofs_lkm.ko for KMI: ${{ matrix.kmi }} ==="
-          CC=clang make
-          
-          echo "=== Build completed ==="
-          mkdir -p /github/workspace/out
-          OUTPUT_NAME="${{ matrix.kmi }}_hymofs_lkm.ko"
-          cp hymofs_lkm.ko "/github/workspace/out/$OUTPUT_NAME"
-          
-          echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
-          ls -la "/github/workspace/out/$OUTPUT_NAME"
-          echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
-          llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-          echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
-
-      - name: Upload hymofs_lkm.ko artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.kmi }}-lkm
-          path: /github/workspace/out/${{ matrix.kmi }}_hymofs_lkm.ko
+    uses: ./.github/workflows/ddk-lkm.yml
+    secrets: inherit
+    with:
+      kmi: ${{ matrix.kmi }}
+      ddk_release: "20251104"
 
   merge-lkm:
     name: Merge all LKM artifacts
@@ -61,15 +33,104 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all LKM artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
 
       - name: Merge into lkm folder
         run: |
           mkdir -p lkm
-          find . -name "*.ko" -exec cp {} lkm/ \;
+          find . -name "*.ko" -path "*hymofs_lkm*" -exec cp {} lkm/ \;
+          ls -la lkm/
+
+      - name: Import GPG key
+        if: github.actor == 'Anatdx'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          gpg --batch --import <<< "$GPG_PRIVATE_KEY"
+          gpg --list-secret-keys --keyid-format long
+
+      - name: Sign all LKM .ko files with GPG
+        if: github.actor == 'Anatdx'
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for ko in lkm/*.ko; do
+            [ -f "$ko" ] || continue
+            name=$(basename "$ko")
+            echo "Signing $name..."
+            gpg --detach-sign --local-user 0x942F2C75D1DC540F --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" \
+              --output "lkm/${name}.asc" "$ko"
+          done
+          ls -la lkm/*.asc 2>/dev/null || echo "No .ko.asc files"
 
       - name: Upload combined LKM artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: hymofs-lkm-all
           path: lkm/
+
+      - name: Create zip archive
+        run: |
+          zip -r hymofs-lkm.zip lkm/
+          ls -la hymofs-lkm.zip
+
+      - name: Sign zip with GPG
+        if: github.actor == 'Anatdx'
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "Signing hymofs-lkm.zip..."
+          gpg --detach-sign --local-user 0x942F2C75D1DC540F --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --output "hymofs-lkm.zip.asc" "hymofs-lkm.zip"
+          ls -la hymofs-lkm.zip.asc
+
+      - name: Prepare and upload zip artifact
+        run: |
+          mkdir -p dist
+          cp hymofs-lkm.zip dist/
+          [ -f hymofs-lkm.zip.asc ] && cp hymofs-lkm.zip.asc dist/ || true
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymofs-lkm-zip
+          path: dist/
+
+  trigger-hymo:
+    name: Trigger hymo build-lkm
+    needs: merge-lkm
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # 使用 workflow_dispatch API 显式触发 build.yml（比 repository_dispatch 更可靠，可指定 ref）
+      - name: Trigger hymo workflow_dispatch
+        env:
+          HYMO_REPO: Anatdx/hymo
+          HYMO_TRIGGER_TOKEN: ${{ secrets.HYMO_TRIGGER_TOKEN }}
+          HYMOFS_REF: ${{ github.ref_name }}
+          HYMOFS_SHA: ${{ github.sha }}
+          HYMOFS_MSG: ${{ github.event.head_commit.message }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$HYMO_TRIGGER_TOKEN" ]; then
+            echo "HYMO_TRIGGER_TOKEN not set, skip triggering hymo."
+            exit 0
+          fi
+          echo "Triggering $HYMO_REPO workflow_dispatch build.yml (ref=main, HymoFS ref=$HYMOFS_REF)"
+          # Send only ref; do not send inputs unless hymo build.yml workflow_dispatch declares them (else HTTP 422).
+          payload=$(jq -n --arg ref "main" '{ref: $ref}')
+          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
+            -H "Authorization: Bearer ${HYMO_TRIGGER_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+          code=$(echo "$resp" | tail -n1)
+          echo "Response: HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::error::Trigger failed"
+            echo "$resp" | sed '$d'
+            exit 1
+          fi
+          echo "Trigger sent. Check Actions in $HYMO_REPO."

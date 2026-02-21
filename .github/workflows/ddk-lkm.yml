@@ -1,0 +1,169 @@
+name: Build HymoFS Kernel Module
+
+on:
+  workflow_call:
+    inputs:
+      kmi:
+        description: "KMI version"
+        required: true
+        type: string
+      ddk_release:
+        description: "Legacy input (kept for compatibility)"
+        required: false
+        default: "20251104"
+        type: string
+      kernel_repo_url:
+        description: "Kernel repository URL"
+        required: false
+        default: "https://android.googlesource.com/kernel/common"
+        type: string
+      kernel_ref:
+        description: "Kernel ref/branch (empty: use kmi, e.g. android15-6.6)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build-hymofs-ko:
+    name: Build hymofs_lkm.ko for ${{ inputs.kmi }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version
+        id: parse_version
+        run: |
+          COMMIT_NUM=$(git rev-list --count HEAD)
+          VERSION=$(echo "$COMMIT_NUM + 200" | bc)
+          echo "Generated Version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git make clang lld llvm gcc gcc-aarch64-linux-gnu ccache \
+            flex bison bc rsync cpio \
+            libelf-dev libssl-dev libdw-dev pahole zip
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-hymofs-kernel-${{ inputs.kmi }}
+          restore-keys: |
+            ccache-hymofs-kernel-
+
+      - name: Cache kernel tree
+        uses: actions/cache@v4
+        with:
+          path: kernel
+          key: kernel-hymofs-${{ inputs.kmi }}-${{ inputs.kernel_ref || inputs.kmi }}
+          restore-keys: |
+            kernel-hymofs-${{ inputs.kmi }}-
+
+      - name: Ensure cache dirs exist (avoid "Path does not exist" on save)
+        run: mkdir -p ~/.ccache kernel
+
+      - name: Fetch kernel tree
+        run: |
+          set -euo pipefail
+          KMI="${{ inputs.kmi }}"
+          KERNEL_REPO_URL="${{ inputs.kernel_repo_url }}"
+          KERNEL_REF="${{ inputs.kernel_ref }}"
+          if [ -z "$KERNEL_REF" ]; then
+            KERNEL_REF="$KMI"
+          fi
+
+          KERNEL_SRC="$GITHUB_WORKSPACE/kernel"
+          if [ ! -f "$KERNEL_SRC/Makefile" ]; then
+            rm -rf "$KERNEL_SRC"
+            echo "Cloning kernel tree: $KERNEL_REPO_URL @$KERNEL_REF"
+            git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_REPO_URL" "$KERNEL_SRC"
+          else
+            echo "Using cached kernel tree at: $KERNEL_SRC"
+          fi
+          test -f "$KERNEL_SRC/Makefile"
+          echo "Kernel tree ready at: $KERNEL_SRC"
+
+      - name: Setup ccache wrapper for GCC (rewrite -r to --relocatable so ccache does not eat -r)
+        run: |
+          set -euo pipefail
+          WRAP_DIR="$GITHUB_WORKSPACE/.ccache_cross"
+          mkdir -p "$WRAP_DIR"
+          # Wrapper: replace -r with --relocatable so ccache passes through to gcc (sed strips YAML indentation)
+          cat << 'WRAPEOF' | sed 's/^          //' > "$WRAP_DIR/gcc"
+          #!/bin/bash
+          args=()
+          for a in "$@"; do
+            [[ "$a" == "-r" ]] && a="--relocatable"
+            args+=("$a")
+          done
+          exec ccache aarch64-linux-gnu-gcc "${args[@]}"
+          WRAPEOF
+          chmod +x "$WRAP_DIR/gcc"
+          for t in ld as ar nm objcopy objdump strip; do
+            ln -sf "$(which aarch64-linux-gnu-$t)" "$WRAP_DIR/$t"
+          done
+          echo "CCACHE_CROSS_WRAP=$WRAP_DIR/" >> $GITHUB_ENV
+
+      - name: Build hymofs_lkm.ko
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          KMI="${{ inputs.kmi }}"
+          KERNEL_REPO_URL="${{ inputs.kernel_repo_url }}"
+          KERNEL_REF="${{ inputs.kernel_ref }}"
+          if [ -z "$KERNEL_REF" ]; then
+            KERNEL_REF="$KMI"
+          fi
+          KERNEL_SRC="$GITHUB_WORKSPACE/kernel"
+          SRC="$GITHUB_WORKSPACE/src"
+
+          if [ ! -f "$KERNEL_SRC/Makefile" ]; then
+            echo "Kernel tree not found at $KERNEL_SRC"
+            echo "Kernel source expected from: $KERNEL_REPO_URL@$KERNEL_REF"
+            exit 1
+          fi
+
+          # 5.10: use GCC + ccache via wrapper (kernel passes -r to gcc, ccache treats -r as its own option; wrapper rewrites -r -> --relocatable)
+          if [[ "$KMI" == android12-5.10 ]] || [[ "$KMI" == android13-5.10 ]]; then
+            LLVM_ARGS=""
+            CROSS_ARGS="CROSS_COMPILE=${CCACHE_CROSS_WRAP}"
+          else
+            LLVM_ARGS="LLVM=1 LLVM_IAS=1"
+            CROSS_ARGS="CC=ccache clang"
+          fi
+
+          echo "Preparing kernel tree (KMI=$KMI)..."
+          make -C "$KERNEL_SRC" ARCH=arm64 "$CROSS_ARGS" $LLVM_ARGS gki_defconfig 2>/dev/null || \
+            make -C "$KERNEL_SRC" ARCH=arm64 "$CROSS_ARGS" $LLVM_ARGS defconfig
+          # 6.12: disable gendwarfksyms to avoid dwarf.h dependency
+          if [[ "$KMI" == *"6.12"* ]] && [ -f "$KERNEL_SRC/scripts/config" ]; then
+            $KERNEL_SRC/scripts/config --file "$KERNEL_SRC/.config" -d GENDWARFKSYMS 2>/dev/null || true
+            make -C "$KERNEL_SRC" ARCH=arm64 "$CROSS_ARGS" $LLVM_ARGS olddefconfig 2>/dev/null || true
+          fi
+          make -C "$KERNEL_SRC" ARCH=arm64 "$CROSS_ARGS" $LLVM_ARGS modules_prepare
+
+          VERSION="${{ steps.parse_version.outputs.VERSION }}"
+          echo "Building hymofs_lkm.ko (v0.1.${VERSION})..."
+          make -C "$KERNEL_SRC" ARCH=arm64 "$CROSS_ARGS" $LLVM_ARGS M="$SRC" KBUILD_MODPOST_WARN=1 \
+            CFLAGS_MODULE="-DHYMOFS_VERSION=\\\"0.1.${VERSION}\\\"" modules
+          ls -la "$SRC"/hymofs_lkm.ko
+          llvm-strip -d "$SRC"/hymofs_lkm.ko 2>/dev/null || true
+
+      - name: Prepare .ko artifact
+        run: |
+          mkdir -p out
+          cp src/hymofs_lkm.ko "out/${{ inputs.kmi }}_hymofs_lkm.ko"
+          ls -la out/
+
+      - name: Upload .ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kmi }}_hymofs_lkm.ko
+          path: out/${{ inputs.kmi }}_hymofs_lkm.ko

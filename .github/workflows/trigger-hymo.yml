@@ -1,0 +1,49 @@
+# 仅用于测试：手动运行会通过 workflow_dispatch API 触发 hymo 的 build.yml。
+# Token 需为 PAT，且对 Anatdx/hymo 具备 repo + workflow 权限。
+name: Trigger hymo (test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hymofs_ref:
+        description: 'HymoFS ref for hymo to clone (e.g. main)'
+        required: true
+        default: 'main'
+      hymo_ref:
+        description: 'Branch of hymo repo to run workflow on (e.g. main)'
+        required: false
+        default: 'main'
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger hymo workflow_dispatch
+        env:
+          HYMO_REPO: Anatdx/hymo
+          HYMO_TRIGGER_TOKEN: ${{ secrets.HYMO_TRIGGER_TOKEN }}
+          HYMOFS_REF: ${{ inputs.hymofs_ref }}
+          HYMO_REF: ${{ inputs.hymo_ref }}
+          HYMOFS_SHA: ${{ github.sha }}
+          HYMOFS_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$HYMO_TRIGGER_TOKEN" ]; then
+            echo "::error::HYMO_TRIGGER_TOKEN is not set in this repo's secrets."
+            exit 1
+          fi
+          echo "Triggering $HYMO_REPO workflow build.yml (ref=$HYMO_REF)"
+          # Do not send inputs unless hymo build.yml workflow_dispatch declares them (else HTTP 422).
+          payload=$(jq -n --arg ref "$HYMO_REF" '{ref: $ref}')
+          resp=$(curl -sS -w "\n%{http_code}" -X POST "https://api.github.com/repos/${HYMO_REPO}/actions/workflows/build.yml/dispatches" \
+            -H "Authorization: token ${HYMO_TRIGGER_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+          code=$(echo "$resp" | tail -n1)
+          echo "Response: HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::error::Unexpected response: $code"
+            echo "$resp" | sed '$d'
+            exit 1
+          fi
+          echo "Trigger sent. Check Actions in $HYMO_REPO for the new run."
