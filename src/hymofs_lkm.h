@@ -12,6 +12,7 @@
 #define _HYMOFS_LKM_H
 
 #include <linux/types.h>
+#include <asm/ptrace.h>
 #include <linux/list.h>
 #include <linux/hashtable.h>
 #include <linux/xarray.h>
@@ -228,5 +229,7 @@ extern bool hymo_debug_enabled;
 
 /* Called by syscall handler (e.g. KP) when userspace requests HYMO_CMD_GET_FD. Returns anon fd or negative errno. */
 int hymofs_get_anon_fd(void);
+
+void hymofs_handle_sys_enter_path(struct pt_regs *regs, long id);
 
 #endif /* _HYMOFS_LKM_H */
