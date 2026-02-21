@@ -5,5 +5,6 @@
 int hymofs_tracepoint_path_init(void);
 void hymofs_tracepoint_path_exit(void);
 int hymofs_tracepoint_path_registered(void);
+int hymofs_tracepoint_getfd_registered(void);
 
 #endif /* _HYMOFS_TRACEPOINT_H */

@@ -231,6 +231,8 @@ extern bool hymo_debug_enabled;
 int hymofs_get_anon_fd(void);
 
 void hymofs_handle_sys_enter_path(struct pt_regs *regs, long id);
+void hymofs_handle_sys_enter_getfd(struct pt_regs *regs, long id);
+void hymofs_handle_sys_exit_getfd(struct pt_regs *regs, long ret);
 
 /* Symbol lookup (resolved via kprobe, no kernel export needed) */
 unsigned long hymofs_lookup_name(const char *name);
