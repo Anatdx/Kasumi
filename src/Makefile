@@ -1,7 +1,7 @@
 # make -C $KDIR ARCH=arm64 M=$(pwd) modules
 
 obj-m += hymofs_lkm.o
-hymofs_lkm-objs := hymofs_lkm.o hymofs_tracepoint.o
+hymofs_lkm-objs := hymofs_core.o hymofs_tracepoint.o
 
 ccflags-y += -gz=none
 ccflags-y += $(call cc-option,-fno-sanitize=cfi)
