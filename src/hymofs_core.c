@@ -94,7 +94,7 @@ static unsigned long (*hymofs_kallsyms_lookup_name)(const char *name);
  * anything: first try to get kallsyms_lookup_name itself via kprobe, then
  * use it for fast lookup; else fall back to per-symbol kprobe resolution.
  */
-static HYMO_NOCFI unsigned long hymofs_lookup_name(const char *name)
+HYMO_NOCFI unsigned long hymofs_lookup_name(const char *name)
 {
 	if (hymofs_kallsyms_lookup_name) {
 		unsigned long addr = hymofs_kallsyms_lookup_name(name);

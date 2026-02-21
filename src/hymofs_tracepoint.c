@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <linux/kernel.h>
-#include <linux/kallsyms.h>
 #include <linux/ptrace.h>
 #include <linux/tracepoint.h>
 
@@ -19,8 +18,10 @@ static void hymo_sys_enter_handler(void *data, struct pt_regs *regs, long id)
 int hymofs_tracepoint_path_init(void)
 {
 	int ret;
+	unsigned long addr;
 
-	tp_sys_enter = (struct tracepoint *)kallsyms_lookup_name("__tracepoint_sys_enter");
+	addr = hymofs_lookup_name("__tracepoint_sys_enter");
+	tp_sys_enter = (struct tracepoint *)addr;
 	if (!tp_sys_enter) {
 		pr_warn("hymofs: __tracepoint_sys_enter not found (kallsyms), falling back to getname_flags kprobe\n");
 		return 0;
