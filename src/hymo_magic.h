@@ -123,6 +123,21 @@ struct hymo_spoof_cmdline {
 #define HYMO_FEATURE_CMDLINE_SPOOF  (1 << 2)
 #define HYMO_FEATURE_SELINUX_BYPASS (1 << 4)
 #define HYMO_FEATURE_MERGE_DIR      (1 << 5)
+#define HYMO_FEATURE_MOUNT_HIDE    (1 << 6)  /* hide overlay from /proc/mounts and /proc/pid/mountinfo */
+#define HYMO_FEATURE_MAPS_SPOOF    (1 << 7)  /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
+
+/*
+ * Maps spoof rule: when a /proc/pid/maps line has (target_ino[, target_dev]),
+ * replace ino/dev/pathname with spoofed values. target_dev 0 = match any dev.
+ */
+struct hymo_maps_rule {
+	unsigned long target_ino;
+	unsigned long target_dev;   /* 0 = match any device */
+	unsigned long spoofed_ino;
+	unsigned long spoofed_dev;
+	char spoofed_pathname[HYMO_MAX_LEN_PATHNAME];
+	int err;
+};
 
 // ioctl definitions (for fd-based mode)
 // Must be after struct definitions
@@ -147,5 +162,7 @@ struct hymo_spoof_cmdline {
 #define HYMO_IOC_SET_ENABLED        _IOW(HYMO_IOC_MAGIC, 20, int)
 #define HYMO_IOC_SET_HIDE_UIDS      _IOW(HYMO_IOC_MAGIC, 21, struct hymo_uid_list_arg)
 #define HYMO_IOC_GET_HOOKS          _IOWR(HYMO_IOC_MAGIC, 22, struct hymo_syscall_list_arg)
+#define HYMO_IOC_ADD_MAPS_RULE     _IOW(HYMO_IOC_MAGIC, 23, struct hymo_maps_rule)
+#define HYMO_IOC_CLEAR_MAPS_RULES   _IO(HYMO_IOC_MAGIC, 24)
 
 #endif /* _LINUX_HYMO_MAGIC_H */

@@ -188,6 +188,18 @@ static DEFINE_HASHTABLE(hymo_merge_dirs, HYMO_HASH_BITS);
 
 static DEFINE_MUTEX(hymo_config_mutex);
 
+/* Maps spoof rules (read buffer filter for /proc/pid/maps); used by ioctl and filter. */
+struct hymo_maps_rule_entry {
+	struct list_head list;
+	unsigned long target_ino;
+	unsigned long target_dev;
+	unsigned long spoofed_ino;
+	unsigned long spoofed_dev;
+	char spoofed_pathname[HYMO_MAX_LEN_PATHNAME];
+};
+static LIST_HEAD(hymo_maps_rules);
+static DEFINE_MUTEX(hymo_maps_mutex);
+
 static bool hymo_allowlist_loaded;
 
 /* hymofs_enabled declared above (used by hooks) */
@@ -222,6 +234,9 @@ static int hymo_uname_kprobe_registered;
 static int hymo_cmdline_kprobe_registered;
 static int hymo_cmdline_kretprobe_registered;
 static int hymo_getxattr_kprobe_registered;
+static int hymo_mount_hide_vfsmnt_registered;
+static int hymo_mount_hide_mountinfo_registered;
+static int hymo_mount_hide_read_fallback_registered;
 
 /* Forward declarations for hymo_export_hooks_status (HYMO_IOC_GET_HOOKS) */
 static int hymo_ni_kprobe_registered;
@@ -1347,6 +1362,48 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
+	if (cmd == HYMO_IOC_ADD_MAPS_RULE) {
+		struct hymo_maps_rule __user *u = (struct hymo_maps_rule __user *)arg;
+		struct hymo_maps_rule k;
+		struct hymo_maps_rule_entry *e;
+
+		if (copy_from_user(&k, u, sizeof(k)))
+			return -EFAULT;
+		e = kmalloc(sizeof(*e), GFP_KERNEL);
+		if (!e) {
+			k.err = -ENOMEM;
+			if (copy_to_user(u, &k, sizeof(k)))
+				return -EFAULT;
+			return -ENOMEM;
+		}
+		e->target_ino = k.target_ino;
+		e->target_dev = k.target_dev;
+		e->spoofed_ino = k.spoofed_ino;
+		e->spoofed_dev = k.spoofed_dev;
+		strscpy(e->spoofed_pathname, k.spoofed_pathname, sizeof(e->spoofed_pathname));
+		k.err = 0;
+		if (copy_to_user(u, &k, sizeof(k))) {
+			kfree(e);
+			return -EFAULT;
+		}
+		mutex_lock(&hymo_maps_mutex);
+		list_add_tail(&e->list, &hymo_maps_rules);
+		mutex_unlock(&hymo_maps_mutex);
+		return 0;
+	}
+
+	if (cmd == HYMO_IOC_CLEAR_MAPS_RULES) {
+		struct hymo_maps_rule_entry *e, *tmp;
+
+		mutex_lock(&hymo_maps_mutex);
+		list_for_each_entry_safe(e, tmp, &hymo_maps_rules, list) {
+			list_del(&e->list);
+			kfree(e);
+		}
+		mutex_unlock(&hymo_maps_mutex);
+		return 0;
+	}
+
 	if (cmd == HYMO_IOC_GET_FEATURES) {
 		int features = 0;
 		if (hymo_uname_kprobe_registered)
@@ -1358,6 +1415,11 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 		features |= HYMO_FEATURE_MERGE_DIR;
 		if (hymo_getxattr_kprobe_registered)
 			features |= HYMO_FEATURE_SELINUX_BYPASS;
+		if (hymo_mount_hide_vfsmnt_registered || hymo_mount_hide_mountinfo_registered ||
+		    hymo_mount_hide_read_fallback_registered)
+			features |= HYMO_FEATURE_MOUNT_HIDE;
+		if (hymo_mount_hide_read_fallback_registered)
+			features |= HYMO_FEATURE_MAPS_SPOOF;
 		if (copy_to_user(arg, &features, sizeof(features)))
 			return -EFAULT;
 		return 0;
@@ -1426,6 +1488,31 @@ static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg)
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kprobe (cmdline_proc_show)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: none\n");
+		written += n;
+
+		/* mountinfo/mounts hide */
+		if (hymo_mount_hide_vfsmnt_registered && hymo_mount_hide_mountinfo_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "mountinfo/mounts: kprobe (show_mountinfo, show_vfsmnt)\n");
+		else if (hymo_mount_hide_vfsmnt_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "mounts: kprobe (show_vfsmnt)\n");
+		else if (hymo_mount_hide_mountinfo_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "mountinfo: kprobe (show_mountinfo)\n");
+		else if (hymo_mount_hide_read_fallback_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "mountinfo/mounts: kretprobe (read syscall buffer filter)\n");
+		else
+			n = scnprintf(kbuf + written, buf_size - written, "mountinfo/mounts: none\n");
+		written += n;
+
+		/* maps spoof (same read kretprobe as mount hide) */
+		if (hymo_mount_hide_read_fallback_registered)
+			n = scnprintf(kbuf + written, buf_size - written,
+				     "maps: kretprobe (read buffer filter)\n");
+		else
+			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;
 
 		list_arg.size = written;
@@ -1929,6 +2016,8 @@ static HYMO_NOCFI long hymofs_dev_ioctl(struct file *file, unsigned int cmd,
 	case HYMO_IOC_SET_MIRROR_PATH:
 	case HYMO_IOC_GET_HOOKS:
 	case HYMO_IOC_SET_UNAME:
+	case HYMO_IOC_ADD_MAPS_RULE:
+	case HYMO_IOC_CLEAR_MAPS_RULES:
 		ret = hymo_dispatch_cmd(cmd, (void __user *)arg);
 		break;
 	default:
@@ -2333,6 +2422,349 @@ static int hymo_cmdline_pre(struct kprobe *p, struct pt_regs *regs)
 
 static struct kprobe hymo_kp_cmdline = {
 	.pre_handler = hymo_cmdline_pre,
+};
+
+/* ======================================================================
+ * /proc mount map hiding: kprobe pre_handler on show_vfsmnt / show_mountinfo
+ * Hide overlay mounts so /proc/mounts and /proc/pid/mountinfo show no overlay.
+ * Defeats "OverlayFS detected but no overlay in mountinfo" style detectors.
+ * ====================================================================== */
+
+static int hymo_mount_hide_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct vfsmount *mnt;
+	struct super_block *sb;
+	struct file_system_type *fstype;
+
+#if defined(__aarch64__)
+	mnt = (struct vfsmount *)regs->regs[1];
+#elif defined(__x86_64__)
+	mnt = (struct vfsmount *)regs->si;
+#else
+	return 0;
+#endif
+	if (!mnt || !hymofs_valid_kernel_addr((unsigned long)mnt))
+		return 0;
+	sb = mnt->mnt_sb;
+	if (!sb || !hymofs_valid_kernel_addr((unsigned long)sb))
+		return 0;
+	fstype = sb->s_type;
+	if (!fstype || !hymofs_valid_kernel_addr((unsigned long)fstype) || !fstype->name)
+		return 0;
+	if (strcmp(fstype->name, "overlay") != 0)
+		return 0;
+
+	/* Skip this line: do not call original, return 0 */
+#if defined(__aarch64__)
+	instruction_pointer_set(regs, regs->regs[30]);
+	regs->regs[0] = 0;
+#elif defined(__x86_64__)
+	instruction_pointer_set(regs, *(unsigned long *)regs->sp);
+	regs->sp += sizeof(unsigned long);
+	regs->ax = 0;
+#endif
+	return 1;
+}
+
+static struct kprobe hymo_kp_show_vfsmnt = {
+	.pre_handler = hymo_mount_hide_pre,
+};
+static struct kprobe hymo_kp_show_mountinfo = {
+	.pre_handler = hymo_mount_hide_pre,
+};
+
+/* Preferred path: filter overlay lines from read() when fd is /proc/.../mountinfo or /proc/mounts.
+ * Uses syscall kretprobe only (less overhead, can share with other syscall handling). */
+#define HYMO_READ_MOUNT_FILTER_BUF 65536
+static char *hymo_read_filter_buf;
+static DEFINE_MUTEX(hymo_read_filter_mutex);
+
+struct hymo_read_mount_ri_data {
+	int fd;
+	void __user *buf;
+	size_t count;
+};
+
+static int hymo_read_mount_filter_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct hymo_read_mount_ri_data *d = (struct hymo_read_mount_ri_data *)ri->data;
+#if defined(__aarch64__)
+	d->fd = (int)regs->regs[0];
+	d->buf = (void __user *)regs->regs[1];
+	d->count = (size_t)regs->regs[2];
+#elif defined(__x86_64__)
+	d->fd = (int)regs->di;
+	d->buf = (void __user *)regs->si;
+	d->count = (size_t)regs->dx;
+#else
+	d->fd = -1;
+	d->buf = NULL;
+	d->count = 0;
+#endif
+	return 0;
+}
+
+/* Remove lines containing " overlay " (mountinfo/mounts format); in-place, return new length */
+static size_t hymo_filter_overlay_lines(char *kbuf, size_t len)
+{
+	size_t out = 0;
+	size_t i = 0;
+
+	while (i < len) {
+		size_t line_start = i;
+		while (i < len && kbuf[i] != '\n')
+			i++;
+		if (i > line_start) {
+			size_t line_len = i - line_start;
+			/* Skip line if it contains " overlay " (space-padded to avoid false hits) */
+			bool is_overlay = false;
+			size_t j;
+			for (j = line_start; j + 8 <= line_start + line_len; j++) {
+				if (kbuf[j] == ' ' && kbuf[j+1] == 'o' && kbuf[j+2] == 'v' &&
+				    kbuf[j+3] == 'e' && kbuf[j+4] == 'r' && kbuf[j+5] == 'l' &&
+				    kbuf[j+6] == 'a' && kbuf[j+7] == 'y' &&
+				    (j + 8 == line_start + line_len || kbuf[j+8] == ' ' || kbuf[j+8] == '\n')) {
+					is_overlay = true;
+					break;
+				}
+			}
+			if (!is_overlay) {
+				if (out != line_start)
+					memmove(kbuf + out, kbuf + line_start, line_len);
+				out += line_len;
+				if (i < len) {
+					kbuf[out++] = '\n';
+					i++;
+				}
+			} else if (i < len) {
+				i++; /* skip newline of the dropped overlay line */
+			}
+		} else {
+			if (i < len)
+				i++;
+		}
+	}
+	return out;
+}
+
+/* Parse one maps line; return 0 on success. Fills in start,end,flags,pgoff,dev,ino,pathname.
+ * Maps line format: start-end flags pgoff major:minor ino pathname */
+static int hymo_parse_maps_line(const char *line, size_t line_len,
+		unsigned long *start, unsigned long *end, char *flags,
+		unsigned long *pgoff, unsigned long *dev, unsigned long *ino,
+		const char **pathname)
+{
+	unsigned int ma, mi;
+	const char *p = line;
+	char *endptr;
+
+	if (line_len < 45) /* min "xxxxxxxx-xxxxxxxx xxxx xxxxxxxx xx:xx x \n" */
+		return -1;
+	*start = simple_strtoul(p, &endptr, 16);
+	if (endptr == p || *endptr != '-')
+		return -1;
+	p = endptr + 1;
+	*end = simple_strtoul(p, &endptr, 16);
+	if (endptr == p || *endptr != ' ')
+		return -1;
+	p = endptr + 1;
+	flags[0] = p[0]; flags[1] = p[1]; flags[2] = p[2]; flags[3] = p[3];
+	flags[4] = '\0';
+	p += 4;
+	if (*p != ' ')
+		return -1;
+	*pgoff = simple_strtoul(p + 1, &endptr, 16);
+	p = endptr;
+	if (*p != ' ')
+		return -1;
+	ma = (unsigned int)simple_strtoul(p + 1, &endptr, 16);
+	if (*endptr != ':')
+		return -1;
+	mi = (unsigned int)simple_strtoul(endptr + 1, &endptr, 16);
+	*dev = (unsigned long)MKDEV(ma, mi);
+	p = endptr;
+	if (*p != ' ')
+		return -1;
+	*ino = simple_strtoul(p + 1, &endptr, 10);
+	p = endptr;
+	while (*p == ' ')
+		p++;
+	*pathname = p;
+	return 0;
+}
+
+/* Filter /proc/pid/maps buffer: replace lines matching a rule with spoofed ino/dev/pathname.
+ * In-place; spoofed line must not exceed original line length (pathname truncated if needed).
+ * Returns new length. */
+static size_t hymo_filter_maps_lines(char *kbuf, size_t len)
+{
+	size_t in = 0, out = 0;
+	struct hymo_maps_rule_entry *r;
+	const char *pathname;
+	char flags[5];
+	unsigned long start, end, pgoff, dev, ino;
+	unsigned long spoof_ino, spoof_dev;
+	const char *spoof_name;
+	size_t path_len, max_path;
+	int n;
+
+	if (list_empty(&hymo_maps_rules))
+		return len;
+
+	while (in < len) {
+		size_t line_start = in;
+		while (in < len && kbuf[in] != '\n')
+			in++;
+		if (in <= line_start) {
+			if (in < len)
+				in++;
+			continue;
+		}
+		size_t line_len = in - line_start;
+		if (kbuf[in] == '\n')
+			line_len++;
+		if (hymo_parse_maps_line(kbuf + line_start, line_len,
+					 &start, &end, flags, &pgoff, &dev, &ino, &pathname) != 0) {
+			if (out != line_start)
+				memmove(kbuf + out, kbuf + line_start, line_len);
+			out += line_len;
+			in += (in < len && kbuf[in] == '\n') ? 1 : 0;
+			continue;
+		}
+		spoof_ino = ino;
+		spoof_dev = dev;
+		spoof_name = pathname;
+		mutex_lock(&hymo_maps_mutex);
+		list_for_each_entry(r, &hymo_maps_rules, list) {
+			if (r->target_ino != ino)
+				continue;
+			if (r->target_dev != 0 && r->target_dev != dev)
+				continue;
+			spoof_ino = r->spoofed_ino;
+			spoof_dev = r->spoofed_dev;
+			spoof_name = r->spoofed_pathname;
+			break;
+		}
+		mutex_unlock(&hymo_maps_mutex);
+		if (spoof_ino != ino || spoof_dev != dev || spoof_name != pathname) {
+			/* Format new line; must not exceed line_len. */
+			max_path = line_len;
+			if (max_path > 1)
+				max_path -= 1; /* \n */
+			/* Reserve "%08lx-%08lx %s %08lx %02x:%02x %lu " = 8+1+8+1+4+1+8+1+5+1+max(ino)=20 ~56 */
+			if (max_path > 56)
+				max_path -= 56;
+			else
+				max_path = 0;
+			n = scnprintf(kbuf + out, len - out, "%08lx-%08lx %s %08lx %02x:%02x %lu ",
+				      start, end, flags, pgoff,
+				      (unsigned int)MAJOR(spoof_dev), (unsigned int)MINOR(spoof_dev),
+				      spoof_ino);
+			path_len = strnlen(spoof_name, max_path);
+			if ((size_t)line_len > n + 1 && n + path_len + 1 > line_len)
+				path_len = (size_t)line_len - n - 1;
+			if (path_len > 0)
+				memcpy(kbuf + out + n, spoof_name, path_len);
+			n += path_len;
+			if (n < len - out)
+				kbuf[out + n] = '\n';
+			n++;
+			out += n;
+		} else {
+			if (out != line_start)
+				memmove(kbuf + out, kbuf + line_start, line_len);
+			out += line_len;
+		}
+		if (in < len && kbuf[in] == '\n')
+			in++;
+	}
+	return out;
+}
+
+static int hymo_read_mount_filter_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	long ret;
+	struct hymo_read_mount_ri_data *d = (struct hymo_read_mount_ri_data *)ri->data;
+	struct file *f;
+	char *path_buf;
+	size_t new_len;
+
+#if defined(__aarch64__)
+	ret = (long)regs->regs[0];
+#elif defined(__x86_64__)
+	ret = (long)regs->ax;
+#else
+	return 0;
+#endif
+	if (ret <= 0 || d->fd < 0 || !d->buf || ret > HYMO_READ_MOUNT_FILTER_BUF)
+		return 0;
+	if (!hymo_read_filter_buf)
+		return 0;
+
+	f = fget(d->fd);
+	if (!f)
+		return 0;
+	path_buf = (char *)__get_free_page(GFP_KERNEL);
+	if (!path_buf) {
+		fput(f);
+		return 0;
+	}
+	path_buf[0] = '\0';
+	d_path(&f->f_path, path_buf, PAGE_SIZE);
+	fput(f);
+
+	mutex_lock(&hymo_read_filter_mutex);
+	if (copy_from_user(hymo_read_filter_buf, d->buf, (size_t)ret)) {
+		mutex_unlock(&hymo_read_filter_mutex);
+		return 0;
+	}
+
+	/* /proc/.../mountinfo or /proc/mounts: filter overlay lines */
+	if (strncmp(path_buf, "/proc/", 6) == 0 &&
+	    (strstr(path_buf, "mountinfo") || strstr(path_buf, "/mounts"))) {
+		free_page((unsigned long)path_buf);
+		new_len = hymo_filter_overlay_lines(hymo_read_filter_buf, (size_t)ret);
+		if (new_len < (size_t)ret) {
+			if (copy_to_user(d->buf, hymo_read_filter_buf, new_len) == 0) {
+#if defined(__aarch64__)
+				regs->regs[0] = (unsigned long)new_len;
+#elif defined(__x86_64__)
+				regs->ax = (unsigned long)new_len;
+#endif
+			}
+		}
+		mutex_unlock(&hymo_read_filter_mutex);
+		return 0;
+	}
+
+	/* /proc/.../maps or .../smaps: spoof ino/dev/pathname by rule */
+	if (strncmp(path_buf, "/proc/", 6) == 0 &&
+	    (strstr(path_buf, "/maps") || strstr(path_buf, "/smaps"))) {
+		free_page((unsigned long)path_buf);
+		new_len = hymo_filter_maps_lines(hymo_read_filter_buf, (size_t)ret);
+		if (new_len != (size_t)ret) {
+			if (copy_to_user(d->buf, hymo_read_filter_buf, new_len) == 0) {
+#if defined(__aarch64__)
+				regs->regs[0] = (unsigned long)new_len;
+#elif defined(__x86_64__)
+				regs->ax = (unsigned long)new_len;
+#endif
+			}
+		}
+		mutex_unlock(&hymo_read_filter_mutex);
+		return 0;
+	}
+
+	free_page((unsigned long)path_buf);
+	mutex_unlock(&hymo_read_filter_mutex);
+	return 0;
+}
+
+static struct kretprobe hymo_krp_read_mount_filter = {
+	.entry_handler = hymo_read_mount_filter_entry,
+	.handler = hymo_read_mount_filter_ret,
+	.data_size = sizeof(struct hymo_read_mount_ri_data),
+	.maxactive = 64,
 };
 
 /* kretprobe fallback for cmdline when tracepoint unavailable */
@@ -3794,6 +4226,70 @@ static int __init hymofs_lkm_init(void)
 	}
 	}
 
+	/* /proc mount map hiding: prefer kretprobe on read() (less overhead, shares syscall with
+	 * cmdline etc); fallback to kprobe on show_vfsmnt/show_mountinfo when read path unavailable. */
+	{
+		static const char *read_syms[] = {
+#if defined(__aarch64__)
+			"__arm64_sys_read", "sys_read", NULL
+#elif defined(__x86_64__)
+			"__x64_sys_read", "sys_read", NULL
+#else
+			NULL
+#endif
+		};
+		unsigned long read_addr = 0;
+		int i;
+		bool use_read_path = false;
+
+		for (i = 0; read_syms[i]; i++) {
+			read_addr = hymofs_lookup_name(read_syms[i]);
+			if (read_addr)
+				break;
+		}
+		if (read_addr) {
+			hymo_read_filter_buf = vmalloc(HYMO_READ_MOUNT_FILTER_BUF);
+			if (hymo_read_filter_buf) {
+				hymo_krp_read_mount_filter.kp.addr = (kprobe_opcode_t *)read_addr;
+				if (register_kretprobe(&hymo_krp_read_mount_filter) == 0) {
+					hymo_mount_hide_read_fallback_registered = 1;
+					use_read_path = true;
+					pr_info("hymofs: mount hide via kretprobe on %s (read buffer filter, preferred)\n",
+						read_syms[i]);
+				} else {
+					vfree(hymo_read_filter_buf);
+					hymo_read_filter_buf = NULL;
+				}
+			}
+		}
+		if (!use_read_path) {
+			unsigned long addr_vfsmnt = hymofs_lookup_name("show_vfsmnt");
+			unsigned long addr_mountinfo = hymofs_lookup_name("show_mountinfo");
+			if (read_addr)
+				pr_info("hymofs: mount hide read path unavailable, falling back to kprobe\n");
+			else
+				pr_warn("hymofs: read syscall not found, trying kprobe on show_vfsmnt/show_mountinfo\n");
+			if (addr_vfsmnt) {
+				hymo_kp_show_vfsmnt.addr = (kprobe_opcode_t *)addr_vfsmnt;
+				if (register_kprobe(&hymo_kp_show_vfsmnt) == 0) {
+					hymo_mount_hide_vfsmnt_registered = 1;
+					pr_info("hymofs: mount hide via kprobe on show_vfsmnt (/proc/mounts)\n");
+				}
+			} else {
+				pr_warn("hymofs: show_vfsmnt not found\n");
+			}
+			if (addr_mountinfo) {
+				hymo_kp_show_mountinfo.addr = (kprobe_opcode_t *)addr_mountinfo;
+				if (register_kprobe(&hymo_kp_show_mountinfo) == 0) {
+					hymo_mount_hide_mountinfo_registered = 1;
+					pr_info("hymofs: mount hide via kprobe on show_mountinfo (/proc/pid/mountinfo)\n");
+				}
+			} else {
+				pr_warn("hymofs: show_mountinfo not found\n");
+			}
+		}
+	}
+
 	pr_alert("hymofs: STAGE 7: registering VFS hooks\n");
 #if HYMOFS_VFS_KPROBES
 	if (!hymo_skip_vfs_param) {
@@ -4003,6 +4499,28 @@ static void __exit hymofs_lkm_exit(void)
 {
 	pr_info("hymofs: shutting down\n");
 
+	if (hymo_mount_hide_read_fallback_registered) {
+		unregister_kretprobe(&hymo_krp_read_mount_filter);
+		if (hymo_read_filter_buf) {
+			vfree(hymo_read_filter_buf);
+			hymo_read_filter_buf = NULL;
+		}
+		/* Clear maps spoof rules */
+		{
+			struct hymo_maps_rule_entry *e, *tmp;
+
+			mutex_lock(&hymo_maps_mutex);
+			list_for_each_entry_safe(e, tmp, &hymo_maps_rules, list) {
+				list_del(&e->list);
+				kfree(e);
+			}
+			mutex_unlock(&hymo_maps_mutex);
+		}
+	}
+	if (hymo_mount_hide_mountinfo_registered)
+		unregister_kprobe(&hymo_kp_show_mountinfo);
+	if (hymo_mount_hide_vfsmnt_registered)
+		unregister_kprobe(&hymo_kp_show_vfsmnt);
 	if (hymo_cmdline_kretprobe_registered)
 		unregister_kretprobe(&hymo_krp_cmdline_read);
 	if (hymo_cmdline_kprobe_registered)
