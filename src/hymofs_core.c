@@ -2612,7 +2612,10 @@ static size_t hymo_filter_maps_lines(char *kbuf, size_t len)
 		return len;
 
 	while (in < len) {
-		size_t line_start = in;
+		size_t line_start;
+		size_t line_len;
+
+		line_start = in;
 		while (in < len && kbuf[in] != '\n')
 			in++;
 		if (in <= line_start) {
@@ -2620,7 +2623,7 @@ static size_t hymo_filter_maps_lines(char *kbuf, size_t len)
 				in++;
 			continue;
 		}
-		size_t line_len = in - line_start;
+		line_len = in - line_start;
 		if (kbuf[in] == '\n')
 			line_len++;
 		if (hymo_parse_maps_line(kbuf + line_start, line_len,
