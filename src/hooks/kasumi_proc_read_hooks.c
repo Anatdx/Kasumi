@@ -24,6 +24,10 @@
 #include <linux/fcntl.h>
 #include <linux/mount.h>
 #include <linux/seq_file.h>
+#include <linux/srcu.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
+#include <linux/atomic.h>
 #include <uapi/linux/magic.h>
 #ifndef EROFS_SUPER_MAGIC
 #define EROFS_SUPER_MAGIC 0xe0f5e1e2
@@ -166,11 +170,45 @@ bool kasumi_path_needs_proc_proxy(const char *path)
 	return kasumi_proc_proxy_kind_for_path(path) != KASUMI_PROC_PROXY_NONE;
 }
 
+/*
+ * Revocable proxy lifecycle:
+ *   - .owner = NULL so fops_get/fops_put never bump THIS_MODULE refcount; long-lived
+ *     readers can't pin the module.
+ *   - Every install adds the proxy to kasumi_proxy_list under kasumi_proxy_list_lock.
+ *   - On module exit, kasumi_mount_proxy_drain() flips file->f_op back to orig_fops,
+ *     then synchronize_srcu()s so any in-flight proxy_read/proxy_release callers exit
+ *     before we kfree the proxy. Module text only goes away after exit returns, so the
+ *     SRCU barrier is what keeps stale callers from jumping into freed code.
+ *   - Natural close (proxy_release) atomically claims state to coordinate with drain;
+ *     whichever side claims OPEN->RELEASING vs OPEN->DRAINED owns the kfree.
+ */
+
+#define KASUMI_PROXY_STATE_OPEN      0
+#define KASUMI_PROXY_STATE_DRAINED   1
+#define KASUMI_PROXY_STATE_RELEASING 2
+
 struct kasumi_mount_file_proxy {
 	const struct file_operations *orig_fops;
 	struct file_operations proxy_fops;
 	enum kasumi_proc_proxy_kind kind;
+	struct list_head node;
+	struct file *file;
+	atomic_t state;
+	struct rcu_head rcu;
 };
+
+static LIST_HEAD(kasumi_proxy_list);
+static DEFINE_SPINLOCK(kasumi_proxy_list_lock);
+DEFINE_STATIC_SRCU(kasumi_proxy_srcu);
+static atomic_t kasumi_proxy_shutdown = ATOMIC_INIT(0);
+
+static void kasumi_mount_proxy_rcu_free(struct rcu_head *rcu)
+{
+	struct kasumi_mount_file_proxy *p =
+		container_of(rcu, struct kasumi_mount_file_proxy, rcu);
+
+	kfree(p);
+}
 
 static ssize_t kasumi_mount_proxy_read(struct file *file, char __user *buf,
 					 size_t count, loff_t *ppos)
@@ -180,54 +218,61 @@ static ssize_t kasumi_mount_proxy_read(struct file *file, char __user *buf,
 	ssize_t ret;
 	loff_t pos;
 	size_t new_len;
+	int srcu_idx;
 
-	if (!proxy->orig_fops->read)
-		return -EINVAL;
+	srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
+
+	if (!proxy->orig_fops->read) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO &&
 	    (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) &&
 	    kasumi_should_apply_hide_rules()) {
 		pos = ppos ? *ppos : file->f_pos;
 		ret = kasumi_fake_mi_serve(file, buf, count, 0, pos);
-		if (ret == -1)
-			return 0;
+		if (ret == -1) {
+			ret = 0;
+			goto out;
+		}
 		if (ret > 0) {
 			if (ppos)
 				*ppos += ret;
 			else
 				file->f_pos += ret;
-			return ret;
+			goto out;
 		}
 	}
 
 	ret = proxy->orig_fops->read(file, buf, count, ppos);
 	if (ret <= 0 || ret > KASUMI_READ_MOUNT_FILTER_BUF || !kasumi_read_filter_buf)
-		return ret;
+		goto out;
 
 	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO ||
 	    proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
 		if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE))
-			return ret;
+			goto out;
 		mutex_lock(&kasumi_read_filter_mutex);
 		if (copy_from_user(kasumi_read_filter_buf, buf, (size_t)ret)) {
 			mutex_unlock(&kasumi_read_filter_mutex);
-			return ret;
+			goto out;
 		}
 		new_len = kasumi_filter_overlay_lines(kasumi_read_filter_buf, (size_t)ret);
 		if (new_len < (size_t)ret &&
 		    copy_to_user(buf, kasumi_read_filter_buf, new_len) == 0)
 			ret = (ssize_t)new_len;
 		mutex_unlock(&kasumi_read_filter_mutex);
-		return ret;
+		goto out;
 	}
 
 	if (proxy->kind == KASUMI_PROC_PROXY_MAPS) {
 		if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF))
-			return ret;
+			goto out;
 		mutex_lock(&kasumi_read_filter_mutex);
 		if (copy_from_user(kasumi_read_filter_buf, buf, (size_t)ret)) {
 			mutex_unlock(&kasumi_read_filter_mutex);
-			return ret;
+			goto out;
 		}
 		new_len = kasumi_filter_maps_lines(kasumi_read_filter_buf, (size_t)ret);
 		if (new_len != (size_t)ret &&
@@ -236,6 +281,8 @@ static ssize_t kasumi_mount_proxy_read(struct file *file, char __user *buf,
 		mutex_unlock(&kasumi_read_filter_mutex);
 	}
 
+out:
+	srcu_read_unlock(&kasumi_proxy_srcu, srcu_idx);
 	return ret;
 }
 
@@ -246,6 +293,9 @@ static ssize_t kasumi_mount_proxy_read_iter(struct kiocb *iocb,
 		container_of(iocb->ki_filp->f_op, struct kasumi_mount_file_proxy,
 			     proxy_fops);
 	ssize_t ret;
+	int srcu_idx;
+
+	srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
 
 	kasumi_log("mount_proxy: read_iter pid=%d comm=%s count=%zu\n",
 		 task_pid_nr(current), current->comm, iov_iter_count(to));
@@ -253,22 +303,29 @@ static ssize_t kasumi_mount_proxy_read_iter(struct kiocb *iocb,
 	if (proxy->kind != KASUMI_PROC_PROXY_MOUNTINFO ||
 	    !(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) ||
 	    !kasumi_should_apply_hide_rules()) {
-		if (!proxy->orig_fops->read_iter)
-			return -EINVAL;
-		return proxy->orig_fops->read_iter(iocb, to);
+		if (!proxy->orig_fops->read_iter) {
+			ret = -EINVAL;
+			goto out;
+		}
+		ret = proxy->orig_fops->read_iter(iocb, to);
+		goto out;
 	}
 
 	ret = kasumi_fake_mi_read_iter(iocb, to);
 	kasumi_log("mount_proxy: fake_read_iter pid=%d comm=%s ret=%zd\n",
 		 task_pid_nr(current), current->comm, ret);
 	if (ret >= 0)
-		return ret;
+		goto out;
 
 	if (!proxy->orig_fops->read_iter)
-		return ret;
+		goto out;
 	kasumi_log("mount_proxy: fallback_orig_read_iter pid=%d comm=%s ret=%zd\n",
 		 task_pid_nr(current), current->comm, ret);
-	return proxy->orig_fops->read_iter(iocb, to);
+	ret = proxy->orig_fops->read_iter(iocb, to);
+
+out:
+	srcu_read_unlock(&kasumi_proxy_srcu, srcu_idx);
+	return ret;
 }
 
 static int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
@@ -276,12 +333,32 @@ static int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
 	struct kasumi_mount_file_proxy *proxy =
 		container_of(file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
 	int ret = 0;
+	int prev;
+	bool we_own;
+	int srcu_idx;
+
+	srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
+
+	prev = atomic_cmpxchg(&proxy->state, KASUMI_PROXY_STATE_OPEN,
+			       KASUMI_PROXY_STATE_RELEASING);
+	we_own = (prev == KASUMI_PROXY_STATE_OPEN);
+	if (we_own) {
+		spin_lock(&kasumi_proxy_list_lock);
+		list_del_init(&proxy->node);
+		spin_unlock(&kasumi_proxy_list_lock);
+	}
 
 	if (proxy->orig_fops->release)
 		ret = proxy->orig_fops->release(inode, file);
-	fops_put(file->f_op);
-	file->f_op = NULL;
-	kfree(proxy);
+
+	srcu_read_unlock(&kasumi_proxy_srcu, srcu_idx);
+
+	if (we_own) {
+		/* defer free past current SRCU grace period */
+		call_srcu(&kasumi_proxy_srcu, &proxy->rcu,
+			  kasumi_mount_proxy_rcu_free);
+	}
+	/* drained side: kasumi_mount_proxy_drain() owns the kfree */
 	return ret;
 }
 
@@ -294,6 +371,9 @@ int kasumi_mount_proxy_install_fd(int fd)
 	const struct file_operations *new_fops;
 	enum kasumi_proc_proxy_kind kind;
 	int ret = 0;
+
+	if (atomic_read(&kasumi_proxy_shutdown))
+		return -ESHUTDOWN;
 
 	file = fget(fd);
 	if (!file)
@@ -329,26 +409,84 @@ int kasumi_mount_proxy_install_fd(int fd)
 	proxy->orig_fops = file->f_op;
 	proxy->kind = kind;
 	proxy->proxy_fops = *file->f_op;
-	proxy->proxy_fops.owner = THIS_MODULE;
+	/* owner = NULL: fops_get/fops_put will not bump THIS_MODULE refcount,
+	 * so long-lived proxied fds cannot block rmmod. Lifetime is governed by
+	 * kasumi_proxy_list + SRCU instead.
+	 */
+	proxy->proxy_fops.owner = NULL;
 	if (proxy->orig_fops->read)
 		proxy->proxy_fops.read = kasumi_mount_proxy_read;
 	if (proxy->orig_fops->read_iter)
 		proxy->proxy_fops.read_iter = kasumi_mount_proxy_read_iter;
 	proxy->proxy_fops.release = kasumi_mount_proxy_release;
+	INIT_LIST_HEAD(&proxy->node);
+	proxy->file = file;
+	atomic_set(&proxy->state, KASUMI_PROXY_STATE_OPEN);
 
+	spin_lock(&kasumi_proxy_list_lock);
+	if (atomic_read(&kasumi_proxy_shutdown)) {
+		spin_unlock(&kasumi_proxy_list_lock);
+		kfree(proxy);
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	new_fops = fops_get(&proxy->proxy_fops);
 	if (!new_fops) {
+		spin_unlock(&kasumi_proxy_list_lock);
 		kfree(proxy);
 		ret = -ENOENT;
 		goto out;
 	}
-	file->f_op = new_fops;
+	list_add(&proxy->node, &kasumi_proxy_list);
+	WRITE_ONCE(file->f_op, new_fops);
+	spin_unlock(&kasumi_proxy_list_lock);
+
 	kasumi_log("proc_proxy: installed fd=%d kind=%d pid=%d comm=%s\n",
 		 fd, kind, task_pid_nr(current), current->comm);
 
 out:
 	fput(file);
 	return ret;
+}
+
+void kasumi_mount_proxy_drain(void)
+{
+	struct kasumi_mount_file_proxy *p, *tmp;
+	LIST_HEAD(victims);
+
+	atomic_set(&kasumi_proxy_shutdown, 1);
+
+	spin_lock(&kasumi_proxy_list_lock);
+	list_for_each_entry_safe(p, tmp, &kasumi_proxy_list, node) {
+		if (atomic_cmpxchg(&p->state, KASUMI_PROXY_STATE_OPEN,
+				    KASUMI_PROXY_STATE_DRAINED) !=
+		    KASUMI_PROXY_STATE_OPEN)
+			continue; /* release path owns this proxy */
+		list_move(&p->node, &victims);
+		/* Restore original f_op so future fops dispatches bypass the
+		 * proxy. WRITE_ONCE under the same spinlock release/install
+		 * also take ensures no torn write or racing assignment.
+		 */
+		WRITE_ONCE(p->file->f_op, p->orig_fops);
+	}
+	spin_unlock(&kasumi_proxy_list_lock);
+
+	/* Wait for all in-flight proxy_read/read_iter/release callers (which
+	 * captured a snapshot of f_op before our WRITE_ONCE) to leave the SRCU
+	 * read-side critical section before we free their proxy.
+	 */
+	synchronize_srcu(&kasumi_proxy_srcu);
+
+	list_for_each_entry_safe(p, tmp, &victims, node) {
+		list_del(&p->node);
+		kfree(p);
+	}
+
+	/* Flush any call_srcu callbacks (kasumi_mount_proxy_rcu_free) queued by
+	 * the natural release path before we go. Their function pointer lives
+	 * in module text, so they must run before module unload completes.
+	 */
+	srcu_barrier(&kasumi_proxy_srcu);
 }
 
 static int kasumi_read_mount_filter_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1259,6 +1397,14 @@ void kasumi_proc_read_hooks_init(void)
 void kasumi_proc_read_hooks_exit(void)
 {
 	bool had_proc_proxy = kasumi_proc_proxy_registered;
+
+	/* Drain installed proc-fd proxies first: restore original f_op on every
+	 * tracked file and wait for in-flight callers to leave proxy_read /
+	 * proxy_release before we free the proxy structs. With .owner = NULL on
+	 * the proxy fops, this is what allows rmmod to succeed even when long-
+	 * lived processes still hold proxied /proc fds open.
+	 */
+	kasumi_mount_proxy_drain();
 
 	if (kasumi_statfs_kretprobe_registered)
 		unregister_kretprobe(&kasumi_krp_statfs);
