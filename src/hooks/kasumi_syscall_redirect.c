@@ -28,6 +28,7 @@
 
 #include "kasumi_base.h"
 #include "kasumi_runtime.h"
+#include "kasumi_file_view.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
@@ -370,6 +371,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	char path[KSM_MAX_LEN_PATHNAME];
 	const char __user *u = (void __user *)(uintptr_t)regs->regs[1];
 	char *t;
+	char *target_path = NULL;
 	long ret;
 	bool proxy = false;
 	long tgid = (long)task_tgid_vnr(current);
@@ -399,7 +401,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 					((unsigned long *)regs)[1] =
 						(unsigned long)n;
 			}
-			kfree(t);
+			target_path = t;
 		}
 	}
 
@@ -411,8 +413,11 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	}
 
 	ret = orig(regs);
+	if (!proxy && ret >= 0 && target_path)
+		(void)kasumi_file_view_bind_fd((int)ret, path, target_path);
 	if (proxy && ret >= 0)
 		kasumi_mount_proxy_install_fd((int)ret);
+	kfree(target_path);
 	return ret;
 }
 

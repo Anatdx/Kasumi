@@ -9,6 +9,7 @@ kasumi_lkm-objs := \
 	kasumi_main.o \
 	core/kasumi_bootstrap.o \
 	core/kasumi_runtime.o \
+	core/kasumi_file_view.o \
 	control/kasumi_ioctl.o \
 	policy/kasumi_path_policy.o \
 	overlay/kasumi_overlay.o \

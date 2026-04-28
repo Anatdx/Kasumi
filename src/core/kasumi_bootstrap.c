@@ -17,6 +17,7 @@
 #include "kasumi_bootstrap.h"
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_file_view.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
@@ -273,6 +274,7 @@ void kasumi_bootstrap_exit(void)
 	kasumi_syscall_redirect_exit();
 
 	/* PHASE 2: handlers can no longer be reached, free their dependencies. */
+	kasumi_file_view_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(kasumi_skip_vfs_param);
 	kasumi_fop_override_exit();

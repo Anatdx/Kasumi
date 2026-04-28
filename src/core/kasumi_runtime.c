@@ -45,6 +45,7 @@
 
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_file_view.h"
 #include "kasumi_dop_override.h"
 #include "kasumi_xattr_sid_override.h"
 #include "kasumi_fop_override.h"
@@ -345,6 +346,7 @@ void kasumi_cleanup_locked(void)
 	int bkt;
 
 	kasumi_enabled = false;
+	kasumi_file_view_clear();
 
 	hash_for_each_safe(kasumi_paths, bkt, tmp, entry, node) {
 		kasumi_clear_inode_flags_for_path(entry->src, AS_FLAGS_KASUMI_HIDE);

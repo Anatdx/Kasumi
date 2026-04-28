@@ -36,6 +36,7 @@
 
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_file_view.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
@@ -675,15 +676,13 @@ static size_t kasumi_filter_maps_lines(char *kbuf, size_t len)
 	size_t in = 0, out = 0;
 	struct kasumi_maps_rule_entry *r;
 	const char *pathname;
+	char auto_spoof_path[KSM_MAX_LEN_PATHNAME];
 	char flags[5];
 	unsigned long start, end, pgoff, dev, ino;
 	unsigned long spoof_ino, spoof_dev;
 	const char *spoof_name;
 	size_t path_len, max_path;
 	int n;
-
-	if (list_empty(&kasumi_maps_rules))
-		return len;
 
 	while (in < len) {
 		size_t line_start;
@@ -711,6 +710,11 @@ static size_t kasumi_filter_maps_lines(char *kbuf, size_t len)
 		spoof_ino = ino;
 		spoof_dev = dev;
 		spoof_name = pathname;
+		if (kasumi_file_view_lookup_maps(ino, dev, &spoof_ino, &spoof_dev,
+						 auto_spoof_path,
+						 sizeof(auto_spoof_path)))
+			spoof_name = auto_spoof_path;
+
 		mutex_lock(&kasumi_maps_mutex);
 		list_for_each_entry(r, &kasumi_maps_rules, list) {
 			if (r->target_ino != ino)
