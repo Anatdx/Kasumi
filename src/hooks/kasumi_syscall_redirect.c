@@ -125,7 +125,7 @@ static int patch_entry(int nr, kasumi_syscall_hook_fn fn)
 	u64 val = (u64)fn;
 	int ret;
 
-	pr_info("Kasumi: patch syscall %d @ %lx -> %llx\n", nr, addr, val);
+	kasumi_log("patch syscall %d @ %lx -> %llx\n", nr, addr, val);
 	ret = ksm_insn_write_u64((void *)addr, val);
 	if (ret)
 		pr_err("Kasumi: aarch64_insn_write_literal_u64(%lx) failed: %d\n",

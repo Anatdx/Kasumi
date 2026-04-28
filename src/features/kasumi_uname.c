@@ -211,7 +211,7 @@ int kasumi_uname_apply_global(const struct kasumi_spoof_uname *u)
 	kasumi_uname_global_on = true;
 	mutex_unlock(&kasumi_uname_cfg_mutex);
 
-	pr_info("Kasumi: uname global applied: release='%s' version='%s'\n",
+	kasumi_log("uname global applied: release='%s' version='%s'\n",
 		kasumi_init_uts_ns_ptr->name.release,
 		kasumi_init_uts_ns_ptr->name.version);
 	return 0;
@@ -235,7 +235,7 @@ int kasumi_uname_restore_global(void)
 	kasumi_uname_global_on = false;
 	mutex_unlock(&kasumi_uname_cfg_mutex);
 
-	pr_info("Kasumi: uname global restored\n");
+	kasumi_log("uname global restored\n");
 	return 0;
 }
 
@@ -286,7 +286,7 @@ int kasumi_uname_set_scoped_config(const struct kasumi_spoof_uname *u)
 	if (old_cfg)
 		kfree_rcu(old_cfg, rcu);
 
-	pr_info("Kasumi: uname scoped config %s\n", active ? "set" : "cleared");
+	kasumi_log("uname scoped config %s\n", active ? "set" : "cleared");
 	return 0;
 }
 
