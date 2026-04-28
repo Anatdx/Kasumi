@@ -12,16 +12,6 @@
 #define PT_REGS_ORIG_SYSCALL(regs) (0)
 #endif
 
-enum kasumi_root_type {
-	KASUMI_ROOT_NONE      = 0,
-	KASUMI_ROOT_KSU       = 1 << 0,
-	KASUMI_ROOT_KSU_RDR   = 1 << 1,
-	KASUMI_ROOT_APATCH    = 1 << 2,
-	KASUMI_ROOT_MAGISK    = 1 << 3,
-};
-extern int kasumi_root_mask;
-void kasumi_root_detect(void);
-
 extern void *kasumi_syscall_table;
 extern int  kasumi_syscall_dispatcher_nr;
 typedef long (*kasumi_syscall_hook_fn)(const struct pt_regs *regs);

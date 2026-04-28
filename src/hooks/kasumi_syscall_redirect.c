@@ -34,6 +34,7 @@
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_fake_mountinfo.h"
+#include "kasumi_root_detection.h"
 #include "kasumi_syscall_redirect.h"
 
 /* ---- Runtime-resolved kernel patching functions ------------------------ */
@@ -71,43 +72,6 @@ static int ksm_resolve_patch_api(void)
 		pr_warn("Kasumi: emergency_sync not resolved (reboot fallback will skip fs sync)\n");
 
 	return 0;
-}
-
-/* ---- Root detection ---------------------------------------------------- */
-
-int kasumi_root_mask;
-
-void kasumi_root_detect(void)
-{
-	unsigned long a;
-	kasumi_root_mask = 0;
-
-	a = kasumi_lookup_name("ksu_syscall_table");
-	if (a && kasumi_valid_kernel_addr(a)) {
-		kasumi_root_mask |= KASUMI_ROOT_KSU;
-		a = kasumi_lookup_name("ksu_dispatcher_nr");
-		if (a && kasumi_valid_kernel_addr(a) &&
-		    READ_ONCE(*(int *)a) >= 0)
-			kasumi_root_mask |= KASUMI_ROOT_KSU_RDR;
-		pr_info("Kasumi: KernelSU detected%s\n",
-			(kasumi_root_mask & KASUMI_ROOT_KSU_RDR) ?
-			" (redirect)" : "");
-	}
-
-	a = kasumi_lookup_name("kpm_init");
-	if (a && kasumi_valid_kernel_addr(a)) {
-		kasumi_root_mask |= KASUMI_ROOT_APATCH;
-		pr_info("Kasumi: APatch/KPM detected\n");
-	}
-
-	if (!(kasumi_root_mask & KASUMI_ROOT_KSU)) {
-		struct file *f = filp_open("/sbin/magisk", O_RDONLY, 0);
-		if (!IS_ERR(f)) {
-			filp_close(f, NULL);
-			kasumi_root_mask |= KASUMI_ROOT_MAGISK;
-			pr_info("Kasumi: Magisk detected\n");
-		}
-	}
 }
 
 /* ---- Syscall table & redirect ------------------------------------------ */

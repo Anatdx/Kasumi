@@ -10,6 +10,7 @@ kasumi_lkm-objs := \
 	core/kasumi_bootstrap.o \
 	core/kasumi_runtime.o \
 	core/kasumi_file_view.o \
+	core/kasumi_root_detection.o \
 	control/kasumi_ioctl.o \
 	policy/kasumi_path_policy.o \
 	overlay/kasumi_overlay.o \
