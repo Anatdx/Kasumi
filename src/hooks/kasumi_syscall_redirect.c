@@ -372,7 +372,7 @@ static long h_write(const struct pt_regs *regs)
 	size_t len;
 
 	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
-	    !kasumi_should_apply_hide_rules())
+	    !kasumi_current_is_selinux_guard_target())
 		return orig_kernel_write(regs);
 
 #if defined(__aarch64__)

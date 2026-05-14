@@ -42,6 +42,7 @@
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <uapi/linux/magic.h>
 #ifndef EROFS_SUPER_MAGIC
 #define EROFS_SUPER_MAGIC 0xe0f5e1e2
@@ -105,6 +106,20 @@ static inline bool kasumi_uid_is_isolated(uid_t uid)
 	       appid <= KASUMI_KSU_LAST_ISOLATED_UID;
 }
 
+static bool kasumi_current_is_app_zygote(void)
+{
+	const char suffix[] = "_zygote";
+	size_t comm_len = strnlen(current->comm, TASK_COMM_LEN);
+	size_t suffix_len = sizeof(suffix) - 1;
+
+	if (strncmp(current->comm, "app_zygote", TASK_COMM_LEN) == 0)
+		return true;
+	if (comm_len < suffix_len)
+		return false;
+	return memcmp(current->comm + comm_len - suffix_len,
+		      suffix, suffix_len) == 0;
+}
+
 static bool kasumi_apatch_should_apply_hide(uid_t uid)
 {
 	if (kasumi_uid_is_isolated(uid))
@@ -147,6 +162,42 @@ bool kasumi_should_apply_hide_rules(void)
 	if (!READ_ONCE(kasumi_allowlist_loaded))
 		return false;
 	return kasumi_uid_in_allowlist(uid);
+}
+
+static bool kasumi_uid_should_umount_strict(uid_t uid)
+{
+	/* uid 0 (root) never sees spoofed view */
+	if (unlikely(uid == 0))
+		return false;
+	if (!kasumi_root_allows_spoofing())
+		return false;
+
+	if (kasumi_root_mask & KASUMI_ROOT_APATCH) {
+		if (!kasumi_ap_get_mod_exclude)
+			return false;
+		return kasumi_ap_get_mod_exclude(uid) != 0;
+	}
+
+	if (kasumi_ksu_uid_should_umount_ptr)
+		return kasumi_ksu_uid_should_umount_ptr(uid);
+
+	if (!READ_ONCE(kasumi_allowlist_loaded))
+		return false;
+	return kasumi_uid_in_allowlist(uid);
+}
+
+bool kasumi_current_is_selinux_guard_target(void)
+{
+	uid_t uid = __kuid_val(current_uid());
+
+	/*
+	 * SELinux Guard is narrower than normal hide/spoof policy. Only the
+	 * hidden app's app-zygote process receives fake SELinux answers; su/ksu,
+	 * root managers, shells, and daemons must observe the real policy even if
+	 * other hide rules would apply to their UID bucket.
+	 */
+	return kasumi_current_is_app_zygote() &&
+	       kasumi_uid_should_umount_strict(uid);
 }
 
 static void kasumi_add_allow_uid(uid_t uid)

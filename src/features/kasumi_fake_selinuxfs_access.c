@@ -9,6 +9,7 @@
  */
 #include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_entrypoints.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
 #include "kasumi_sop_override.h"
 
@@ -207,7 +208,7 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_write(struct file *file,
 		atomic64_inc(&kasumi_hook_stats.selinuxfs_context_queries);
 
 	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
-	    !kasumi_should_apply_hide_rules() ||
+	    !kasumi_current_is_selinux_guard_target() ||
 	    !buf || count == 0 || count >= KASUMI_SELINUXFS_QUERY_MAX)
 		return orig->write(file, buf, count, ppos);
 
