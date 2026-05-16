@@ -614,6 +614,7 @@ static int kasumi_patch_registered_syscalls(void)
 		ret = patch_entry(i, fn);
 		if (ret) {
 			pr_err("Kasumi: patch syscall %d failed: %d\n", i, ret);
+			saved_syscalls[i] = NULL;
 			goto rollback;
 		}
 		patched_syscalls[i] = true;
@@ -807,6 +808,9 @@ void kasumi_syscall_redirect_exit(void)
 	orig_kernel_openat2 = NULL;
 	orig_kernel_statfs  = NULL;
 	orig_kernel_fstatfs = NULL;
+#ifdef __NR_statx
+	orig_kernel_statx   = NULL;
+#endif
 #ifdef __NR_statfs64
 	orig_kernel_statfs64 = NULL;
 #endif
