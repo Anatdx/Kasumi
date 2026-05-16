@@ -5,11 +5,11 @@
 #include <asm/ptrace.h>
 
 #if defined(__aarch64__)
-#define PT_REGS_ORIG_SYSCALL(regs) ((regs)->regs[8])
+#define PT_REGS_ORIG_SYSCALL(_regs) ((_regs)->regs[8])
 #elif defined(__x86_64__)
-#define PT_REGS_ORIG_SYSCALL(regs) ((regs)->orig_ax)
+#define PT_REGS_ORIG_SYSCALL(_regs) ((_regs)->orig_ax)
 #else
-#define PT_REGS_ORIG_SYSCALL(regs) (0)
+#define PT_REGS_ORIG_SYSCALL(_regs) (0)
 #endif
 
 extern void *kasumi_syscall_table;
@@ -25,6 +25,9 @@ extern kasumi_syscall_hook_fn orig_kernel_openat;
 extern kasumi_syscall_hook_fn orig_kernel_openat2;
 extern kasumi_syscall_hook_fn orig_kernel_statfs;
 extern kasumi_syscall_hook_fn orig_kernel_fstatfs;
+#ifdef __NR_statx
+extern kasumi_syscall_hook_fn orig_kernel_statx;
+#endif
 #ifdef __NR_statfs64
 extern kasumi_syscall_hook_fn orig_kernel_statfs64;
 #endif

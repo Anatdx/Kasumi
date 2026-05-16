@@ -51,7 +51,6 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
 #include "kasumi_syscall_redirect.h"
-#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_uname.h"
 #include "kasumi_dop_override.h"
 #include "kasumi_xattr_sid_override.h"
@@ -578,7 +577,8 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (kasumi_uname_capable())
 			features |= KSM_FEATURE_UNAME_SPOOF;
 		if (kasumi_cmdline_kprobe_registered || kasumi_cmdline_kretprobe_registered ||
-		    (kasumi_tracepoint_path_registered() && kasumi_tracepoint_getfd_registered()))
+		    (kasumi_syscall_dispatcher_nr >= 0 &&
+		     kasumi_has_syscall_hook(__NR_read)))
 			features |= KSM_FEATURE_CMDLINE_SPOOF;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
 		features |= KSM_FEATURE_MERGE_DIR;
@@ -628,9 +628,6 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    (kasumi_has_syscall_hook(__NR_reboot) ||
 		     kasumi_has_syscall_hook(__NR_prctl)))
 			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: TSR\n");
-		else if (kasumi_tracepoint_path_registered() && kasumi_tracepoint_getfd_registered())
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "GET_FD: tracepoint (sys_enter/sys_exit)\n");
 		else if (kasumi_ni_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "GET_FD: kprobe (ni_syscall nr=%d)\n", kasumi_syscall_nr_param);
@@ -645,8 +642,6 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_openat))
 			n = scnprintf(kbuf + written, buf_size - written, "path: TSR\n");
-		else if (kasumi_tracepoint_path_registered())
-			n = scnprintf(kbuf + written, buf_size - written, "path: tracepoint (sys_enter)\n");
 		else if (kasumi_getname_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written, "path: kprobe (getname_flags)\n");
 		else
@@ -686,8 +681,6 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_read))
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: TSR\n");
-		else if (kasumi_tracepoint_path_registered() && kasumi_tracepoint_getfd_registered())
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: tracepoint (sys_enter/sys_exit)\n");
 		else if (kasumi_cmdline_kretprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kretprobe (read)\n");
 		else if (kasumi_cmdline_kprobe_registered)

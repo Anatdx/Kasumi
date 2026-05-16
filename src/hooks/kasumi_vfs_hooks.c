@@ -53,7 +53,6 @@
 #include "kasumi_overlay.h"
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_proc_hooks.h"
-#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_ftrace_hooks.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_iop_override.h"
@@ -216,7 +215,7 @@ passthrough:
 #define KASUMI_POP_STACK(regs)	do { } while (0)
 #endif
 
-/* Path register pointer for syscall tracepoint (avoids u64* vs unsigned long* across archs) */
+/* Path register pointer for syscall-entry style pt_regs (avoids u64* vs unsigned long* across archs). */
 #if defined(__aarch64__) || defined(__x86_64__)
 #define KASUMI_PATH_REG_PTR(regs, id)  ((u64 *)((id) == __NR_execve ? &KASUMI_REG0(regs) : &KASUMI_REG1(regs)))
 #define KASUMI_PATH_REG_VAL(p)         ((u64)(uintptr_t)(p))
@@ -357,8 +356,8 @@ void kasumi_handle_sys_exit_getfd(struct pt_regs *regs, long ret)
 }
 
 #if defined(__aarch64__) || defined(__x86_64__)
-/* Cmdline spoof: check if fd refers to /proc/cmdline.  Used by both the
- * tracepoint sys_enter path and the TSR h_read handler. */
+/* Cmdline spoof: check if fd refers to /proc/cmdline. Used by the direct
+ * h_read handler and kretprobe fallback. */
 bool kasumi_fd_is_proc_cmdline(int fd)
 {
 	struct file *file;
@@ -392,7 +391,7 @@ void kasumi_handle_sys_enter_cmdline(struct pt_regs *regs, long id)
 	if (id != __NR_read)
 		return;
 	/*
-	 * If the TSR redirect has installed h_read, it owns the spoof in one
+	 * If the TSR has installed h_read, it owns the spoof in one
 	 * shot — leave the percpu cmdline_ctx untouched so the sys_exit handler
 	 * doesn't double-spoof an already-rewritten buffer.
 	 */
@@ -530,14 +529,18 @@ void kasumi_handle_sys_exit_statx(struct pt_regs *regs, long ret)
 	if (ret != 0 || !pcpu->statx_ctx.buf)
 		return;
 
-	fake_mnt_id = kasumi_fake_mi_lookup_mount_id(pcpu->statx_ctx.path);
+	fake_mnt_id = kasumi_fake_mi_lookup_mount_id_cached(pcpu->statx_ctx.path);
 	if (fake_mnt_id <= 0)
 		return;
-	if (copy_from_user(&stx, pcpu->statx_ctx.buf, sizeof(stx)) != 0)
+	if (!kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault)
+		return;
+	if (kasumi_copy_from_user_nofault(&stx, pcpu->statx_ctx.buf,
+					  sizeof(stx)) != 0)
 		return;
 
 	stx.stx_mnt_id = (u64)fake_mnt_id;
-	if (copy_to_user(pcpu->statx_ctx.buf, &stx, sizeof(stx)) != 0)
+	if (kasumi_copy_to_user_nofault(pcpu->statx_ctx.buf, &stx,
+					sizeof(stx)) != 0)
 		return;
 
 	kasumi_log("statx spoof: path=%s fake_mnt_id=%d pid=%d comm=%s\n",
@@ -1460,7 +1463,8 @@ int kasumi_vfs_hooks_init(bool skip_vfs)
 		kasumi_vfs_use_ftrace = false;
 		kasumi_getxattr_kprobe_registered = 0;
 
-		if (!kasumi_tracepoint_path_registered()) {
+		if (kasumi_syscall_dispatcher_nr < 0 ||
+		    !kasumi_has_syscall_hook(__NR_openat)) {
 			unsigned long addr = kasumi_lookup_name(kasumi_vfs_hooks[0].name);
 
 			if (!addr) {
@@ -1479,13 +1483,11 @@ int kasumi_vfs_hooks_init(bool skip_vfs)
 		}
 
 		pr_info("Kasumi: initialized (getattr=iop, readdir=fop, d_path=disabled, getxattr kprobe=disabled, GET_FD via %s)\n",
-			kasumi_tracepoint_path_registered() && kasumi_tracepoint_getfd_registered() ?
-				"sys_enter/sys_exit tracepoint" : "kprobes");
+			kasumi_syscall_dispatcher_nr >= 0 ? "TSR" : "kprobes");
 	} else {
 		pr_alert("Kasumi: skipping VFS hooks (kasumi_skip_vfs=1)\n");
 		pr_info("Kasumi: initialized (VFS hooks skipped, GET_FD via %s)\n",
-			kasumi_tracepoint_path_registered() && kasumi_tracepoint_getfd_registered() ?
-				"sys_enter/sys_exit tracepoint" : "kprobes");
+			kasumi_syscall_dispatcher_nr >= 0 ? "TSR" : "kprobes");
 	}
 #else
 	pr_info("Kasumi: initialized (GET_FD only, VFS kprobes disabled)\n");

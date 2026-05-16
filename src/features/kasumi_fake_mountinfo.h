@@ -64,6 +64,11 @@ ssize_t kasumi_fake_mi_read_iter(struct kiocb *iocb, struct iov_iter *to);
  */
 int kasumi_fake_mi_lookup_mount_id(const char *path);
 
+/* Atomic-context variant for syscall tracepoint/kprobe paths. It only reads
+ * an already prepared cache and never regenerates or takes a sleeping lock.
+ */
+int kasumi_fake_mi_lookup_mount_id_cached(const char *path);
+
 /* Drop per-file cursor state when the file is closed or refreshed. Called
  * lazily from serve() based on LRU; no explicit close hook needed.
  */

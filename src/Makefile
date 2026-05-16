@@ -17,7 +17,6 @@ kasumi_lkm-objs := \
 	hooks/kasumi_proc_hooks.o \
 	hooks/kasumi_proc_read_hooks.o \
 	hooks/kasumi_vfs_hooks.o \
-	hooks/kasumi_tracepoint_hooks.o \
 	hooks/kasumi_syscall_redirect.o \
 	hooks/kasumi_ftrace_hooks.o \
 	features/kasumi_uname.o \
@@ -28,6 +27,8 @@ kasumi_lkm-objs := \
 	features/kasumi_fop_override.o \
 	features/kasumi_fake_mountinfo.o \
 	features/kasumi_fake_selinuxfs_access.o
+
+kasumi_lkm-$(CONFIG_ARM64) += hooks/arm64/kasumi_patch_memory.o
 
 ccflags-y += -gz=none
 ccflags-y += -I$(src)/include

@@ -31,7 +31,6 @@
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_syscall_redirect.h"
-#include "kasumi_tracepoint_hooks.h"
 
 #ifndef KASUMI_VERSION
 #define KASUMI_VERSION "0.1.0-dev"
@@ -39,7 +38,7 @@
 
 static int kasumi_no_tracepoint_param;
 module_param_named(kasumi_no_tracepoint, kasumi_no_tracepoint_param, int, 0600);
-MODULE_PARM_DESC(kasumi_no_tracepoint, "1=skip sys_enter tracepoint, use kprobe. 0=try tracepoint first (default).");
+MODULE_PARM_DESC(kasumi_no_tracepoint, "Deprecated compatibility knob; syscall hooks now patch syscall table entries directly.");
 
 static int kasumi_skip_vfs_param;
 module_param_named(kasumi_skip_vfs, kasumi_skip_vfs_param, int, 0600);
@@ -51,7 +50,7 @@ MODULE_PARM_DESC(kasumi_skip_extra_kprobes, "1=skip extra kprobes (reboot,prctl,
 
 static int kasumi_skip_getfd_param;
 module_param_named(kasumi_skip_getfd, kasumi_skip_getfd_param, int, 0600);
-MODULE_PARM_DESC(kasumi_skip_getfd, "1=skip GET_FD kprobe/tracepoint. For debugging crash.");
+MODULE_PARM_DESC(kasumi_skip_getfd, "1=skip GET_FD kprobe fallback. For debugging crash.");
 
 static int kasumi_skip_kallsyms_param;
 module_param_named(kasumi_skip_kallsyms, kasumi_skip_kallsyms_param, int, 0600);
@@ -129,6 +128,16 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_strncpy_from_user_nofault = (void *)kasumi_lookup_name("strncpy_from_user_nofault");
 	if (!kasumi_strncpy_from_user_nofault)
 		pr_warn("Kasumi: strncpy_from_user_nofault not found, falling back to copy_from_user\n");
+	kasumi_copy_from_user_nofault = (void *)kasumi_lookup_name("copy_from_user_nofault");
+	kasumi_copy_to_user_nofault = (void *)kasumi_lookup_name("copy_to_user_nofault");
+	if (!kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault)
+		pr_warn("Kasumi: user nofault copy helpers not found, statx mount-id spoof disabled\n");
+	kasumi_call_srcu_ptr = (void *)kasumi_lookup_name("call_srcu");
+	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_name("srcu_barrier");
+	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
+		pr_err("Kasumi: FATAL - call_srcu/srcu_barrier not found\n");
+		return -ENOENT;
+	}
 	kasumi_d_path = (void *)kasumi_lookup_name("d_path");
 	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_name("d_hash_and_lookup");
 	kasumi_path_put_ptr = (void *)kasumi_lookup_name("path_put");
@@ -275,21 +284,17 @@ void kasumi_bootstrap_exit(void)
 	/*
 	 * PHASE 1: Sever every entry point that can drive a syscall hook.
 	 *
-	 *  1. tracepoint_path_exit() unregisters sys_enter/sys_exit and calls
-	 *     tracepoint_synchronize_unregister(), so no new syscall will have
-	 *     its syscallno rewritten to the dispatcher slot.
-	 *  2. syscall_redirect_exit() restores the patched ni_syscall slot and
-	 *     waits via synchronize_srcu() for in-flight dispatcher invocations
-	 *     and their handlers to drain.
+	 *  1. syscall_redirect_exit() restores every patched sys_call_table
+	 *     entry and waits via SRCU for in-flight syscall-table wrappers and
+	 *     their handlers to drain.
 	 *
 	 * Ordering matters: relative to KSU's manager_exit, this is the
-	 * tracepoint -> syscall_table -> hooks teardown.  Any cleanup that frees
+	 * syscall_table -> hooks teardown.  Any cleanup that frees
 	 * resources reachable from h_openat/h_statfs/etc. (proc fd proxies,
 	 * fake mountinfo, fop/iop shadows, vfs ftrace hooks) MUST run after
 	 * this phase, otherwise a high-frequency syscall (e.g. read) will UAF
 	 * those resources mid-teardown.
 	 */
-	kasumi_tracepoint_path_exit();
 	kasumi_syscall_redirect_exit();
 
 	/* PHASE 2: handlers can no longer be reached, free their dependencies. */

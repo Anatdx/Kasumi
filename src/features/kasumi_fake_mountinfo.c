@@ -23,11 +23,13 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/atomic.h>
+#include <linux/rcupdate.h>
 
 /* Cache sizing: mountinfo is typically 20-80KB on Android; cap at 512KB. */
 #define FAKE_MI_BUF_MAX    (512 * 1024)
 #define FAKE_MI_SCRATCH    (512 * 1024)
 #define FAKE_MI_TTL_MS     500
+#define FAKE_MI_BUF_SLOTS  2
 
 /* Per-file cursor table for stateful chunked reads. Size chosen to cover
  * concurrent marked-app open()s; simple linear scan with LRU eviction.
@@ -36,8 +38,11 @@
 #define FAKE_MI_CURSOR_TTL_SEC  30
 
 struct fake_mi_cache {
-    char *buf;
-    size_t len;
+    struct {
+        char *buf;
+        size_t len;
+    } slots[FAKE_MI_BUF_SLOTS];
+    int active_slot;
     unsigned long last_jiffies;
     bool valid;
     struct mutex lock;
@@ -52,8 +57,7 @@ struct fake_mi_cursor {
 };
 
 static struct fake_mi_cache g_cache = {
-    .buf = NULL,
-    .len = 0,
+    .active_slot = 0,
     .valid = false,
 };
 
@@ -68,6 +72,17 @@ static atomic_t fake_mi_reader_pid = ATOMIC_INIT(0);
 static struct file *(*ptr_filp_open)(const char *, int, umode_t);
 static int (*ptr_filp_close)(struct file *, fl_owner_t);
 static ssize_t (*ptr_kernel_read)(struct file *, void *, size_t, loff_t *);
+
+static char *fake_mi_active_buf_locked(size_t *len)
+{
+    int slot = READ_ONCE(g_cache.active_slot);
+
+    if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
+        return NULL;
+    if (len)
+        *len = g_cache.slots[slot].len;
+    return g_cache.slots[slot].buf;
+}
 
 bool kasumi_fake_mi_is_internal_read(void)
 {
@@ -458,15 +473,27 @@ static int regenerate_cache_locked(void)
 {
     struct file *f;
     char *scratch = NULL;
-    char *new_buf = NULL;
+    char *new_buf;
     size_t total = 0;
     size_t new_len = 0;
     loff_t pos = 0;
     ssize_t r;
+    int new_slot;
     int ret = -EIO;
 
     if (!ptr_filp_open || !ptr_kernel_read || !ptr_filp_close)
         return -ENOSYS;
+
+    new_slot = READ_ONCE(g_cache.active_slot) ^ 1;
+    if (new_slot < 0 || new_slot >= FAKE_MI_BUF_SLOTS ||
+        !g_cache.slots[new_slot].buf)
+        return -ENOMEM;
+    new_buf = g_cache.slots[new_slot].buf;
+
+    /* The inactive slot may have been the previous active cache. Wait for
+     * atomic readers to leave before reusing its storage.
+     */
+    synchronize_rcu();
 
     atomic_set(&fake_mi_reader_pid, task_pid_nr(current));
     f = ptr_filp_open("/proc/self/mountinfo", O_RDONLY, 0);
@@ -498,24 +525,16 @@ static int regenerate_cache_locked(void)
         total += r;
     }
 
-    new_buf = vmalloc(FAKE_MI_BUF_MAX);
-    if (!new_buf) {
-        ret = -ENOMEM;
-        goto out_free;
-    }
-
     ret = build_fake_buffer(scratch, total, new_buf, FAKE_MI_BUF_MAX, &new_len);
     if (ret != 0)
         goto out_free;
 
-    if (g_cache.buf)
-        vfree(g_cache.buf);
-    g_cache.buf = new_buf;
-    g_cache.len = new_len;
-    g_cache.last_jiffies = jiffies;
-    g_cache.valid = true;
+    g_cache.slots[new_slot].len = new_len;
+    smp_wmb();
+    WRITE_ONCE(g_cache.active_slot, new_slot);
+    WRITE_ONCE(g_cache.last_jiffies, jiffies);
+    WRITE_ONCE(g_cache.valid, true);
     g_cache_gen++;
-    new_buf = NULL;
     ret = 0;
     kasumi_log("fake_mi: regenerated pid=%d comm=%s raw_len=%zu fake_len=%zu gen=%llu\n",
              task_pid_nr(current), current->comm, total, new_len,
@@ -523,7 +542,6 @@ static int regenerate_cache_locked(void)
 
 out_free:
     if (scratch) vfree(scratch);
-    if (new_buf) vfree(new_buf);
 out_close:
     ptr_filp_close(f, NULL);
     atomic_set(&fake_mi_reader_pid, 0);
@@ -633,6 +651,8 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
     unsigned long flags;
     u64 gen;
     bool use_explicit_pos = explicit_pos >= 0;
+    char *cache_buf;
+    size_t cache_len;
 
     if (!file || !userbuf)
         return 0;
@@ -640,7 +660,8 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
     (void)kasumi_fake_mi_prepare(false);
 
     mutex_lock(&g_cache.lock);
-    if (!g_cache.valid || !g_cache.buf) {
+    cache_buf = fake_mi_active_buf_locked(&cache_len);
+    if (!g_cache.valid || !cache_buf) {
         mutex_unlock(&g_cache.lock);
         return 0;
     }
@@ -656,7 +677,7 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
         spin_unlock_irqrestore(&g_cursors_lock, flags);
     }
 
-    if (pos >= g_cache.len) {
+    if (pos >= cache_len) {
         /* EOF: report 0 bytes, user loop exits. */
         mutex_unlock(&g_cache.lock);
         /* Also clear cursor so a subsequent lseek-to-0 would start fresh;
@@ -665,10 +686,10 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
         return -1;  /* caller interprets: override ret to 0 */
     }
 
-    avail = g_cache.len - pos;
+    avail = cache_len - pos;
     to_copy = count < avail ? count : avail;
 
-    if (copy_to_user(userbuf, g_cache.buf + pos, to_copy)) {
+    if (copy_to_user(userbuf, cache_buf + pos, to_copy)) {
         mutex_unlock(&g_cache.lock);
         return 0;
     }
@@ -696,6 +717,8 @@ ssize_t kasumi_fake_mi_read_iter(struct kiocb *iocb, struct iov_iter *to)
     size_t to_copy;
     size_t copied;
     loff_t pos;
+    char *cache_buf;
+    size_t cache_len;
 
     if (!iocb || !to)
         return -EINVAL;
@@ -706,20 +729,21 @@ ssize_t kasumi_fake_mi_read_iter(struct kiocb *iocb, struct iov_iter *to)
     (void)kasumi_fake_mi_prepare(false);
 
     mutex_lock(&g_cache.lock);
-    if (!g_cache.valid || !g_cache.buf) {
+    cache_buf = fake_mi_active_buf_locked(&cache_len);
+    if (!g_cache.valid || !cache_buf) {
         mutex_unlock(&g_cache.lock);
         return -EAGAIN;
     }
 
     pos = iocb->ki_pos;
-    if (pos < 0 || (size_t)pos >= g_cache.len) {
+    if (pos < 0 || (size_t)pos >= cache_len) {
         mutex_unlock(&g_cache.lock);
         return 0;
     }
 
-    avail = g_cache.len - (size_t)pos;
+    avail = cache_len - (size_t)pos;
     to_copy = min_t(size_t, iov_iter_count(to), avail);
-    copied = copy_to_iter(g_cache.buf + pos, to_copy, to);
+    copied = copy_to_iter(cache_buf + pos, to_copy, to);
     mutex_unlock(&g_cache.lock);
 
     if (copied == 0)
@@ -734,6 +758,8 @@ int kasumi_fake_mi_lookup_mount_id(const char *path)
     size_t path_len;
     size_t in = 0;
     int ret = -ENOENT;
+    char *cache_buf;
+    size_t cache_len;
 
     if (!path || !path[0])
         return -EINVAL;
@@ -742,34 +768,95 @@ int kasumi_fake_mi_lookup_mount_id(const char *path)
     (void)kasumi_fake_mi_prepare(false);
 
     mutex_lock(&g_cache.lock);
-    if (!g_cache.valid || !g_cache.buf) {
+    cache_buf = fake_mi_active_buf_locked(&cache_len);
+    if (!g_cache.valid || !cache_buf) {
         ret = -EAGAIN;
         goto out_unlock;
     }
 
-    while (in < g_cache.len) {
+    while (in < cache_len) {
         size_t ls = in;
         int mi;
         size_t target_start;
         size_t target_end;
         size_t line_len;
 
-        while (in < g_cache.len && g_cache.buf[in] != '\n')
+        while (in < cache_len && cache_buf[in] != '\n')
             in++;
         line_len = in - ls;
-        if (parse_line_target(g_cache.buf + ls, line_len, &mi,
+        if (parse_line_target(cache_buf + ls, line_len, &mi,
                               &target_start, &target_end) &&
             target_end - target_start == path_len &&
-            memcmp(g_cache.buf + ls + target_start, path, path_len) == 0) {
+            memcmp(cache_buf + ls + target_start, path, path_len) == 0) {
             ret = mi;
             goto out_unlock;
         }
-        if (in < g_cache.len)
+        if (in < cache_len)
             in++;
     }
 
 out_unlock:
     mutex_unlock(&g_cache.lock);
+    return ret;
+}
+
+int kasumi_fake_mi_lookup_mount_id_cached(const char *path)
+{
+    size_t path_len;
+    size_t in = 0;
+    int ret = -ENOENT;
+    int slot;
+    char *cache_buf;
+    size_t cache_len;
+
+    if (!path || !path[0])
+        return -EINVAL;
+
+    path_len = strlen(path);
+
+    rcu_read_lock();
+    if (!READ_ONCE(g_cache.valid)) {
+        ret = -EAGAIN;
+        goto out_unlock;
+    }
+
+    slot = READ_ONCE(g_cache.active_slot);
+    if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS) {
+        ret = -EAGAIN;
+        goto out_unlock;
+    }
+
+    smp_rmb();
+    cache_buf = READ_ONCE(g_cache.slots[slot].buf);
+    cache_len = READ_ONCE(g_cache.slots[slot].len);
+    if (!cache_buf || cache_len == 0) {
+        ret = -EAGAIN;
+        goto out_unlock;
+    }
+
+    while (in < cache_len) {
+        size_t ls = in;
+        int mi;
+        size_t target_start;
+        size_t target_end;
+        size_t line_len;
+
+        while (in < cache_len && cache_buf[in] != '\n')
+            in++;
+        line_len = in - ls;
+        if (parse_line_target(cache_buf + ls, line_len, &mi,
+                              &target_start, &target_end) &&
+            target_end - target_start == path_len &&
+            memcmp(cache_buf + ls + target_start, path, path_len) == 0) {
+            ret = mi;
+            goto out_unlock;
+        }
+        if (in < cache_len)
+            in++;
+    }
+
+out_unlock:
+    rcu_read_unlock();
     return ret;
 }
 
@@ -779,6 +866,8 @@ out_unlock:
 
 int kasumi_fake_mi_init(void)
 {
+    int i;
+
     mutex_init(&g_cache.lock);
     memset(g_cursors, 0, sizeof(g_cursors));
 
@@ -791,18 +880,44 @@ int kasumi_fake_mi_init(void)
                 ptr_filp_open, ptr_filp_close, ptr_kernel_read);
         return -ENOSYS;
     }
+
+    for (i = 0; i < FAKE_MI_BUF_SLOTS; i++) {
+        g_cache.slots[i].buf = vmalloc(FAKE_MI_BUF_MAX);
+        if (!g_cache.slots[i].buf)
+            goto out_free_slots;
+        g_cache.slots[i].len = 0;
+    }
+    g_cache.active_slot = 0;
+    g_cache.valid = false;
+
     pr_info("Kasumi fake_mi: initialized (current-view mountinfo)\n");
     return 0;
+
+out_free_slots:
+    while (--i >= 0) {
+        vfree(g_cache.slots[i].buf);
+        g_cache.slots[i].buf = NULL;
+        g_cache.slots[i].len = 0;
+    }
+    return -ENOMEM;
 }
 
 void kasumi_fake_mi_exit(void)
 {
+    int i;
+
     mutex_lock(&g_cache.lock);
-    if (g_cache.buf) {
-        vfree(g_cache.buf);
-        g_cache.buf = NULL;
+    g_cache.valid = false;
+    mutex_unlock(&g_cache.lock);
+
+    synchronize_rcu();
+
+    mutex_lock(&g_cache.lock);
+    for (i = 0; i < FAKE_MI_BUF_SLOTS; i++) {
+        vfree(g_cache.slots[i].buf);
+        g_cache.slots[i].buf = NULL;
+        g_cache.slots[i].len = 0;
     }
-    g_cache.len = 0;
     g_cache.valid = false;
     mutex_unlock(&g_cache.lock);
 }

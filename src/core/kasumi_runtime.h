@@ -16,8 +16,10 @@
 #include <linux/kprobes.h>
 #include <linux/limits.h>
 #include <linux/percpu.h>
+#include <linux/rcupdate.h>
 #include <linux/seq_file.h>
 #include <linux/smp.h>
+#include <linux/srcu.h>
 #include <linux/stat.h>
 #include <linux/vmalloc.h>
 
@@ -161,6 +163,11 @@ extern char *(*kasumi_strndup_user)(const char __user *, long);
 extern struct filename *(*kasumi_getname_kernel)(const char *);
 extern void (*kasumi_ihold)(struct inode *);
 extern long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
+extern long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);
+extern long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t size);
+extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
+				    rcu_callback_t func);
+extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
 
 static inline void kasumi_path_put(const struct path *path)
 {

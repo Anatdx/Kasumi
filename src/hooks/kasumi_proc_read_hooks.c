@@ -42,7 +42,7 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
-#include "kasumi_tracepoint_hooks.h"
+#include "kasumi_syscall_redirect.h"
 #include "kasumi_fake_mountinfo.h"
 
 #ifndef D_REAL_DATA
@@ -374,8 +374,8 @@ static int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
 
 	if (we_own) {
 		/* defer free past current SRCU grace period */
-		call_srcu(&kasumi_proxy_srcu, &proxy->rcu,
-			  kasumi_mount_proxy_rcu_free);
+		kasumi_call_srcu_ptr(&kasumi_proxy_srcu, &proxy->rcu,
+				     kasumi_mount_proxy_rcu_free);
 	}
 	/* drained side: kasumi_mount_proxy_drain() owns the kfree */
 	return ret;
@@ -512,7 +512,7 @@ void kasumi_mount_proxy_drain(void)
 	 * the natural release path before we go. Their function pointer lives
 	 * in module text, so they must run before module unload completes.
 	 */
-	srcu_barrier(&kasumi_proxy_srcu);
+	kasumi_srcu_barrier_ptr(&kasumi_proxy_srcu);
 }
 
 static int kasumi_read_mount_filter_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -1193,7 +1193,7 @@ static struct kretprobe kasumi_krp_seq_read_maps = {
  * OVERLAYFS_SUPER_MAGIC from uapi/linux/magic.h so we use the running kernel's definition.
  *
  * Two routes share the same resolver:
- *   - sys_enter/sys_exit tracepoint dispatcher (preferred when registered)
+ *   - TSR
  *   - kretprobe on __arm64_sys_statfs (legacy fallback)
  */
 
@@ -1404,7 +1404,8 @@ void kasumi_proc_read_hooks_init(void)
 	unsigned long pread_addr = 0;
 	const char *read_sym_name = NULL;
 	const char *pread_sym_name = NULL;
-	bool use_proxy_filter = kasumi_tracepoint_path_registered();
+	bool use_proxy_filter = kasumi_syscall_dispatcher_nr >= 0 &&
+				kasumi_has_syscall_hook(__NR_openat);
 	bool use_syscall_filter = false;
 	int i;
 

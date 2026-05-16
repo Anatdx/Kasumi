@@ -25,8 +25,8 @@ char __user *kasumi_userspace_stack_buffer(const char *data, size_t len);
 
 #if defined(__aarch64__) || defined(__x86_64__)
 /* Resolve whether `fd` currently refers to /proc/cmdline.  Safe to call
- * from any process context (issues fget/fput).  Used both by the legacy
- * tracepoint cmdline-spoof path and the TSR redirect h_read handler. */
+ * from process context (issues fget/fput). Used by the direct read hook
+ * and kretprobe fallback. */
 bool kasumi_fd_is_proc_cmdline(int fd);
 #endif
 

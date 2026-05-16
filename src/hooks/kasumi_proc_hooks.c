@@ -51,7 +51,7 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
-#include "kasumi_tracepoint_hooks.h"
+#include "kasumi_syscall_redirect.h"
 #include "kasumi_uname.h"
 #include "kasumi_fake_mountinfo.h"
 /* override_fd/override_active and cmdline_ctx now in kasumi_percpu_base */
@@ -309,7 +309,7 @@ static struct kprobe kasumi_kp_cmdline = {
 	.pre_handler = kasumi_cmdline_pre,
 };
 
-/* kretprobe fallback for cmdline when tracepoint unavailable */
+/* kretprobe fallback for cmdline when TSR read hook is unavailable */
 static int kasumi_cmdline_read_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	kasumi_handle_sys_enter_cmdline(regs, __NR_read);
@@ -338,18 +338,16 @@ static struct kretprobe kasumi_krp_cmdline_read = {
 
 int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes)
 {
-	if (!skip_getfd && !no_tracepoint)
-		(void)kasumi_tracepoint_path_init();
-	else if (skip_getfd)
-		pr_alert("Kasumi: skipping tracepoint (kasumi_skip_getfd=1)\n");
+	(void)no_tracepoint;
+	if (skip_getfd)
+		pr_alert("Kasumi: skipping GET_FD kprobes (kasumi_skip_getfd=1)\n");
 
 	if (kasumi_syscall_nr_param <= 0) {
 		pr_err("Kasumi: kasumi_syscall_nr must be positive (got %d)\n", kasumi_syscall_nr_param);
 		return -EINVAL;
 	}
 
-	if (!skip_getfd &&
-	    (!kasumi_tracepoint_path_registered() || !kasumi_tracepoint_getfd_registered())) {
+	if (!skip_getfd && kasumi_syscall_dispatcher_nr < 0) {
 		const char *ni_names[] = { "__arm64_sys_ni_syscall", "sys_ni_syscall",
 					   "__x64_sys_ni_syscall", NULL };
 		unsigned long ni_addr = 0;
@@ -382,7 +380,7 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 		pr_alert("Kasumi: skipping GET_FD kprobes (kasumi_skip_getfd=1)\n");
 	}
 
-	if (!skip_extra_kprobes && !kasumi_tracepoint_path_registered()) {
+	if (!skip_extra_kprobes && kasumi_syscall_dispatcher_nr < 0) {
 		static const char *reboot_symbols[] = {
 #if defined(__aarch64__)
 			"__arm64_sys_reboot", "sys_reboot", NULL
@@ -415,7 +413,7 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 		}
 	}
 
-	if (!skip_extra_kprobes && !kasumi_tracepoint_path_registered()) {
+	if (!skip_extra_kprobes && kasumi_syscall_dispatcher_nr < 0) {
 		static const char *prctl_symbols[] = {
 #if defined(__aarch64__)
 			"__arm64_sys_prctl", "sys_prctl", NULL
@@ -449,7 +447,8 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 	if (!skip_extra_kprobes) {
 		int ret;
 
-		if (!kasumi_tracepoint_path_registered() || !kasumi_tracepoint_getfd_registered()) {
+		if (kasumi_syscall_dispatcher_nr < 0 ||
+		    !kasumi_has_syscall_hook(__NR_read)) {
 			const char *read_sym =
 #if defined(__aarch64__)
 				"__arm64_sys_read";
@@ -486,7 +485,7 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 				}
 			}
 		} else {
-			pr_info("Kasumi: cmdline spoofing via tracepoint (sys_enter/sys_exit)\n");
+			pr_info("Kasumi: cmdline spoofing via syscall-table read hook\n");
 		}
 	}
 
@@ -498,12 +497,12 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 void kasumi_proc_hooks_exit(void)
 {
 	/*
-	 * Note: tracepoint sys_enter/sys_exit unregistration is intentionally
-	 * NOT performed here.  kasumi_bootstrap_exit() drives that as PHASE 1
-	 * (before any handler-reachable resource is freed) so that proc-fd
-	 * proxies, fake mountinfo, and other state cleaned up below cannot be
-	 * raced against by a high-frequency syscall (read/openat) still being
-	 * dispatched into our redirect.
+	 * Note: syscall table restoration is intentionally NOT performed here.
+	 * kasumi_bootstrap_exit() drives that as PHASE 1 (before any
+	 * handler-reachable resource is freed) so that proc-fd proxies, fake
+	 * mountinfo, and other state cleaned up below cannot be raced against
+	 * by a high-frequency syscall (read/openat) still being dispatched into
+	 * our redirect.
 	 */
 	kasumi_proc_read_hooks_exit();
 	if (kasumi_cmdline_kretprobe_registered)

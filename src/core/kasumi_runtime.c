@@ -140,6 +140,11 @@ char *(*kasumi_strndup_user)(const char __user *, long);
 struct filename *(*kasumi_getname_kernel)(const char *);
 void (*kasumi_ihold)(struct inode *);
 long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
+long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);
+long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t size);
+void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
+			     rcu_callback_t func);
+void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
 kasumi_ksu_get_allow_list_fn kasumi_ksu_get_allow_list_ptr;
 
 bool kasumi_valid_kernel_addr(unsigned long addr)
