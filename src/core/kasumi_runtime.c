@@ -70,6 +70,12 @@ DEFINE_HASHTABLE(kasumi_paths, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_targets, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_hide_paths, KASUMI_HASH_BITS);
 DEFINE_XARRAY(kasumi_allow_uids_xa);
+DEFINE_XARRAY(kasumi_policy_allow_uids_xa);
+DEFINE_XARRAY(kasumi_policy_deny_uids_xa);
+u32 kasumi_policy_allow_uid_list[KASUMI_ALLOWLIST_UID_MAX];
+u32 kasumi_policy_deny_uid_list[KASUMI_ALLOWLIST_UID_MAX];
+u32 kasumi_policy_allow_uid_count;
+u32 kasumi_policy_deny_uid_count;
 DEFINE_HASHTABLE(kasumi_inject_dirs, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_xattr_sbs, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_merge_dirs, KASUMI_HASH_BITS);
@@ -83,6 +89,7 @@ LIST_HEAD(kasumi_maps_rules);
 DEFINE_MUTEX(kasumi_maps_mutex);
 
 bool kasumi_allowlist_loaded;
+u32 kasumi_policy_flags;
 kasumi_ksu_is_allow_uid_fn kasumi_ksu_is_allow_uid_ptr;
 kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 
@@ -484,6 +491,11 @@ void kasumi_cleanup_locked(void)
 		call_rcu(&hide_entry->rcu, kasumi_hide_entry_free_rcu);
 	}
 	xa_destroy(&kasumi_allow_uids_xa);
+	xa_destroy(&kasumi_policy_allow_uids_xa);
+	xa_destroy(&kasumi_policy_deny_uids_xa);
+	kasumi_policy_allow_uid_count = 0;
+	kasumi_policy_deny_uid_count = 0;
+	kasumi_policy_flags = 0;
 	hash_for_each_safe(kasumi_inject_dirs, bkt, tmp, inject_entry, node) {
 		kasumi_clear_inode_flags_for_path(inject_entry->dir, AS_FLAGS_KASUMI_DIR_HAS_INJECT);
 		hlist_del_rcu(&inject_entry->node);

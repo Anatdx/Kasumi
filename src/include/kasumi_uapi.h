@@ -22,7 +22,7 @@
 
 #define KSM_MAGIC1 0x4B534D31  // "KSM1"
 #define KSM_MAGIC2 0x524F4F54  // "ROOT"
-#define KSM_PROTOCOL_VERSION 16
+#define KSM_PROTOCOL_VERSION 17
 
 #define KSM_MAX_LEN_PATHNAME 256
 #define KSM_FAKE_CMDLINE_SIZE 4096
@@ -76,6 +76,67 @@ struct kasumi_uid_list_arg {
     __u32 count;
     __u32 reserved;
     __aligned_u64 uids;
+};
+
+#define KSM_POLICY_API_VERSION 1
+
+/*
+ * Policy owner controls where Kasumi gets its target app policy from.
+ *
+ * AUTO keeps legacy detection semantics. MAGISK is currently a reported but
+ * unsupported owner; use MANUAL plus explicit policy lists on Magisk systems.
+ */
+#define KSM_POLICY_OWNER_AUTO       0
+#define KSM_POLICY_OWNER_KERNELSU   1
+#define KSM_POLICY_OWNER_APATCH     2
+#define KSM_POLICY_OWNER_MAGISK     3
+#define KSM_POLICY_OWNER_MANUAL     4
+#define KSM_POLICY_OWNER_DISABLED   5
+
+/*
+ * ALLOW means "UID receives Kasumi managed/spoofed view".
+ * DENY means "UID always receives real view" and wins over ALLOW.
+ */
+#define KSM_POLICY_FLAG_USE_ALLOW_UIDS       (1U << 0)
+#define KSM_POLICY_FLAG_USE_DENY_UIDS        (1U << 1)
+#define KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS (1U << 2)
+
+#define KSM_POLICY_UID_LIST_ALLOW 1
+#define KSM_POLICY_UID_LIST_DENY  2
+#define KSM_POLICY_UID_LIST_ALL   3
+
+struct kasumi_policy_config_arg {
+	__u32 version;     /* KSM_POLICY_API_VERSION */
+	__u32 size;        /* sizeof(struct kasumi_policy_config_arg) */
+	__u32 owner;       /* KSM_POLICY_OWNER_* */
+	__u32 flags;       /* KSM_POLICY_FLAG_* */
+	__u32 reserved[4];
+	__s32 err;
+};
+
+struct kasumi_policy_state_arg {
+	__u32 version;      /* KSM_POLICY_API_VERSION */
+	__u32 size;         /* sizeof(struct kasumi_policy_state_arg) */
+	__u32 owner;        /* configured owner */
+	__u32 effective_owner;
+	__u32 flags;
+	__u32 detected_roots;
+	__u32 allow_count;
+	__u32 deny_count;
+	__u32 max_uid_count;
+	__u32 reserved[4];
+	__s32 err;
+};
+
+struct kasumi_policy_uid_list_arg {
+	__u32 version;   /* KSM_POLICY_API_VERSION */
+	__u32 size;      /* sizeof(struct kasumi_policy_uid_list_arg) */
+	__u32 list;      /* KSM_POLICY_UID_LIST_* */
+	__u32 count;     /* input capacity for GET, input count for SET, copied count on return */
+	__u32 total;     /* total entries available after SET/GET */
+	__u32 reserved;
+	__aligned_u64 uids;
+	__s32 err;
 };
 
 /*
@@ -213,5 +274,11 @@ struct kasumi_statfs_spoof_arg {
  */
 #define KSM_IOC_SET_UNAME_GLOBAL  _IOW(KSM_IOC_MAGIC, 28, struct kasumi_spoof_uname)
 #define KSM_IOC_SELINUX_FIX       _IOW(KSM_IOC_MAGIC, 29, int)
+#define KSM_IOC_SET_POLICY        _IOWR(KSM_IOC_MAGIC, 30, struct kasumi_policy_config_arg)
+#define KSM_IOC_SET_POLICY_OWNER  KSM_IOC_SET_POLICY
+#define KSM_IOC_SET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 31, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_CLEAR_POLICY_UIDS _IOWR(KSM_IOC_MAGIC, 32, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_GET_POLICY        _IOWR(KSM_IOC_MAGIC, 33, struct kasumi_policy_state_arg)
+#define KSM_IOC_GET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 34, struct kasumi_policy_uid_list_arg)
 
 #endif /* _KASUMI_UAPI_H */

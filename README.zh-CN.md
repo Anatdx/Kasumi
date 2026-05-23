@@ -13,7 +13,7 @@ English version： [README.md](./README.md)
 - 仓库形态：LKM（不是 in-tree 内核补丁）
 - 主代码目录：`src/`
 - 协议定义：`src/include/kasumi_uapi.h`
-- 当前协议版本：`KSM_PROTOCOL_VERSION = 16`
+- 当前协议版本：`KSM_PROTOCOL_VERSION = 17`
 - Hook 策略：热路径优先使用 syscall-table TSR，必要时配合 fop/iop shadow 与 kprobe/ftrace 回退
 - 已包含 `arch_ftrace_get_regs` 在 6.6+ 的兼容处理
 
@@ -105,6 +105,8 @@ ksud insmod kasumi_lkm.ko
 - `KSM_IOC_SET_UNAME`、`KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`、`KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`、`KSM_IOC_SET_MAPS_SPOOF`、`KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_SET_POLICY`、`KSM_IOC_GET_POLICY`
+- `KSM_IOC_SET_POLICY_UIDS`、`KSM_IOC_GET_POLICY_UIDS`、`KSM_IOC_CLEAR_POLICY_UIDS`
 
 Anatdx 本人维护的 [YukiSU](https://github.com/Anatdx/YukiSU) 提供与 KernelSU 集成的实现（C++），
 以及 Anatdx 参与开发的 [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) 元模块也加入了 Kasumi 支持与用户态实现（Rust）。

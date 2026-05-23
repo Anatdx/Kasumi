@@ -16,6 +16,9 @@ struct kasumi_entry;
 
 bool kasumi_is_privileged_process(void);
 bool kasumi_reload_ksu_allowlist(void);
+int kasumi_set_policy_owner(u32 owner, u32 flags);
+int kasumi_replace_policy_uid_list(u32 list, const u32 *uids, u32 count);
+int kasumi_clear_policy_uid_list(u32 list);
 bool kasumi_current_is_selinux_guard_target(void);
 char *kasumi_resolve_target(const char *pathname);
 char *kasumi_resolve_target_slow(const char *pathname);

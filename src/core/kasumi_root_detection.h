@@ -30,6 +30,7 @@ struct kasumi_ap_su_profile {
 
 extern int kasumi_root_mask;
 extern int kasumi_ksu_dispatcher_nr;
+extern int kasumi_policy_owner_override;
 extern bool kasumi_root_spoof_allowed;
 extern const char *(*kasumi_ap_su_get_path)(void);
 extern int (*kasumi_ap_is_su_allow_uid)(uid_t uid);

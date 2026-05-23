@@ -76,6 +76,7 @@ struct kasumi_kp_vmap_node {
 
 int kasumi_root_mask;
 int kasumi_ksu_dispatcher_nr = -1;
+int kasumi_policy_owner_override = KSM_POLICY_OWNER_AUTO;
 bool kasumi_root_spoof_allowed;
 const char *(*kasumi_ap_su_get_path)(void);
 int (*kasumi_ap_is_su_allow_uid)(uid_t uid);
@@ -573,5 +574,19 @@ void kasumi_root_detect(void)
 
 bool kasumi_root_allows_spoofing(void)
 {
+	switch (READ_ONCE(kasumi_policy_owner_override)) {
+	case KSM_POLICY_OWNER_DISABLED:
+		return false;
+	case KSM_POLICY_OWNER_KERNELSU:
+	case KSM_POLICY_OWNER_APATCH:
+	case KSM_POLICY_OWNER_MANUAL:
+		return true;
+	case KSM_POLICY_OWNER_MAGISK:
+		return false;
+	case KSM_POLICY_OWNER_AUTO:
+	default:
+		break;
+	}
+
 	return READ_ONCE(kasumi_root_spoof_allowed);
 }

@@ -51,6 +51,12 @@ extern struct hlist_head kasumi_paths[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_targets[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_hide_paths[1 << KASUMI_HASH_BITS];
 extern struct xarray kasumi_allow_uids_xa;
+extern struct xarray kasumi_policy_allow_uids_xa;
+extern struct xarray kasumi_policy_deny_uids_xa;
+extern u32 kasumi_policy_allow_uid_list[KASUMI_ALLOWLIST_UID_MAX];
+extern u32 kasumi_policy_deny_uid_list[KASUMI_ALLOWLIST_UID_MAX];
+extern u32 kasumi_policy_allow_uid_count;
+extern u32 kasumi_policy_deny_uid_count;
 extern struct hlist_head kasumi_inject_dirs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_xattr_sbs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_merge_dirs[1 << KASUMI_HASH_BITS];
@@ -62,6 +68,7 @@ extern struct mutex kasumi_config_mutex;
 extern struct mutex kasumi_maps_mutex;
 
 extern bool kasumi_allowlist_loaded;
+extern u32 kasumi_policy_flags;
 extern unsigned long kasumi_path_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 extern unsigned long kasumi_hide_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 

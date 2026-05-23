@@ -48,6 +48,7 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_root_detection.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
 #include "kasumi_syscall_redirect.h"
@@ -62,6 +63,210 @@
  * Part 15: Dispatch Handler (ioctl only; all commands use KSM_IOC_* from kasumi_uapi.h)
  * GET_FD is syscall-only -> kasumi_get_anon_fd()
  * ====================================================================== */
+
+static u32 kasumi_ioctl_effective_policy_owner(void)
+{
+	u32 owner = READ_ONCE(kasumi_policy_owner_override);
+	int roots = READ_ONCE(kasumi_root_mask);
+
+	if (owner != KSM_POLICY_OWNER_AUTO)
+		return owner;
+	if (roots & KASUMI_ROOT_KSU)
+		return KSM_POLICY_OWNER_KERNELSU;
+	if (roots & KASUMI_ROOT_APATCH)
+		return KSM_POLICY_OWNER_APATCH;
+	if (roots & KASUMI_ROOT_MAGISK)
+		return KSM_POLICY_OWNER_MAGISK;
+	return KSM_POLICY_OWNER_AUTO;
+}
+
+static bool kasumi_policy_arg_header_valid(u32 version, u32 size, size_t min_size)
+{
+	if (version != KSM_POLICY_API_VERSION)
+		return false;
+	if (size < min_size)
+		return false;
+	return true;
+}
+
+static int kasumi_ioctl_set_policy(void __user *arg)
+{
+	struct kasumi_policy_config_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_arg_header_valid(a.version, a.size, sizeof(a)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_set_policy_owner(a.owner, a.flags);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy(void __user *arg)
+{
+	struct kasumi_policy_state_arg a;
+	int ret = 0;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_arg_header_valid(a.version, a.size, sizeof(a)))
+		ret = -EINVAL;
+	else {
+		a.owner = READ_ONCE(kasumi_policy_owner_override);
+		a.effective_owner = kasumi_ioctl_effective_policy_owner();
+		a.flags = READ_ONCE(kasumi_policy_flags);
+		a.detected_roots = READ_ONCE(kasumi_root_mask);
+		a.allow_count = READ_ONCE(kasumi_policy_allow_uid_count);
+		a.deny_count = READ_ONCE(kasumi_policy_deny_uid_count);
+		a.max_uid_count = KASUMI_ALLOWLIST_UID_MAX;
+	}
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_set_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	u32 *uids = NULL;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_arg_header_valid(a.version, a.size, sizeof(a))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if (a.count) {
+		if (!a.uids) {
+			ret = -EINVAL;
+			goto out;
+		}
+		uids = kmalloc_array(a.count, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(uids, (const void __user *)(unsigned long)a.uids,
+				   a.count * sizeof(*uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = kasumi_replace_policy_uid_list(a.list, uids, a.count);
+	if (!ret)
+		a.total = a.list == KSM_POLICY_UID_LIST_ALLOW ?
+			  READ_ONCE(kasumi_policy_allow_uid_count) :
+			  READ_ONCE(kasumi_policy_deny_uid_count);
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		ret = -EFAULT;
+	kfree(uids);
+	return ret;
+}
+
+static int kasumi_ioctl_clear_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_arg_header_valid(a.version, a.size, sizeof(a)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_clear_policy_uid_list(a.list);
+	a.count = 0;
+	a.total = 0;
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	u32 *snapshot;
+	u32 *uids = NULL;
+	u32 capacity;
+	u32 copied = 0;
+	u32 total = 0;
+	int ret = 0;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_arg_header_valid(a.version, a.size, sizeof(a))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	switch (a.list) {
+	case KSM_POLICY_UID_LIST_ALLOW:
+		snapshot = kasumi_policy_allow_uid_list;
+		total = READ_ONCE(kasumi_policy_allow_uid_count);
+		break;
+	case KSM_POLICY_UID_LIST_DENY:
+		snapshot = kasumi_policy_deny_uid_list;
+		total = READ_ONCE(kasumi_policy_deny_uid_count);
+		break;
+	default:
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.count && !a.uids) {
+		ret = -EINVAL;
+		goto out;
+	}
+	capacity = min_t(u32, a.count, total);
+	if (capacity) {
+		uids = kmalloc_array(capacity, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	if (capacity) {
+		mutex_lock(&kasumi_config_mutex);
+		total = a.list == KSM_POLICY_UID_LIST_ALLOW ?
+			kasumi_policy_allow_uid_count :
+			kasumi_policy_deny_uid_count;
+		copied = min_t(u32, capacity, total);
+		memcpy(uids, snapshot, copied * sizeof(*uids));
+		mutex_unlock(&kasumi_config_mutex);
+	}
+	if (copied &&
+	    copy_to_user((void __user *)(unsigned long)a.uids, uids,
+			 copied * sizeof(*uids)))
+		ret = -EFAULT;
+
+out:
+	a.count = copied;
+	a.total = total;
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	kfree(uids);
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
 
 static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 {
@@ -124,6 +329,21 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			kasumi_reload_ksu_allowlist();
 		return 0;
 	}
+
+	if (cmd == KSM_IOC_SET_POLICY)
+		return kasumi_ioctl_set_policy(arg);
+
+	if (cmd == KSM_IOC_GET_POLICY)
+		return kasumi_ioctl_get_policy(arg);
+
+	if (cmd == KSM_IOC_SET_POLICY_UIDS)
+		return kasumi_ioctl_set_policy_uids(arg);
+
+	if (cmd == KSM_IOC_CLEAR_POLICY_UIDS)
+		return kasumi_ioctl_clear_policy_uids(arg);
+
+	if (cmd == KSM_IOC_GET_POLICY_UIDS)
+		return kasumi_ioctl_get_policy_uids(arg);
 
 	if (cmd == KSM_IOC_REORDER_MNT_ID) {
 		/* struct mnt_namespace/mount not exposed to LKM; only KPM (built-in) supports this */
@@ -207,6 +427,11 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				written += scnprintf(kbuf + written, buf_size - written,
 						     "stealth enabled\n");
 		}
+		if (written < buf_size)
+			written += scnprintf(kbuf + written, buf_size - written,
+					     "policy owner override: %d flags=0x%x\n",
+					     READ_ONCE(kasumi_policy_owner_override),
+					     READ_ONCE(kasumi_policy_flags));
 		rcu_read_unlock();
 
 		if (copy_to_user(list_arg.buf, kbuf, written)) {
@@ -1326,6 +1551,11 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_SET_MAPS_SPOOF:
 	case KSM_IOC_SET_STATFS_SPOOF:
 	case KSM_IOC_SELINUX_FIX:
+	case KSM_IOC_SET_POLICY_OWNER:
+	case KSM_IOC_SET_POLICY_UIDS:
+	case KSM_IOC_CLEAR_POLICY_UIDS:
+	case KSM_IOC_GET_POLICY:
+	case KSM_IOC_GET_POLICY_UIDS:
 	case KSM_IOC_ADD_SPOOF_KSTAT:
 	case KSM_IOC_UPDATE_SPOOF_KSTAT:
 		ret = kasumi_dispatch_cmd(cmd, (void __user *)arg);

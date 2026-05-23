@@ -13,7 +13,7 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - Repository type: LKM (not an in-tree kernel patch set)
 - Main code: `src/`
 - Control protocol: `src/include/kasumi_uapi.h`
-- Current protocol version: `KSM_PROTOCOL_VERSION = 16`
+- Current protocol version: `KSM_PROTOCOL_VERSION = 17`
 - Hook strategy: syscall-table TSR for the hot path, with fop/iop shadows and kprobe/ftrace fallbacks where needed
 - 6.6+ compatibility for `arch_ftrace_get_regs` is included in current code
 
@@ -107,6 +107,8 @@ Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
 - `KSM_IOC_SET_UNAME`, `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_SET_POLICY`, `KSM_IOC_GET_POLICY`
+- `KSM_IOC_SET_POLICY_UIDS`, `KSM_IOC_GET_POLICY_UIDS`, `KSM_IOC_CLEAR_POLICY_UIDS`
 
 You can use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
 In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) meta-module includes Kasumi support with a Rust userspace implementation.

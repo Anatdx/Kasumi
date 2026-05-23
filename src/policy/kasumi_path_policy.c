@@ -81,6 +81,16 @@ static bool kasumi_uid_in_allowlist(uid_t uid)
 	return p != NULL;
 }
 
+static bool kasumi_uid_in_xarray(struct xarray *xa, uid_t uid)
+{
+	void *p;
+
+	rcu_read_lock();
+	p = xa_load(xa, uid);
+	rcu_read_unlock();
+	return p != NULL;
+}
+
 static void kasumi_clear_allowlist_cache(void)
 {
 	WRITE_ONCE(kasumi_allowlist_loaded, false);
@@ -120,6 +130,35 @@ static bool kasumi_current_is_app_zygote(void)
 		      suffix, suffix_len) == 0;
 }
 
+static bool kasumi_policy_lists_configured(void)
+{
+	u32 flags = READ_ONCE(kasumi_policy_flags);
+
+	return flags & (KSM_POLICY_FLAG_USE_ALLOW_UIDS |
+			KSM_POLICY_FLAG_USE_DENY_UIDS);
+}
+
+static bool kasumi_policy_uid_filter_allows(uid_t uid, bool include_isolated)
+{
+	u32 flags = READ_ONCE(kasumi_policy_flags);
+
+	if ((flags & KSM_POLICY_FLAG_USE_DENY_UIDS) &&
+	    kasumi_uid_in_xarray(&kasumi_policy_deny_uids_xa, uid))
+		return false;
+
+	if (flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS) {
+		if (kasumi_uid_in_xarray(&kasumi_policy_allow_uids_xa, uid))
+			return true;
+		if (include_isolated &&
+		    (flags & KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS) &&
+		    kasumi_uid_is_isolated(uid))
+			return true;
+		return false;
+	}
+
+	return true;
+}
+
 static KASUMI_NOCFI bool kasumi_apatch_should_apply_hide(uid_t uid)
 {
 	if (kasumi_uid_is_isolated(uid))
@@ -133,14 +172,28 @@ static KASUMI_NOCFI bool kasumi_apatch_should_apply_hide(uid_t uid)
 KASUMI_NOCFI bool kasumi_should_apply_hide_rules(void)
 {
 	uid_t uid = __kuid_val(current_uid());
+	int owner;
 
 	/* uid 0 (root) never sees spoofed view */
 	if (unlikely(uid == 0))
 		return false;
 	if (!kasumi_root_allows_spoofing())
 		return false;
+	if (!kasumi_policy_uid_filter_allows(uid, true))
+		return false;
 
-	if (kasumi_root_mask & KASUMI_ROOT_APATCH)
+	owner = READ_ONCE(kasumi_policy_owner_override);
+	if (owner == KSM_POLICY_OWNER_DISABLED)
+		return false;
+	if (owner == KSM_POLICY_OWNER_MAGISK)
+		return false;
+	if (owner != KSM_POLICY_OWNER_AUTO && kasumi_policy_lists_configured())
+		return true;
+	if (owner == KSM_POLICY_OWNER_MANUAL)
+		return false;
+
+	if (owner == KSM_POLICY_OWNER_APATCH ||
+	    (owner == KSM_POLICY_OWNER_AUTO && (kasumi_root_mask & KASUMI_ROOT_APATCH)))
 		return kasumi_apatch_should_apply_hide(uid);
 
 	/*
@@ -167,13 +220,28 @@ KASUMI_NOCFI bool kasumi_should_apply_hide_rules(void)
 
 static KASUMI_NOCFI bool kasumi_uid_should_umount_strict(uid_t uid)
 {
+	int owner;
+
 	/* uid 0 (root) never sees spoofed view */
 	if (unlikely(uid == 0))
 		return false;
 	if (!kasumi_root_allows_spoofing())
 		return false;
+	if (!kasumi_policy_uid_filter_allows(uid, false))
+		return false;
 
-	if (kasumi_root_mask & KASUMI_ROOT_APATCH) {
+	owner = READ_ONCE(kasumi_policy_owner_override);
+	if (owner == KSM_POLICY_OWNER_DISABLED)
+		return false;
+	if (owner == KSM_POLICY_OWNER_MAGISK)
+		return false;
+	if (owner != KSM_POLICY_OWNER_AUTO && kasumi_policy_lists_configured())
+		return true;
+	if (owner == KSM_POLICY_OWNER_MANUAL)
+		return false;
+
+	if (owner == KSM_POLICY_OWNER_APATCH ||
+	    (owner == KSM_POLICY_OWNER_AUTO && (kasumi_root_mask & KASUMI_ROOT_APATCH))) {
 		if (!kasumi_ap_get_mod_exclude)
 			return false;
 		return kasumi_ap_get_mod_exclude(uid) != 0;
@@ -193,9 +261,9 @@ bool kasumi_current_is_selinux_guard_target(void)
 
 	/*
 	 * SELinux Guard is narrower than normal hide/spoof policy. Only the
-	 * hidden app's app-zygote process receives fake SELinux answers; su/ksu,
-	 * root managers, shells, and daemons must observe the real policy even if
-	 * other hide rules would apply to their UID bucket.
+	 * hidden app's app-zygote process receives fake SELinux answers; su/ksu/
+	 * magisk domains, root managers, shells, and daemons must observe the real
+	 * policy even if other hide rules would apply to their UID bucket.
 	 */
 	return kasumi_current_is_app_zygote() &&
 	       kasumi_uid_should_umount_strict(uid);
@@ -204,6 +272,140 @@ bool kasumi_current_is_selinux_guard_target(void)
 static void kasumi_add_allow_uid(uid_t uid)
 {
 	xa_store(&kasumi_allow_uids_xa, uid, KASUMI_UID_ALLOW_MARKER, GFP_KERNEL);
+}
+
+static int kasumi_policy_owner_valid(u32 owner)
+{
+	switch (owner) {
+	case KSM_POLICY_OWNER_AUTO:
+	case KSM_POLICY_OWNER_KERNELSU:
+	case KSM_POLICY_OWNER_APATCH:
+	case KSM_POLICY_OWNER_MAGISK:
+	case KSM_POLICY_OWNER_MANUAL:
+	case KSM_POLICY_OWNER_DISABLED:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+int kasumi_set_policy_owner(u32 owner, u32 flags)
+{
+	int ret;
+
+	ret = kasumi_policy_owner_valid(owner);
+	if (ret)
+		return ret;
+	if (flags & ~(KSM_POLICY_FLAG_USE_ALLOW_UIDS |
+		      KSM_POLICY_FLAG_USE_DENY_UIDS |
+		      KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS))
+		return -EINVAL;
+
+	mutex_lock(&kasumi_config_mutex);
+	WRITE_ONCE(kasumi_policy_owner_override, (int)owner);
+	WRITE_ONCE(kasumi_policy_flags,
+		   (READ_ONCE(kasumi_policy_flags) &
+		    ~(KSM_POLICY_FLAG_USE_ALLOW_UIDS |
+		      KSM_POLICY_FLAG_USE_DENY_UIDS |
+		      KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS)) | flags);
+	mutex_unlock(&kasumi_config_mutex);
+	return 0;
+}
+
+static int kasumi_policy_store_uid_list(struct xarray *xa, u32 *snapshot,
+					u32 *snapshot_count, const u32 *uids,
+					u32 count)
+{
+	u32 i;
+	int ret = 0;
+
+	xa_destroy(xa);
+	*snapshot_count = 0;
+	for (i = 0; i < count; i++) {
+		if (!uids[i])
+			continue;
+		if (xa_load(xa, (uid_t)uids[i]))
+			continue;
+		ret = xa_err(xa_store(xa, (uid_t)uids[i],
+				      KASUMI_UID_ALLOW_MARKER, GFP_KERNEL));
+		if (ret)
+			break;
+		snapshot[*snapshot_count] = uids[i];
+		(*snapshot_count)++;
+	}
+	if (ret) {
+		xa_destroy(xa);
+		*snapshot_count = 0;
+	}
+	return ret;
+}
+
+int kasumi_replace_policy_uid_list(u32 list, const u32 *uids, u32 count)
+{
+	struct xarray *xa;
+	u32 *snapshot;
+	u32 *snapshot_count;
+	u32 flag;
+	int ret;
+
+	if (!uids && count)
+		return -EINVAL;
+	if (count > KASUMI_ALLOWLIST_UID_MAX)
+		return -E2BIG;
+
+	switch (list) {
+	case KSM_POLICY_UID_LIST_ALLOW:
+		xa = &kasumi_policy_allow_uids_xa;
+		snapshot = kasumi_policy_allow_uid_list;
+		snapshot_count = &kasumi_policy_allow_uid_count;
+		flag = KSM_POLICY_FLAG_USE_ALLOW_UIDS;
+		break;
+	case KSM_POLICY_UID_LIST_DENY:
+		xa = &kasumi_policy_deny_uids_xa;
+		snapshot = kasumi_policy_deny_uid_list;
+		snapshot_count = &kasumi_policy_deny_uid_count;
+		flag = KSM_POLICY_FLAG_USE_DENY_UIDS;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	mutex_lock(&kasumi_config_mutex);
+	synchronize_rcu();
+	ret = kasumi_policy_store_uid_list(xa, snapshot, snapshot_count, uids, count);
+	if (!ret)
+		WRITE_ONCE(kasumi_policy_flags,
+			   READ_ONCE(kasumi_policy_flags) | flag);
+	mutex_unlock(&kasumi_config_mutex);
+	return ret;
+}
+
+int kasumi_clear_policy_uid_list(u32 list)
+{
+	u32 flags;
+
+	mutex_lock(&kasumi_config_mutex);
+	synchronize_rcu();
+	flags = READ_ONCE(kasumi_policy_flags);
+	if (list == KSM_POLICY_UID_LIST_ALLOW || list == KSM_POLICY_UID_LIST_ALL) {
+		xa_destroy(&kasumi_policy_allow_uids_xa);
+		kasumi_policy_allow_uid_count = 0;
+		flags &= ~KSM_POLICY_FLAG_USE_ALLOW_UIDS;
+	}
+	if (list == KSM_POLICY_UID_LIST_DENY || list == KSM_POLICY_UID_LIST_ALL) {
+		xa_destroy(&kasumi_policy_deny_uids_xa);
+		kasumi_policy_deny_uid_count = 0;
+		flags &= ~KSM_POLICY_FLAG_USE_DENY_UIDS;
+	}
+	if (list != KSM_POLICY_UID_LIST_ALLOW &&
+	    list != KSM_POLICY_UID_LIST_DENY &&
+	    list != KSM_POLICY_UID_LIST_ALL) {
+		mutex_unlock(&kasumi_config_mutex);
+		return -EINVAL;
+	}
+	WRITE_ONCE(kasumi_policy_flags, flags);
+	mutex_unlock(&kasumi_config_mutex);
+	return 0;
 }
 
 /*
