@@ -141,10 +141,17 @@ bool kasumi_path_is_proc_mountinfo(const char *path)
 	       strstr(path, "/mountinfo");
 }
 
+static bool kasumi_path_is_proc_maps_view(const char *path)
+{
+	return path && strncmp(path, "/proc/", 6) == 0 &&
+	       (strstr(path, "/maps") || strstr(path, "/smaps"));
+}
+
 enum kasumi_proc_proxy_kind {
 	KASUMI_PROC_PROXY_NONE = 0,
 	KASUMI_PROC_PROXY_MOUNTINFO,
 	KASUMI_PROC_PROXY_MOUNTS,
+	KASUMI_PROC_PROXY_MAPS,
 };
 
 static enum kasumi_proc_proxy_kind kasumi_proc_proxy_kind_for_path(const char *path)
@@ -157,11 +164,9 @@ static enum kasumi_proc_proxy_kind kasumi_proc_proxy_kind_for_path(const char *p
 	if ((kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) &&
 	    path && strncmp(path, "/proc/", 6) == 0 && strstr(path, "/mounts"))
 		return KASUMI_PROC_PROXY_MOUNTS;
-	/*
-	 * Do not proxy maps/smaps file_operations. Large app maps can make
-	 * procfs seq_read abort with -ENOMEM after f_op swapping; maps spoofing
-	 * is handled by the seq_read kretprobe fallback below instead.
-	 */
+	if ((kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF) &&
+	    kasumi_path_is_proc_maps_view(path))
+		return KASUMI_PROC_PROXY_MAPS;
 	return KASUMI_PROC_PROXY_NONE;
 }
 
@@ -228,6 +233,7 @@ static ssize_t kasumi_mount_proxy_read(struct file *file, char __user *buf,
 	ssize_t ret;
 	loff_t pos;
 	size_t new_len;
+	bool maps_changed;
 	int srcu_idx;
 
 	srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
@@ -272,6 +278,25 @@ static ssize_t kasumi_mount_proxy_read(struct file *file, char __user *buf,
 		}
 		new_len = kasumi_filter_overlay_lines(kasumi_read_filter_buf, (size_t)ret);
 		if (new_len < (size_t)ret &&
+		    copy_to_user(buf, kasumi_read_filter_buf, new_len) == 0)
+			ret = (ssize_t)new_len;
+		mutex_unlock(&kasumi_read_filter_mutex);
+		goto out;
+	}
+
+	if (proxy->kind == KASUMI_PROC_PROXY_MAPS) {
+		if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF))
+			goto out;
+		if (!kasumi_should_apply_hide_rules())
+			goto out;
+		mutex_lock(&kasumi_read_filter_mutex);
+		if (copy_from_user(kasumi_read_filter_buf, buf, (size_t)ret)) {
+			mutex_unlock(&kasumi_read_filter_mutex);
+			goto out;
+		}
+		new_len = kasumi_filter_maps_lines(kasumi_read_filter_buf, (size_t)ret,
+						   &maps_changed);
+		if (maps_changed &&
 		    copy_to_user(buf, kasumi_read_filter_buf, new_len) == 0)
 			ret = (ssize_t)new_len;
 		mutex_unlock(&kasumi_read_filter_mutex);
@@ -1487,7 +1512,7 @@ void kasumi_proc_read_hooks_init(void)
 		}
 	}
 
-	if (!kasumi_maps_seq_read_registered) {
+	if (!use_proxy_filter && !use_syscall_filter && !kasumi_maps_seq_read_registered) {
 		unsigned long seq_read_addr = kasumi_lookup_name("seq_read");
 
 		if (seq_read_addr) {
