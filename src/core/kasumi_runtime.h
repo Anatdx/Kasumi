@@ -10,6 +10,8 @@
 #ifndef _KASUMI_RUNTIME_H
 #define _KASUMI_RUNTIME_H
 
+#include "kasumi_base.h"
+
 #include <linux/anon_inodes.h>
 #include <linux/bitmap.h>
 #include <linux/fcntl.h>
@@ -174,13 +176,18 @@ extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rh
 				    rcu_callback_t func);
 extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
 
-static inline void kasumi_path_put(const struct path *path)
+/* KASUMI_NOCFI: these call kallsyms-resolved pointers (path_get/path_put).
+ * Whether a kernel build emits a .cfi_jt thunk for those symbols varies per
+ * build (e.g. present on some Qualcomm 5.15, absent on some Meizu), so
+ * kasumi_lookup_callable may hand back the RAW body address. Calling it from
+ * CFI-instrumented code is a fatal CFI violation; disable the check here. */
+static inline KASUMI_NOCFI void kasumi_path_put(const struct path *path)
 {
 	if (kasumi_path_put_ptr)
 		kasumi_path_put_ptr(path);
 }
 
-static inline void kasumi_path_get(const struct path *path)
+static inline KASUMI_NOCFI void kasumi_path_get(const struct path *path)
 {
 	if (kasumi_path_get_ptr)
 		kasumi_path_get_ptr(path);

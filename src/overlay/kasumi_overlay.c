@@ -152,7 +152,7 @@ static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_cont
 	return KASUMI_FILLDIR_CONTINUE;
 }
 
-void kasumi_populate_injected_list(const char *dir_path, struct dentry *parent,
+KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct dentry *parent,
 				   struct list_head *head)
 {
 	struct kasumi_entry *entry;
@@ -414,7 +414,7 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
  * contrast, keeps the real subdir intact and only performs iterate_dir-time
  * injection of the module's contents on top.
  */
-static bool kasumi_register_nested_merge(const char *src_str,
+static KASUMI_NOCFI bool kasumi_register_nested_merge(const char *src_str,
 					 const char *target_str)
 {
 	struct kasumi_merge_entry *me, *existing;

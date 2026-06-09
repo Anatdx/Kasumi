@@ -350,7 +350,7 @@ out:
 	return ret;
 }
 
-static int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
+static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
 {
 	struct kasumi_mount_file_proxy *proxy =
 		container_of(file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
@@ -384,7 +384,7 @@ static int kasumi_mount_proxy_release(struct inode *inode, struct file *file)
 	return ret;
 }
 
-int kasumi_mount_proxy_install_fd(int fd)
+KASUMI_NOCFI int kasumi_mount_proxy_install_fd(int fd)
 {
 	struct file *file;
 	struct kasumi_mount_file_proxy *proxy;
@@ -478,7 +478,7 @@ out:
 	return ret;
 }
 
-void kasumi_mount_proxy_drain(void)
+KASUMI_NOCFI void kasumi_mount_proxy_drain(void)
 {
 	struct kasumi_mount_file_proxy *p, *tmp;
 	LIST_HEAD(victims);
@@ -813,7 +813,7 @@ static size_t kasumi_filter_maps_lines(char *kbuf, size_t len, bool *changed)
 	return out;
 }
 
-static int kasumi_read_mount_filter_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static KASUMI_NOCFI int kasumi_read_mount_filter_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	long ret;
 	struct kasumi_read_mount_ri_data *d = (struct kasumi_read_mount_ri_data *)ri->data;
@@ -959,7 +959,7 @@ static int kasumi_read_mount_filter_ret(struct kretprobe_instance *ri, struct pt
 	return 0;
 }
 
-static int kasumi_vfs_read_mount_filter_ret(struct kretprobe_instance *ri,
+static KASUMI_NOCFI int kasumi_vfs_read_mount_filter_ret(struct kretprobe_instance *ri,
 					     struct pt_regs *regs)
 {
 	long ret;
@@ -1141,7 +1141,7 @@ static int kasumi_seq_read_maps_filter_entry(struct kretprobe_instance *ri, stru
 	return 0;
 }
 
-static int kasumi_seq_read_maps_filter_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+static KASUMI_NOCFI int kasumi_seq_read_maps_filter_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	long ret;
 	struct kasumi_seq_read_ri_data *d = (struct kasumi_seq_read_ri_data *)ri->data;

@@ -63,7 +63,7 @@
  * GET_FD is syscall-only -> kasumi_get_anon_fd()
  * ====================================================================== */
 
-static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
+static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 {
 	struct kasumi_syscall_arg req;
 	struct kasumi_entry *entry;

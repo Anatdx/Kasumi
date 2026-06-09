@@ -432,7 +432,7 @@ static void kasumi_set_path_arg0(const struct pt_regs *regs, unsigned long value
 #endif
 }
 
-static long kasumi_copy_user_path_at(int dirfd, const char __user *u,
+static KASUMI_NOCFI long kasumi_copy_user_path_at(int dirfd, const char __user *u,
 				     char *path, size_t size)
 {
 	char *page;
@@ -727,7 +727,7 @@ struct kasumi_linux_dirent64 {
 	char d_name[];
 };
 
-static long h_getdents64(const struct pt_regs *regs)
+static KASUMI_NOCFI long h_getdents64(const struct pt_regs *regs)
 {
 	char *kbuf = NULL;
 	char *pathbuf = NULL;

@@ -178,7 +178,7 @@ int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *so
 	return 0;
 }
 
-int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path)
+KASUMI_NOCFI int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path)
 {
 	struct path source = {};
 	int ret;

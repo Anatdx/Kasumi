@@ -157,7 +157,7 @@ static void kasumi_xattr_sid_meta_free_rcu(struct rcu_head *rcu)
 	kfree(m);
 }
 
-static int kasumi_xattr_sid_install_sid(struct inode *target_inode, u32 source_sid)
+static KASUMI_NOCFI int kasumi_xattr_sid_install_sid(struct inode *target_inode, u32 source_sid)
 {
 	struct kasumi_xattr_sid_meta *m, *existing;
 	u32 orig_sid;
@@ -279,7 +279,7 @@ static void kasumi_source_path_parent_or_anchor(char *path)
 	*slash = '\0';
 }
 
-int kasumi_xattr_sid_uninstall_path(const char *path)
+KASUMI_NOCFI int kasumi_xattr_sid_uninstall_path(const char *path)
 {
 	struct path p;
 	int ret;
@@ -299,7 +299,7 @@ int kasumi_xattr_sid_uninstall_path(const char *path)
 	return ret;
 }
 
-int kasumi_xattr_sid_install_path_ancestors(const char *target_path, const char *source_path)
+KASUMI_NOCFI int kasumi_xattr_sid_install_path_ancestors(const char *target_path, const char *source_path)
 {
 	struct dentry *dentry;
 	struct path p;
@@ -343,7 +343,7 @@ int kasumi_xattr_sid_install_path_ancestors(const char *target_path, const char 
 	return installed ? 0 : (first_ret ?: -ENOENT);
 }
 
-int kasumi_xattr_sid_uninstall_path_ancestors(const char *target_path)
+KASUMI_NOCFI int kasumi_xattr_sid_uninstall_path_ancestors(const char *target_path)
 {
 	struct dentry *dentry;
 	struct path p;

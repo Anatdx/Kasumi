@@ -120,7 +120,7 @@ static bool kasumi_current_is_app_zygote(void)
 		      suffix, suffix_len) == 0;
 }
 
-static bool kasumi_apatch_should_apply_hide(uid_t uid)
+static KASUMI_NOCFI bool kasumi_apatch_should_apply_hide(uid_t uid)
 {
 	if (kasumi_uid_is_isolated(uid))
 		return true;
@@ -419,7 +419,7 @@ char *kasumi_resolve_target(const char *pathname)
 	return target;
 }
 
-char *kasumi_resolve_target_slow(const char *pathname)
+KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 {
 	struct kasumi_merge_entry *me;
 	char *src = NULL;

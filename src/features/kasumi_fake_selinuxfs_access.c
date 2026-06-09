@@ -328,7 +328,7 @@ static void kasumi_selinuxfs_meta_free_rcu(struct rcu_head *rcu)
 	kfree(m);
 }
 
-static int kasumi_fake_selinuxfs_install_path(const char *path,
+static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 					     enum kasumi_selinuxfs_txn_kind kind)
 {
 	struct kasumi_selinuxfs_txn_meta __rcu **slot;

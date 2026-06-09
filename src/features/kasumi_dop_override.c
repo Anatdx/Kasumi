@@ -149,7 +149,7 @@ static struct kasumi_dop_meta *kasumi_dop_uninstall_locked(struct dentry *dentry
 	return m;
 }
 
-int kasumi_dop_uninstall_path(const char *path)
+KASUMI_NOCFI int kasumi_dop_uninstall_path(const char *path)
 {
 	struct path p;
 	int ret;
