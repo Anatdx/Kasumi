@@ -100,7 +100,11 @@ extern unsigned long (*kasumi_kallsyms_lookup_name)(const char *name);
 bool kasumi_valid_kernel_addr(unsigned long addr);
 unsigned long kasumi_lookup_name(const char *name);
 unsigned long kasumi_lookup_name_quiet(const char *name);
+unsigned long kasumi_lookup_callable(const char *name);
+unsigned long kasumi_lookup_callable_quiet(const char *name);
 void kasumi_resolve_kallsyms_lookup(void);
+int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *source_inode);
+int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path);
 
 typedef bool (*kasumi_ksu_is_allow_uid_fn)(uid_t uid);
 typedef bool (*kasumi_ksu_uid_should_umount_fn)(uid_t uid);

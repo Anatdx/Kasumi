@@ -1026,8 +1026,11 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			if (path.dentry && d_inode(path.dentry)) {
 				target_inode = d_inode(path.dentry);
 				kasumi_ihold(target_inode);
+				if (src_inode)
+					(void)kasumi_clone_source_inode_attrs(target_inode,
+									       src_inode);
 				(void)kasumi_dop_install(path.dentry, src);
-				(void)kasumi_xattr_sid_install(target_inode, src);
+				(void)kasumi_xattr_sid_install_path_ancestors(target, src);
 			}
 			kasumi_path_put(&path);
 		}
@@ -1233,7 +1236,7 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				kasumi_clear_inode_flags_for_path(entry->target,
 								AS_FLAGS_KASUMI_SPOOF_KSTAT);
 				(void)kasumi_dop_uninstall_path(entry->target);
-				(void)kasumi_xattr_sid_uninstall_path(entry->target);
+				(void)kasumi_xattr_sid_uninstall_path_ancestors(entry->target);
 				hlist_del_rcu(&entry->node);
 				hlist_del_rcu(&entry->target_node);
 				atomic_dec(&kasumi_rule_count);

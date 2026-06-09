@@ -462,7 +462,7 @@ out:
 #endif
 }
 
-void kasumi_handle_sys_enter_statx(struct pt_regs *regs, long id)
+KASUMI_NOCFI void kasumi_handle_sys_enter_statx(struct pt_regs *regs, long id)
 {
 #if defined(__aarch64__) || defined(__x86_64__)
 	struct kasumi_percpu *pcpu = kasumi_this_cpu();
@@ -512,7 +512,7 @@ void kasumi_handle_sys_enter_statx(struct pt_regs *regs, long id)
 #endif
 }
 
-void kasumi_handle_sys_exit_statx(struct pt_regs *regs, long ret)
+KASUMI_NOCFI void kasumi_handle_sys_exit_statx(struct pt_regs *regs, long ret)
 {
 #if defined(__aarch64__) || defined(__x86_64__)
 	struct kasumi_percpu *pcpu = kasumi_this_cpu();
@@ -564,7 +564,7 @@ void kasumi_handle_sys_exit_path(struct pt_regs *regs, long ret)
 	(void)kasumi_mount_proxy_install_fd((int)ret);
 }
 
-void kasumi_handle_sys_enter_path(struct pt_regs *regs, long id)
+KASUMI_NOCFI void kasumi_handle_sys_enter_path(struct pt_regs *regs, long id)
 {
 	const char __user *filename_user;
 	char *buf;
@@ -650,6 +650,41 @@ void kasumi_handle_sys_enter_path(struct pt_regs *regs, long id)
 	}
 }
 
+/* names_cachep, resolved at vfs hooks init, for atomic struct filename build. */
+static struct kmem_cache *kasumi_names_cachep;
+
+/*
+ * Atomic-context replacement for getname_kernel(). The getname kprobe
+ * pre-handler runs preempt-disabled; getname_kernel()'s __getname() uses
+ * GFP_KERNEL and can schedule-while-atomic on CONFIG_PREEMPT. Build a
+ * putname-compatible struct filename (embedded name, allocated from
+ * names_cachep so __putname/kmem_cache_free frees it) with GFP_ATOMIC instead.
+ */
+static struct filename *kasumi_getname_atomic(const char *path)
+{
+	struct filename *result;
+	size_t len = strlen(path) + 1;
+	size_t embedded_max = PATH_MAX - offsetof(struct filename, iname);
+
+	if (!kasumi_names_cachep || len > embedded_max)
+		return ERR_PTR(-ENAMETOOLONG);
+	result = kmem_cache_alloc(kasumi_names_cachep, GFP_ATOMIC);
+	if (!result)
+		return ERR_PTR(-ENOMEM);
+	memcpy((char *)result->iname, path, len);
+	result->name = result->iname;
+	result->uptr = NULL;
+	result->aname = NULL;
+	/* struct filename.refcnt became atomic_t in v6.5 (Android KMI: int on
+	 * 5.x/6.1, atomic_t on 6.6+). Keep this builder KMI-portable. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	atomic_set(&result->refcnt, 1);
+#else
+	result->refcnt = 1;
+#endif
+	return result;
+}
+
 /* getname_flags pre-handler: only modify user path and regs; return 0 to run original. */
 static KASUMI_NOCFI int kasumi_kp_getname_flags_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -692,10 +727,15 @@ static KASUMI_NOCFI int kasumi_kp_getname_flags_pre(struct kprobe *p, struct pt_
 		buf[KASUMI_PATH_BUF - 1] = '\0';
 	}
 
-	if (check_mountinfo_prime && buf[0] == '/' &&
-	    kasumi_path_is_proc_mountinfo(buf) &&
-	    kasumi_should_apply_hide_rules())
-		(void)kasumi_fake_mi_prepare(false);
+	/*
+	 * Do NOT prewarm the fake-mountinfo cache from this kprobe pre-handler.
+	 * It runs in atomic (preempt-disabled) context, but kasumi_fake_mi_prepare()
+	 * takes a mutex and does filp_open/kernel_read I/O on /proc/self/mountinfo
+	 * (which itself re-enters getname_flags). On CONFIG_PREEMPT kernels that is
+	 * scheduling-while-atomic / self-deadlock -> panic. The cache is filled
+	 * lazily in process context at read() time instead.
+	 */
+	(void)check_mountinfo_prime;
 
 	if (!have_path_filters)
 		return 0;
@@ -713,21 +753,18 @@ static KASUMI_NOCFI int kasumi_kp_getname_flags_pre(struct kprobe *p, struct pt_
 		return 1;
 	}
 
-	/* Redirect: use getname_kernel to build a struct filename from the target
-	 * path, then skip the original getname_flags entirely.  This avoids
-	 * writing back to user memory (which may be read-only, too small, or
-	 * cause PAN/MTE faults in atomic context). */
+	/* Redirect: build a struct filename for the target path (改指针) and skip
+	 * the original getname_flags entirely. Use the GFP_ATOMIC builder, NOT
+	 * getname_kernel() — this handler is preempt-disabled (atomic) and
+	 * getname_kernel's GFP_KERNEL alloc can schedule-while-atomic on PREEMPT. */
 	if (buf[0] != '/')
 		return 0;
 	target = kasumi_resolve_target(buf);
 	if (!target)
 		return 0;
-	if (kasumi_getname_kernel) {
-		struct filename *fname;
+	{
+		struct filename *fname = kasumi_getname_atomic(target);
 
-		kasumi_this_cpu()->kprobe_reent = 1;
-		fname = kasumi_getname_kernel(target);
-		kasumi_this_cpu()->kprobe_reent = 0;
 		kfree(target);
 		if (IS_ERR(fname))
 			return 0;
@@ -736,8 +773,6 @@ static KASUMI_NOCFI int kasumi_kp_getname_flags_pre(struct kprobe *p, struct pt_
 		KASUMI_POP_STACK(regs);
 		return 1;
 	}
-	kfree(target);
-	return 0;
 }
 
 /* vfs_getattr kprobe pre: nop (stat spoofing is done in kretprobe entry/ret). */
@@ -1283,7 +1318,7 @@ KASUMI_NOCFI int kasumi_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *reg
 	return 0;
 }
 
-struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
+KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
 							      struct dir_context *orig_ctx)
 {
 	struct kasumi_filldir_wrapper *w;
@@ -1464,6 +1499,15 @@ int kasumi_vfs_hooks_init(bool skip_vfs)
 		pr_alert("Kasumi: STAGE 7: hot VFS kprobes disabled\n");
 		kasumi_vfs_use_ftrace = false;
 		kasumi_getxattr_kprobe_registered = 0;
+
+		if (!kasumi_names_cachep) {
+			unsigned long nc = kasumi_lookup_name("names_cachep");
+
+			if (nc && kasumi_valid_kernel_addr(nc))
+				kasumi_names_cachep = *(struct kmem_cache **)nc;
+			if (!kasumi_names_cachep)
+				pr_warn("Kasumi: names_cachep not found, getname path redirect disabled\n");
+		}
 
 		if (kasumi_syscall_dispatcher_nr < 0 ||
 		    !kasumi_has_syscall_hook(__NR_openat)) {

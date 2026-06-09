@@ -40,18 +40,6 @@ static int kasumi_no_tracepoint_param;
 module_param_named(kasumi_no_tracepoint, kasumi_no_tracepoint_param, int, 0600);
 MODULE_PARM_DESC(kasumi_no_tracepoint, "Deprecated compatibility knob; syscall hooks now patch syscall table entries directly.");
 
-static int kasumi_skip_vfs_param;
-module_param_named(kasumi_skip_vfs, kasumi_skip_vfs_param, int, 0600);
-MODULE_PARM_DESC(kasumi_skip_vfs, "1=skip VFS hooks (ftrace+kprobes). For debugging crash.");
-
-static int kasumi_skip_extra_kprobes_param;
-module_param_named(kasumi_skip_extra_kprobes, kasumi_skip_extra_kprobes_param, int, 0600);
-MODULE_PARM_DESC(kasumi_skip_extra_kprobes, "1=skip extra kprobes (reboot,prctl,uname,cmdline). For debugging.");
-
-static int kasumi_skip_getfd_param;
-module_param_named(kasumi_skip_getfd, kasumi_skip_getfd_param, int, 0600);
-MODULE_PARM_DESC(kasumi_skip_getfd, "1=skip GET_FD kprobe fallback. For debugging crash.");
-
 static int kasumi_skip_kallsyms_param;
 module_param_named(kasumi_skip_kallsyms, kasumi_skip_kallsyms_param, int, 0600);
 MODULE_PARM_DESC(kasumi_skip_kallsyms, "1=skip kallsyms resolution, use per-symbol kprobe. For GKI compatibility.");
@@ -60,7 +48,7 @@ static int kasumi_dummy_mode_param;
 module_param_named(kasumi_dummy_mode, kasumi_dummy_mode_param, int, 0600);
 MODULE_PARM_DESC(kasumi_dummy_mode, "1=exit immediately after init starts (for testing).");
 
-static void kasumi_resolve_system_dev(void)
+static noinline KASUMI_NOCFI void kasumi_resolve_system_dev(void)
 {
 	struct path sys_path = {};
 	struct dentry *dentry;
@@ -96,53 +84,53 @@ static void kasumi_resolve_system_dev(void)
 
 static int kasumi_resolve_runtime_symbols(void)
 {
-	kasumi_kern_path = (void *)kasumi_lookup_name("kern_path");
+	kasumi_kern_path = (void *)kasumi_lookup_callable("kern_path");
 	if (!kasumi_kern_path) {
 		pr_err("Kasumi: FATAL - kern_path not found\n");
 		return -ENOENT;
 	}
 
-	kasumi_strndup_user = (void *)kasumi_lookup_name("strndup_user");
+	kasumi_strndup_user = (void *)kasumi_lookup_callable("strndup_user");
 	if (!kasumi_strndup_user) {
 		pr_err("Kasumi: FATAL - strndup_user not found\n");
 		return -ENOENT;
 	}
 
-	kasumi_ihold = (void *)kasumi_lookup_name("ihold");
+	kasumi_ihold = (void *)kasumi_lookup_callable("ihold");
 	if (!kasumi_ihold) {
 		pr_err("Kasumi: FATAL - ihold not found\n");
 		return -ENOENT;
 	}
 
-	kasumi_getname_kernel = (void *)kasumi_lookup_name("getname_kernel");
+	kasumi_getname_kernel = (void *)kasumi_lookup_callable("getname_kernel");
 	if (!kasumi_getname_kernel)
 		pr_warn("Kasumi: getname_kernel not found, path redirect may fail\n");
 
-	kasumi_filp_open = (void *)kasumi_lookup_name("filp_open");
-	kasumi_filp_close = (void *)kasumi_lookup_name("filp_close");
-	kasumi_kernel_read = (void *)kasumi_lookup_name("kernel_read");
-	kasumi_vfs_getattr = (void *)kasumi_lookup_name("vfs_getattr");
-	kasumi_dentry_open = (void *)kasumi_lookup_name("dentry_open");
-	kasumi_d_absolute_path = (void *)kasumi_lookup_name("d_absolute_path");
-	kasumi_dentry_path_raw = (void *)kasumi_lookup_name("dentry_path_raw");
-	kasumi_strncpy_from_user_nofault = (void *)kasumi_lookup_name("strncpy_from_user_nofault");
+	kasumi_filp_open = (void *)kasumi_lookup_callable("filp_open");
+	kasumi_filp_close = (void *)kasumi_lookup_callable("filp_close");
+	kasumi_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
+	kasumi_vfs_getattr = (void *)kasumi_lookup_callable("vfs_getattr");
+	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
+	kasumi_d_absolute_path = (void *)kasumi_lookup_callable("d_absolute_path");
+	kasumi_dentry_path_raw = (void *)kasumi_lookup_callable("dentry_path_raw");
+	kasumi_strncpy_from_user_nofault = (void *)kasumi_lookup_callable("strncpy_from_user_nofault");
 	if (!kasumi_strncpy_from_user_nofault)
 		pr_warn("Kasumi: strncpy_from_user_nofault not found, falling back to copy_from_user\n");
-	kasumi_copy_from_user_nofault = (void *)kasumi_lookup_name("copy_from_user_nofault");
-	kasumi_copy_to_user_nofault = (void *)kasumi_lookup_name("copy_to_user_nofault");
+	kasumi_copy_from_user_nofault = (void *)kasumi_lookup_callable("copy_from_user_nofault");
+	kasumi_copy_to_user_nofault = (void *)kasumi_lookup_callable("copy_to_user_nofault");
 	if (!kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault)
 		pr_warn("Kasumi: user nofault copy helpers not found, statx mount-id spoof disabled\n");
-	kasumi_call_srcu_ptr = (void *)kasumi_lookup_name("call_srcu");
-	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_name("srcu_barrier");
+	kasumi_call_srcu_ptr = (void *)kasumi_lookup_callable("call_srcu");
+	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_callable("srcu_barrier");
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
 		pr_err("Kasumi: FATAL - call_srcu/srcu_barrier not found\n");
 		return -ENOENT;
 	}
-	kasumi_d_path = (void *)kasumi_lookup_name("d_path");
-	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_name("d_hash_and_lookup");
-	kasumi_path_get_ptr = (void *)kasumi_lookup_name("path_get");
-	kasumi_path_put_ptr = (void *)kasumi_lookup_name("path_put");
-	kasumi_free_inode_nonrcu_ptr = (void *)kasumi_lookup_name("free_inode_nonrcu");
+	kasumi_d_path = (void *)kasumi_lookup_callable("d_path");
+	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_callable("d_hash_and_lookup");
+	kasumi_path_get_ptr = (void *)kasumi_lookup_callable("path_get");
+	kasumi_path_put_ptr = (void *)kasumi_lookup_callable("path_put");
+	kasumi_free_inode_nonrcu_ptr = (void *)kasumi_lookup_callable("free_inode_nonrcu");
 	if (!kasumi_d_path)
 		pr_warn("Kasumi: d_path not found, path resolution in populate/merge/hide may fail\n");
 	if (!kasumi_d_hash_and_lookup)
@@ -160,21 +148,21 @@ static int kasumi_resolve_runtime_symbols(void)
 
 	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
 	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_name("ksu_uid_should_umount");
+		unsigned long addr = kasumi_lookup_callable("ksu_uid_should_umount");
 
 		if (addr && kasumi_valid_kernel_addr(addr))
 			kasumi_ksu_uid_should_umount_ptr = (kasumi_ksu_uid_should_umount_fn)addr;
 	}
 	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
 	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_name("__ksu_is_allow_uid_for_current");
+		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid_for_current");
 
 		if (addr && kasumi_valid_kernel_addr(addr))
 			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
 	}
 	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
 	    kasumi_root_allows_spoofing() && !kasumi_ksu_is_allow_uid_ptr) {
-		unsigned long addr = kasumi_lookup_name("__ksu_is_allow_uid");
+		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid");
 
 		if (addr && kasumi_valid_kernel_addr(addr))
 			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
@@ -205,10 +193,6 @@ int kasumi_bootstrap_init(void)
 		pr_alert("Kasumi: failed to create filldir slab cache\n");
 		return -ENOMEM;
 	}
-
-	pr_alert("Kasumi: skip_kallsyms=%d skip_vfs=%d skip_extra=%d skip_getfd=%d\n",
-		kasumi_skip_kallsyms_param, kasumi_skip_vfs_param,
-		kasumi_skip_extra_kprobes_param, kasumi_skip_getfd_param);
 
 	if (!kasumi_skip_kallsyms_param)
 		kasumi_resolve_kallsyms_lookup();
@@ -242,12 +226,11 @@ int kasumi_bootstrap_init(void)
 
 	(void)kasumi_syscall_redirect_init();
 
-	ret = kasumi_proc_hooks_init(kasumi_skip_getfd_param, kasumi_no_tracepoint_param,
-				     kasumi_skip_extra_kprobes_param);
+	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param, 0);
 	if (ret)
 		goto err_buffers;
 
-	ret = kasumi_vfs_hooks_init(kasumi_skip_vfs_param);
+	ret = kasumi_vfs_hooks_init(0);
 	if (ret)
 		goto err_proc;
 
@@ -257,6 +240,7 @@ int kasumi_bootstrap_init(void)
 	(void)kasumi_iop_override_init();
 	(void)kasumi_fop_override_init();
 	(void)kasumi_fake_mi_init();
+
 	(void)kasumi_fake_selinuxfs_access_init();
 	pr_alert("Kasumi: Chikyuu ga buttobu kurai tanoshinjaoo!!\n");
 	return 0;
@@ -303,7 +287,7 @@ void kasumi_bootstrap_exit(void)
 	/* PHASE 2: handlers can no longer be reached, free their dependencies. */
 	kasumi_file_view_shutdown();
 	kasumi_proc_hooks_exit();
-	kasumi_vfs_hooks_exit(kasumi_skip_vfs_param);
+	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
 	kasumi_iop_override_exit();

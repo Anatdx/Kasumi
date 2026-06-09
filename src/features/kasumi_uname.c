@@ -295,7 +295,7 @@ bool kasumi_uname_scoped_active(void)
 	return READ_ONCE(kasumi_uname_scoped_on);
 }
 
-void kasumi_uname_apply_scoped_current(void)
+KASUMI_NOCFI void kasumi_uname_apply_scoped_current(void)
 {
 	struct task_struct *task = current;
 	struct nsproxy *new_nsp = NULL;

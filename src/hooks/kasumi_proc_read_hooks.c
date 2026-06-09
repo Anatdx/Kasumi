@@ -1263,7 +1263,7 @@ void kasumi_statfs_apply_spoof(void __user *buf, unsigned long spoof_f_type)
 	}
 }
 
-void kasumi_handle_sys_enter_statfs(struct pt_regs *regs, long id)
+KASUMI_NOCFI void kasumi_handle_sys_enter_statfs(struct pt_regs *regs, long id)
 {
 #if defined(__aarch64__) || defined(__x86_64__)
 	struct kasumi_percpu *pcpu = kasumi_this_cpu();
@@ -1532,9 +1532,12 @@ void kasumi_proc_read_hooks_init(void)
 		}
 	}
 
-	if (!kasumi_statfs_kretprobe_registered) {
-		/* Always kretprobe, never tracepoint: kern_path() may
-		 * sleep but tracepoint runs in atomic context. */
+	if (!use_proxy_filter && !kasumi_statfs_kretprobe_registered) {
+		/* LEGACY fallback only (TSR off). kretprobe handlers run in
+		 * ATOMIC context (preempt disabled), so the kern_path() in the
+		 * statfs handler is a sleep-in-atomic bug on PREEMPT kernels.
+		 * When TSR is active, statfs is handled in the sleepable
+		 * syscall dispatcher instead. */
 		{
 			static const char *statfs_syms[] = {
 #if defined(__aarch64__)

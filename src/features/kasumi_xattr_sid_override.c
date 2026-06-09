@@ -18,6 +18,7 @@
 
 #include <linux/hashtable.h>
 #include <linux/lsm_hooks.h>
+#include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -45,6 +46,7 @@ struct kasumi_xattr_sid_meta {
 	struct inode *inode;
 	u32 orig_sid;
 	u32 spoof_sid;
+	unsigned int refs;
 	struct hlist_node node;
 	struct rcu_head rcu;
 };
@@ -155,25 +157,20 @@ static void kasumi_xattr_sid_meta_free_rcu(struct rcu_head *rcu)
 	kfree(m);
 }
 
-int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path)
+static int kasumi_xattr_sid_install_sid(struct inode *target_inode, u32 source_sid)
 {
 	struct kasumi_xattr_sid_meta *m, *existing;
-	u32 source_sid;
 	u32 orig_sid;
-	int ret;
 
 	if (!READ_ONCE(kasumi_xattr_sid_ready))
 		return -EOPNOTSUPP;
 	if (!kasumi_root_allows_spoofing())
 		return -EOPNOTSUPP;
-	if (!target_inode || !source_path)
+	if (!target_inode || !source_sid)
 		return -EINVAL;
 	if (!kasumi_ihold)
 		return -EOPNOTSUPP;
 
-	ret = kasumi_source_sid_from_path(source_path, &source_sid);
-	if (ret)
-		return ret;
 	if (!kasumi_selinux_read_sid(target_inode, &orig_sid))
 		return -ENOENT;
 
@@ -183,17 +180,24 @@ int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path
 	m->inode = target_inode;
 	m->orig_sid = orig_sid;
 	m->spoof_sid = source_sid;
+	m->refs = 1;
 	kasumi_ihold(target_inode);
 
 	spin_lock(&kasumi_xattr_sid_lock);
 	existing = kasumi_xattr_sid_lookup_rcu(target_inode);
 	if (existing) {
 		existing->spoof_sid = source_sid;
+		existing->refs++;
 		spin_unlock(&kasumi_xattr_sid_lock);
 		iput(m->inode);
 		kfree(m);
-		if (!kasumi_selinux_write_sid(target_inode, source_sid))
+		if (!kasumi_selinux_write_sid(target_inode, source_sid)) {
+			spin_lock(&kasumi_xattr_sid_lock);
+			if (existing->refs > 0)
+				existing->refs--;
+			spin_unlock(&kasumi_xattr_sid_lock);
 			return -ENOENT;
+		}
 		atomic64_inc(&kasumi_hook_stats.xattr_sid_overrides);
 		return 0;
 	}
@@ -215,6 +219,19 @@ int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path
 	return 0;
 }
 
+int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path)
+{
+	u32 source_sid;
+	int ret;
+
+	if (!target_inode || !source_path)
+		return -EINVAL;
+	ret = kasumi_source_sid_from_path(source_path, &source_sid);
+	if (ret)
+		return ret;
+	return kasumi_xattr_sid_install_sid(target_inode, source_sid);
+}
+
 static struct kasumi_xattr_sid_meta *kasumi_xattr_sid_uninstall_locked(struct inode *inode)
 {
 	struct kasumi_xattr_sid_meta *m;
@@ -222,13 +239,48 @@ static struct kasumi_xattr_sid_meta *kasumi_xattr_sid_uninstall_locked(struct in
 	m = kasumi_xattr_sid_lookup_rcu(inode);
 	if (!m)
 		return NULL;
+	if (m->refs > 1) {
+		m->refs--;
+		return NULL;
+	}
 	hash_del_rcu(&m->node);
 	return m;
 }
 
-int kasumi_xattr_sid_uninstall_path(const char *path)
+static int kasumi_xattr_sid_uninstall_inode(struct inode *inode)
 {
 	struct kasumi_xattr_sid_meta *m;
+
+	if (!inode)
+		return -EINVAL;
+
+	spin_lock(&kasumi_xattr_sid_lock);
+	m = kasumi_xattr_sid_uninstall_locked(inode);
+	spin_unlock(&kasumi_xattr_sid_lock);
+
+	if (!m)
+		return 0;
+
+	(void)kasumi_selinux_write_sid(m->inode, m->orig_sid);
+	iput(m->inode);
+	call_rcu(&m->rcu, kasumi_xattr_sid_meta_free_rcu);
+	return 0;
+}
+
+static void kasumi_source_path_parent_or_anchor(char *path)
+{
+	char *slash;
+
+	if (!path || path[0] != '/')
+		return;
+	slash = strrchr(path, '/');
+	if (!slash || slash == path)
+		return;
+	*slash = '\0';
+}
+
+int kasumi_xattr_sid_uninstall_path(const char *path)
+{
 	struct path p;
 	int ret;
 
@@ -242,15 +294,74 @@ int kasumi_xattr_sid_uninstall_path(const char *path)
 		return -ENOENT;
 	}
 
-	spin_lock(&kasumi_xattr_sid_lock);
-	m = kasumi_xattr_sid_uninstall_locked(d_inode(p.dentry));
-	spin_unlock(&kasumi_xattr_sid_lock);
+	ret = kasumi_xattr_sid_uninstall_inode(d_inode(p.dentry));
+	kasumi_path_put(&p);
+	return ret;
+}
 
-	if (m) {
-		(void)kasumi_selinux_write_sid(m->inode, m->orig_sid);
-		iput(m->inode);
-		call_rcu(&m->rcu, kasumi_xattr_sid_meta_free_rcu);
+int kasumi_xattr_sid_install_path_ancestors(const char *target_path, const char *source_path)
+{
+	struct dentry *dentry;
+	struct path p;
+	char *source_walk;
+	int installed = 0;
+	int first_ret = 0;
+	int ret;
+
+	if (!target_path || !source_path || !kasumi_kern_path)
+		return -EINVAL;
+	source_walk = kstrdup(source_path, GFP_KERNEL);
+	if (!source_walk)
+		return -ENOMEM;
+	ret = kasumi_kern_path(target_path, LOOKUP_FOLLOW, &p);
+	if (ret) {
+		kfree(source_walk);
+		return ret;
 	}
+
+	for (dentry = p.dentry; dentry; dentry = dentry->d_parent) {
+		struct inode *inode = d_inode(dentry);
+		u32 source_sid;
+
+		if (inode) {
+			ret = kasumi_source_sid_from_path(source_walk, &source_sid);
+			if (!ret)
+				ret = kasumi_xattr_sid_install_sid(inode, source_sid);
+			if (!ret) {
+				installed++;
+			} else if (!first_ret) {
+				first_ret = ret;
+			}
+		}
+		kasumi_source_path_parent_or_anchor(source_walk);
+		if (dentry == p.mnt->mnt_root || dentry == dentry->d_parent)
+			break;
+	}
+
+	kasumi_path_put(&p);
+	kfree(source_walk);
+	return installed ? 0 : (first_ret ?: -ENOENT);
+}
+
+int kasumi_xattr_sid_uninstall_path_ancestors(const char *target_path)
+{
+	struct dentry *dentry;
+	struct path p;
+	int ret;
+
+	if (!target_path || !kasumi_kern_path)
+		return -EINVAL;
+	ret = kasumi_kern_path(target_path, LOOKUP_FOLLOW, &p);
+	if (ret)
+		return ret;
+
+	for (dentry = p.dentry; dentry; dentry = dentry->d_parent) {
+		if (d_inode(dentry))
+			(void)kasumi_xattr_sid_uninstall_inode(d_inode(dentry));
+		if (dentry == p.mnt->mnt_root || dentry == dentry->d_parent)
+			break;
+	}
+
 	kasumi_path_put(&p);
 	return 0;
 }

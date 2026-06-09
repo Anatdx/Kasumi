@@ -161,6 +161,46 @@ bool kasumi_valid_kernel_addr(unsigned long addr)
 #endif
 }
 
+int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *source_inode)
+{
+	umode_t mode;
+
+	if (!target_inode || !source_inode)
+		return -EINVAL;
+
+	mode = (READ_ONCE(target_inode->i_mode) & S_IFMT) |
+	       (READ_ONCE(source_inode->i_mode) & 07777);
+	inode_lock(target_inode);
+	WRITE_ONCE(target_inode->i_mode, mode);
+	target_inode->i_uid = source_inode->i_uid;
+	target_inode->i_gid = source_inode->i_gid;
+	inode_unlock(target_inode);
+	return 0;
+}
+
+int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path)
+{
+	struct path source = {};
+	int ret;
+
+	if (!target_inode || !source_path || !kasumi_kern_path)
+		return -EINVAL;
+
+	atomic_long_set(&kasumi_xattr_source_tgid, (long)task_tgid_vnr(current));
+	ret = kasumi_kern_path(source_path, LOOKUP_FOLLOW, &source);
+	atomic_long_set(&kasumi_xattr_source_tgid, 0);
+	if (ret)
+		return ret;
+	if (!source.dentry || !d_inode(source.dentry)) {
+		kasumi_path_put(&source);
+		return -ENOENT;
+	}
+
+	ret = kasumi_clone_source_inode_attrs(target_inode, d_inode(source.dentry));
+	kasumi_path_put(&source);
+	return ret;
+}
+
 KASUMI_NOCFI unsigned long kasumi_lookup_name(const char *name)
 {
 	if (kasumi_kallsyms_lookup_name) {
@@ -190,6 +230,36 @@ KASUMI_NOCFI unsigned long kasumi_lookup_name(const char *name)
 	}
 }
 
+/*
+ * Resolve a kernel symbol that Kasumi will CALL through a function pointer.
+ *
+ * On old jump-table CFI kernels (android12-5.10 .. android14-5.15) the only
+ * valid indirect-call target for an address-taken function is its
+ * "<name>.cfi_jt" thunk; calling the raw function body faults under strict
+ * (non-permissive) CFI. Prefer the thunk; fall back to the raw symbol for
+ * kCFI kernels (6.1+, where the raw addr is callable) and for functions with
+ * no thunk (the raw addr is then the canonical entry).
+ *
+ * CAVEAT: depends on the ".cfi_jt" locals being present in kallsyms
+ * (CONFIG_KALLSYMS_ALL). Not robust where they are stripped AND the target is
+ * a non-exported, address-taken function: there is then no thunk to resolve
+ * and no direct call available. For EXPORTED symbols prefer a direct call.
+ */
+KASUMI_NOCFI unsigned long kasumi_lookup_callable(const char *name)
+{
+	if (kasumi_kallsyms_lookup_name) {
+		char jt[256];
+		unsigned long addr;
+
+		if (snprintf(jt, sizeof(jt), "%s.cfi_jt", name) < (int)sizeof(jt)) {
+			addr = kasumi_kallsyms_lookup_name(jt);
+			if (addr && !IS_ERR_VALUE(addr))
+				return addr;
+		}
+	}
+	return kasumi_lookup_name(name);
+}
+
 KASUMI_NOCFI unsigned long kasumi_lookup_name_quiet(const char *name)
 {
 	if (kasumi_kallsyms_lookup_name) {
@@ -213,6 +283,22 @@ KASUMI_NOCFI unsigned long kasumi_lookup_name_quiet(const char *name)
 			return 0;
 		return addr;
 	}
+}
+
+/* Quiet variant of kasumi_lookup_callable (no error log on miss). See kasumi_lookup_callable. */
+KASUMI_NOCFI unsigned long kasumi_lookup_callable_quiet(const char *name)
+{
+	if (kasumi_kallsyms_lookup_name) {
+		char jt[256];
+		unsigned long addr;
+
+		if (snprintf(jt, sizeof(jt), "%s.cfi_jt", name) < (int)sizeof(jt)) {
+			addr = kasumi_kallsyms_lookup_name(jt);
+			if (addr && !IS_ERR_VALUE(addr))
+				return addr;
+		}
+	}
+	return kasumi_lookup_name_quiet(name);
 }
 
 void kasumi_resolve_kallsyms_lookup(void)
@@ -385,7 +471,7 @@ void kasumi_cleanup_locked(void)
 		kasumi_clear_inode_flags_for_path(entry->src, AS_FLAGS_KASUMI_HIDE);
 		kasumi_clear_inode_flags_for_path(entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
 		(void)kasumi_dop_uninstall_path(entry->target);
-		(void)kasumi_xattr_sid_uninstall_path(entry->target);
+		(void)kasumi_xattr_sid_uninstall_path_ancestors(entry->target);
 		hlist_del_rcu(&entry->node);
 		hlist_del_rcu(&entry->target_node);
 		call_rcu(&entry->rcu, kasumi_entry_free_rcu);

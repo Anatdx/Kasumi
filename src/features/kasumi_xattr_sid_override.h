@@ -16,5 +16,8 @@ int kasumi_xattr_sid_override_init(void);
 void kasumi_xattr_sid_override_exit(void);
 int kasumi_xattr_sid_install(struct inode *target_inode, const char *source_path);
 int kasumi_xattr_sid_uninstall_path(const char *path);
+int kasumi_xattr_sid_install_path_ancestors(const char *target_path,
+					    const char *source_path);
+int kasumi_xattr_sid_uninstall_path_ancestors(const char *target_path);
 
 #endif /* _KASUMI_XATTR_SID_OVERRIDE_H */

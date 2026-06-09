@@ -384,9 +384,11 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 
 					if (kasumi_kern_path(tgt, LOOKUP_FOLLOW, &p) == 0) {
 						if (p.dentry && d_inode(p.dentry)) {
+							(void)kasumi_clone_source_attrs_from_path(d_inode(p.dentry),
+												    src);
 							(void)kasumi_iop_mark_spoof(d_inode(p.dentry));
 							(void)kasumi_dop_install(p.dentry, src);
-							(void)kasumi_xattr_sid_install(d_inode(p.dentry), src);
+							(void)kasumi_xattr_sid_install_path_ancestors(tgt, src);
 						}
 						kasumi_path_put(&p);
 					}

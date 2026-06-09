@@ -73,6 +73,10 @@ static int ksm_resolve_patch_api(void)
 
 void *kasumi_syscall_table;
 int  kasumi_syscall_dispatcher_nr = -1;
+static int kasumi_tsr_basic_param;
+module_param_named(kasumi_tsr_basic, kasumi_tsr_basic_param, int, 0600);
+MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/reboot/prctl (skip stat/statfs/read/write/getdents/xattr) to isolate crashing handler.");
+
 static kasumi_syscall_hook_fn hooks[__NR_syscalls];
 static kasumi_syscall_hook_fn saved_syscalls[__NR_syscalls];
 static bool patched_syscalls[__NR_syscalls];
@@ -541,7 +545,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	ret = orig(regs);
 	if (!raw_proc_proxy && ret >= 0 && target_path)
 		(void)kasumi_file_view_bind_fd((int)ret, path, target_path);
-	if (ret >= 0 && kasumi_proc_proxy_should_try())
+	if (raw_proc_proxy && ret >= 0 && kasumi_proc_proxy_should_try())
 		kasumi_mount_proxy_install_fd((int)ret);
 	kfree(target_path);
 	return ret;
@@ -1139,6 +1143,9 @@ int kasumi_syscall_redirect_init(void)
 	int n = 0;
 	kasumi_add_syscall_hook_counted(__NR_openat,  d_openat, &n);
 	kasumi_add_syscall_hook_counted(__NR_openat2, d_openat2, &n);
+	kasumi_add_syscall_hook_counted(__NR_reboot,  d_reboot, &n);
+	kasumi_add_syscall_hook_counted(__NR_prctl,   d_prctl, &n);
+	if (!kasumi_tsr_basic_param) {
 	kasumi_add_syscall_hook_counted(__NR_statfs,  d_statfs, &n);
 	kasumi_add_syscall_hook_counted(__NR_fstatfs, d_fstatfs, &n);
 #ifdef __NR_statx
@@ -1150,8 +1157,6 @@ int kasumi_syscall_redirect_init(void)
 #ifdef __NR_fstatfs64
 	kasumi_add_syscall_hook_counted(__NR_fstatfs64, d_fstatfs64, &n);
 #endif
-	kasumi_add_syscall_hook_counted(__NR_reboot,  d_reboot, &n);
-	kasumi_add_syscall_hook_counted(__NR_prctl,   d_prctl, &n);
 #if defined(__aarch64__) || defined(__x86_64__)
 	kasumi_add_syscall_hook_counted(__NR_read,    d_read, &n);
 	kasumi_add_syscall_hook_counted(__NR_write,   d_write, &n);
@@ -1175,6 +1180,7 @@ int kasumi_syscall_redirect_init(void)
 #ifdef __NR_llistxattr
 	kasumi_add_syscall_hook_counted(__NR_llistxattr, d_llistxattr, &n);
 #endif
+	}
 	ret = kasumi_patch_registered_syscalls();
 	if (ret) {
 		for (n = 0; n < __NR_syscalls; n++)
@@ -1205,7 +1211,7 @@ static void kasumi_redirect_drain_done(struct rcu_head *head)
 	complete(s->done);
 }
 
-void kasumi_syscall_redirect_exit(void)
+KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 {
 	DECLARE_COMPLETION_ONSTACK(drain_done);
 	static struct kasumi_drain_state drain;

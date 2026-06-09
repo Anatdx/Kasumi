@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/moduleparam.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -93,19 +94,19 @@ static long (*kasumi_copy_from_kernel_nofault_fn)(void *dst, const void *src,
 						  size_t size);
 static bool kasumi_copy_from_kernel_nofault_tried;
 
-static struct file *kasumi_open_ro(const char *path)
+static KASUMI_NOCFI struct file *kasumi_open_ro(const char *path)
 {
 	if (!kasumi_filp_open)
-		kasumi_filp_open = (void *)kasumi_lookup_name_quiet("filp_open");
+		kasumi_filp_open = (void *)kasumi_lookup_callable_quiet("filp_open");
 	if (!kasumi_filp_open)
 		return ERR_PTR(-ENOENT);
 	return kasumi_filp_open(path, O_RDONLY, 0);
 }
 
-static void kasumi_close_file(struct file *file)
+static KASUMI_NOCFI void kasumi_close_file(struct file *file)
 {
 	if (!kasumi_filp_close)
-		kasumi_filp_close = (void *)kasumi_lookup_name_quiet("filp_close");
+		kasumi_filp_close = (void *)kasumi_lookup_callable_quiet("filp_close");
 	if (kasumi_filp_close)
 		kasumi_filp_close(file, NULL);
 	else
@@ -125,10 +126,10 @@ static void kasumi_ap_clear_symbols(void)
 	kasumi_ap_list_kstorage_ids = NULL;
 }
 
-static bool kasumi_kernel_read_nofault(void *dst, unsigned long src, size_t size)
+static KASUMI_NOCFI bool kasumi_kernel_read_nofault(void *dst, unsigned long src, size_t size)
 {
 	if (!kasumi_copy_from_kernel_nofault_tried) {
-		unsigned long a = kasumi_lookup_name_quiet("copy_from_kernel_nofault");
+		unsigned long a = kasumi_lookup_callable_quiet("copy_from_kernel_nofault");
 
 		kasumi_copy_from_kernel_nofault_tried = true;
 		if (a && kasumi_valid_kernel_addr(a))
@@ -280,11 +281,11 @@ static bool kasumi_kp_scan_range(unsigned long start, unsigned long end,
 
 static bool kasumi_kp_scan_kernel_image(void)
 {
-	unsigned long start = kasumi_lookup_name_quiet("_text");
-	unsigned long end = kasumi_lookup_name_quiet("_end");
+	unsigned long start = kasumi_lookup_callable_quiet("_text");
+	unsigned long end = kasumi_lookup_callable_quiet("_end");
 
 	if (!kasumi_valid_kernel_addr(start))
-		start = kasumi_lookup_name_quiet("_stext");
+		start = kasumi_lookup_callable_quiet("_stext");
 
 	if (kasumi_kp_scan_range(start, end, "kernel image"))
 		return true;
@@ -341,8 +342,8 @@ static bool kasumi_kp_scan_vmap_list(unsigned long head_addr, const char *tag)
 
 static bool kasumi_kp_scan_vmap_nodes(void)
 {
-	unsigned long nodes_sym = kasumi_lookup_name_quiet("vmap_nodes");
-	unsigned long nr_sym = kasumi_lookup_name_quiet("nr_vmap_nodes");
+	unsigned long nodes_sym = kasumi_lookup_callable_quiet("vmap_nodes");
+	unsigned long nr_sym = kasumi_lookup_callable_quiet("nr_vmap_nodes");
 	struct kasumi_kp_vmap_node *nodes;
 	unsigned int nr;
 	unsigned int i;
@@ -368,7 +369,7 @@ static bool kasumi_kp_scan_vmap_nodes(void)
 
 static bool kasumi_kp_scan_legacy_vmap_list(void)
 {
-	unsigned long head_addr = kasumi_lookup_name_quiet("vmap_area_list");
+	unsigned long head_addr = kasumi_lookup_callable_quiet("vmap_area_list");
 
 	if (!kasumi_valid_kernel_addr(head_addr))
 		return false;
@@ -395,13 +396,13 @@ static bool kasumi_apatch_detect(void)
 
 	kasumi_ap_clear_symbols();
 
-	a = kasumi_lookup_name_quiet("su_get_path");
+	a = kasumi_lookup_callable_quiet("su_get_path");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_ap_su_get_path = (void *)a;
 		kasumi_ap_su_allow_uid_profile =
-			(void *)kasumi_lookup_name_quiet("su_allow_uid_profile");
+			(void *)kasumi_lookup_callable_quiet("su_allow_uid_profile");
 		kasumi_ap_get_mod_exclude =
-			(void *)kasumi_lookup_name_quiet("get_ap_mod_exclude");
+			(void *)kasumi_lookup_callable_quiet("get_ap_mod_exclude");
 		pr_info("Kasumi: APatch sucompat detected via kallsyms\n");
 		return true;
 	}
@@ -433,11 +434,11 @@ static bool kasumi_ksu_detect(void)
 	bool seen = false;
 	bool has_policy = false;
 
-	a = kasumi_lookup_name_quiet("ksu_syscall_table");
+	a = kasumi_lookup_callable_quiet("ksu_syscall_table");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_root_mask |= KASUMI_ROOT_KSU;
 		seen = true;
-		a = kasumi_lookup_name_quiet("ksu_dispatcher_nr");
+		a = kasumi_lookup_callable_quiet("ksu_dispatcher_nr");
 		if (a && kasumi_valid_kernel_addr(a)) {
 			int nr = -1;
 
@@ -449,7 +450,7 @@ static bool kasumi_ksu_detect(void)
 		}
 	}
 
-	a = kasumi_lookup_name_quiet("ksu_uid_should_umount");
+	a = kasumi_lookup_callable_quiet("ksu_uid_should_umount");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_root_mask |= KASUMI_ROOT_KSU;
 		kasumi_ksu_uid_should_umount_ptr = (void *)a;
@@ -457,7 +458,7 @@ static bool kasumi_ksu_detect(void)
 		has_policy = true;
 	}
 
-	a = kasumi_lookup_name_quiet("ksu_get_allow_list");
+	a = kasumi_lookup_callable_quiet("ksu_get_allow_list");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_root_mask |= KASUMI_ROOT_KSU;
 		kasumi_ksu_get_allow_list_ptr = (void *)a;
@@ -466,11 +467,11 @@ static bool kasumi_ksu_detect(void)
 	}
 
 	if (seen) {
-		a = kasumi_lookup_name_quiet("__ksu_is_allow_uid_for_current");
+		a = kasumi_lookup_callable_quiet("__ksu_is_allow_uid_for_current");
 		if (a && kasumi_valid_kernel_addr(a))
 			kasumi_ksu_is_allow_uid_ptr = (void *)a;
 		if (!kasumi_ksu_is_allow_uid_ptr) {
-			a = kasumi_lookup_name_quiet("__ksu_is_allow_uid");
+			a = kasumi_lookup_callable_quiet("__ksu_is_allow_uid");
 			if (a && kasumi_valid_kernel_addr(a))
 				kasumi_ksu_is_allow_uid_ptr = (void *)a;
 		}

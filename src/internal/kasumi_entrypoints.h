@@ -32,6 +32,7 @@ void kasumi_handle_sys_enter_cmdline(struct pt_regs *regs, long id);
 void kasumi_handle_sys_exit_cmdline(struct pt_regs *regs, long ret);
 
 unsigned long kasumi_lookup_name(const char *name);
+unsigned long kasumi_lookup_callable(const char *name);
 bool kasumi_should_apply_hide_rules(void);
 
 KASUMI_FILLDIR_RET_TYPE kasumi_filldir_filter(struct dir_context *ctx, const char *name,
