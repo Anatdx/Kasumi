@@ -1,0 +1,2 @@
+# Keep repository text files and working-tree checkouts on LF on every platform.
+* text=auto eol=lf

@@ -1,3 +1,12 @@
+> [!CAUTION]
+> # ⚠️ 重要警告 / IMPORTANT WARNING ⚠️
+>
+> **本项目目前存在已知或潜在的检测问题，无法保证能够规避检测。作者近期处于消极维护、低活跃开发状态，相关问题可能无法得到及时修复。继续使用本项目所造成的一切后果均由用户自行承担。在作者恢复积极维护并另行通知前，我不建议任何用户继续使用本项目。**
+>
+> **This project currently has known or potential detection issues and cannot be assumed to evade detection. The author has recently been maintaining and developing it at a low level of activity, so related problems may not be fixed promptly. You are solely responsible for any consequences resulting from continued use. I do not recommend that anyone continue using this project until the author resumes active maintenance and announces otherwise.**
+
+---
+
 # Kasumi
 
 Kasumi 是一个面向 Android GKI/Linux 的外置内核模块（LKM，产物为 `kasumi_lkm.ko`），用于 root/SU 场景下的路径控制。
