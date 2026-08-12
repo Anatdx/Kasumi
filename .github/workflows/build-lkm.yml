@@ -3,6 +3,9 @@ name: Build LKM for Kasumi
 on:
   workflow_call:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -34,6 +37,7 @@ jobs:
   merge-lkm:
     name: Merge all LKM artifacts
     needs: build-lkm
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Download all LKM artifacts
