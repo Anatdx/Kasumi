@@ -16,9 +16,7 @@
 #include "kasumi_base.h"
 #include "kasumi_types.h"
 
-extern int kasumi_syscall_nr_param;
-
-int kasumi_get_anon_fd(void);
+int kasumi_install_anon_fd(int __user *outp);
 
 unsigned long kasumi_lookup_name(const char *name);
 unsigned long kasumi_lookup_callable(const char *name);

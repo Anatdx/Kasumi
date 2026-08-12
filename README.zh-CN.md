@@ -44,7 +44,7 @@ English version： [README.md](./README.md)
 ## Hook 架构
 
 - TSR：`sys_enter` 将已注册的 syscall number 重定向到一个共享 dispatcher；dispatcher 只占用一个空闲 `ni_syscall` 表项，不再修改目标 syscall 表项
-- GET_FD：通过 TSR 路由 `reboot`/`prctl`，保留旧 kprobe 回退
+- GET_FD：通过仅 root 可用的 `reboot` kprobe 将 fd 安装排入 task work；`reboot` 与 `prctl` 均不属于 TSR 路由
 - 路径 syscall：TSR 覆盖 `openat/openat2`、`statfs`、`statx`、`newfstatat`、`faccessat`、`getxattr/lgetxattr` 与 `listxattr/llistxattr`
 - 数据面 syscall：`read`、`write`、`getdents64`、`fstatfs` 不再是 TSR 路由；cmdline、proc attr、目录遍历与 statfs 伪装分别下沉到 producer/VFS 操作层
 - KernelSU 共存：Kasumi 选择另一个空闲 dispatcher 槽位，并且不会覆盖已被其他 TSR 使用者重定向的 syscall number
@@ -95,17 +95,14 @@ ksud insmod kasumi_lkm.ko
 
 常用参数（定义于 `src/core/kasumi_bootstrap.c`）：
 
-- `kasumi_syscall_nr`
 - `kasumi_no_tracepoint=1`（禁用 TSR；虚拟路径重定向将不可用，独立的操作层功能可继续工作）
-- `kasumi_skip_vfs=1`
-- `kasumi_skip_extra_kprobes=1`
-- `kasumi_skip_getfd=1`
+- `kasumi_tsr_basic=1`（调试：仅保留 `openat/openat2` TSR 路由）
 - `kasumi_skip_kallsyms=1`
 - `kasumi_dummy_mode=1`
 
 ## 用户态控制面
 
-1. 用户态通过 GET_FD 获取匿名 fd（仅 root）。
+1. 用户态通过仅 root 可用的 `reboot` GET_FD 命令获取匿名 fd。
 2. 对该 fd 发送 `ioctl` 管理规则与特性。
 
 常用 ioctl（完整 ABI 见 `src/include/kasumi_uapi.h`）：

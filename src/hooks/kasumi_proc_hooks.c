@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
- * Kasumi - proc producer hooks and GET_FD compatibility paths.
+ * Kasumi - proc producer hooks and the reboot GET_FD entry.
  *
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
@@ -18,6 +18,7 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/task_work.h>
 #include <linux/vmalloc.h>
 #include <linux/jhash.h>
 #include <linux/file.h>
@@ -54,203 +55,99 @@
 #include "kasumi_syscall_redirect.h"
 #include "kasumi_uname.h"
 #include "kasumi_fake_mountinfo.h"
-/* override_fd/override_active live in kasumi_percpu_base. */
 
-static int kasumi_ni_syscall_pre(struct kprobe *p, struct pt_regs *regs)
+/*
+ * GET_FD uses a narrow reboot kprobe. The probe only validates scalar
+ * arguments and queues task_work; fd allocation and user access run later in
+ * normal task context before returning to userspace.
+ */
+struct kasumi_getfd_task_work {
+	struct callback_head cb;
+	int __user *outp;
+};
+
+static void kasumi_getfd_task_work_func(struct callback_head *cb)
 {
-#if defined(__aarch64__)
-	unsigned long nr = regs->regs[8];
-	unsigned long a0 = regs->regs[0];
-	unsigned long a1 = regs->regs[1];
-	unsigned long a2 = regs->regs[2];
-#elif defined(__x86_64__)
-	unsigned long nr = regs->orig_ax;
-	unsigned long a0 = regs->di;
-	unsigned long a1 = regs->si;
-	unsigned long a2 = regs->dx;
-#else
-	unsigned long nr = 0, a0 = 0, a1 = 0, a2 = 0;
-#endif
-	if (nr != (unsigned long)kasumi_syscall_nr_param)
-		return 0;
-	if (a0 != KSM_MAGIC1 || a1 != KSM_MAGIC2 || a2 != (unsigned long)KSM_CMD_GET_FD)
-		return 0;
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return 0;
-	{
-		int fd = kasumi_get_anon_fd();
-		if (fd < 0)
-			return 0;
-		kasumi_this_cpu()->override_fd = fd;
-		kasumi_this_cpu()->override_active = 1;
+	struct kasumi_getfd_task_work *tw =
+		container_of(cb, struct kasumi_getfd_task_work, cb);
+	int fd = kasumi_install_anon_fd(tw->outp);
+
+	if (fd < 0)
+		(void)put_user(fd, tw->outp);
+	module_put(THIS_MODULE);
+	kfree(tw);
+}
+
+static int kasumi_queue_getfd_task_work(int __user *outp)
+{
+	struct kasumi_getfd_task_work *tw;
+
+	if (!outp || !access_ok(outp, sizeof(*outp)))
+		return -EFAULT;
+
+	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+	if (!tw)
+		return -ENOMEM;
+	if (!try_module_get(THIS_MODULE)) {
+		kfree(tw);
+		return -ENODEV;
 	}
+
+	tw->outp = outp;
+	tw->cb.func = kasumi_getfd_task_work_func;
+	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+		module_put(THIS_MODULE);
+		kfree(tw);
+		return -ESRCH;
+	}
+
 	return 0;
 }
 
-/*
- * kretprobe handler: replace function return value (x0) with our fd.
- *
- * On aarch64 >= 4.16 the call chain is:
- *   invoke_syscall() {
- *       ret = __arm64_sys_reboot(regs);  // <-- kretprobe fires here
- *       regs->regs[0] = ret;             // stores ret into user pt_regs
- *   }
- * So we MUST modify the kretprobe's own regs->regs[0] (= function return value x0).
- * invoke_syscall will then copy our fd into the user's pt_regs.
- * Writing to real_regs directly would be overwritten by invoke_syscall.
- */
-static int kasumi_ni_syscall_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	if (!kasumi_this_cpu()->override_active)
-		return 0;
-#if defined(__aarch64__)
-	regs->regs[0] = kasumi_this_cpu()->override_fd;
-#elif defined(__x86_64__)
-	regs->ax = kasumi_this_cpu()->override_fd;
-#endif
-	kasumi_this_cpu()->override_active = 0;
-	return 0;
-}
-
-static struct kprobe kasumi_kp_ni = {
-	.pre_handler = kasumi_ni_syscall_pre,
-};
-static struct kretprobe kasumi_krp_ni = {
-	.handler = kasumi_ni_syscall_ret,
-};
-
-/*
- * GET_FD via kprobe on __arm64_sys_reboot (same as susfs/KernelSU old kprobes).
- * When userspace calls SYS_reboot(142) with our magic, we intercept and return fd in kretprobe.
- * Real reboot sees invalid magic and returns -EINVAL; we overwrite return value with fd.
- * Compatible with 5.10+; use this when ni_syscall path is not available.
- */
 static int kasumi_reboot_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	/*
-	 * On aarch64 4.16+, __arm64_sys_reboot is a wrapper: first arg (regs->regs[0])
-	 * is the pointer to the real syscall pt_regs. Read magic from there.
-	 *
-	 * We use the KernelSU approach: write fd to userspace via put_user on the
-	 * 4th syscall argument (a user pointer). This avoids kretprobe return value
-	 * issues entirely — invoke_syscall would overwrite any kretprobe changes.
-	 *
-	 * Userspace: int fd = -1; syscall(SYS_reboot, M1, M2, CMD, &fd);
-	 */
-#if defined(__aarch64__)
 	struct pt_regs *real_regs;
 	unsigned long a0, a1, a2;
-	int __user *fd_ptr;
-	int fd;
+	int __user *outp;
 
+	(void)p;
+#if defined(__aarch64__)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
 	real_regs = (struct pt_regs *)regs->regs[0];
 #else
 	real_regs = regs;
 #endif
+	if (!real_regs)
+		return 0;
 	a0 = real_regs->regs[0];
 	a1 = real_regs->regs[1];
 	a2 = real_regs->regs[2];
-
-	if (a0 != KSM_MAGIC1 || a1 != KSM_MAGIC2 || a2 != (unsigned long)KSM_CMD_GET_FD)
-		return 0;
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return 0;
-
-	fd = kasumi_get_anon_fd();
-	if (fd < 0)
-		return 0;
-
-	/* Write fd to userspace via 4th arg pointer (like KernelSU) */
-	fd_ptr = (int __user *)(unsigned long)real_regs->regs[3];
-	if (fd_ptr)
-		put_user(fd, fd_ptr);
+	outp = (int __user *)(unsigned long)real_regs->regs[3];
 #elif defined(__x86_64__)
-	unsigned long a0 = regs->di;
-	unsigned long a1 = regs->si;
-	unsigned long a2 = regs->dx;
+	real_regs = (struct pt_regs *)regs->di;
+	if (!real_regs)
+		return 0;
+	a0 = real_regs->di;
+	a1 = real_regs->si;
+	a2 = real_regs->dx;
+	outp = (int __user *)(unsigned long)real_regs->r10;
+#else
+	return 0;
+#endif
 
-	if (a0 != KSM_MAGIC1 || a1 != KSM_MAGIC2 || a2 != (unsigned long)KSM_CMD_GET_FD)
+	if (a0 != KSM_MAGIC1 || a1 != KSM_MAGIC2 ||
+	    a2 != (unsigned long)KSM_CMD_GET_FD)
 		return 0;
 	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
 		return 0;
-	{
-		int fd = kasumi_get_anon_fd();
-		if (fd < 0)
-			return 0;
-		kasumi_this_cpu()->override_fd = fd;
-		kasumi_this_cpu()->override_active = 1;
-	}
-#endif
+
+	(void)kasumi_queue_getfd_task_work(outp);
 	return 0;
 }
 
 static struct kprobe kasumi_kp_reboot = {
 	.pre_handler = kasumi_reboot_pre,
 };
-static struct kretprobe kasumi_krp_reboot = {
-	.handler = kasumi_ni_syscall_ret, /* same: replace return with fd */
-};
-
-/*
- * GET_FD via prctl (SECCOMP-safe). option=KSM_PRCTL_GET_FD, arg2=(int *) for fd.
- * No kretprobe: we put_user(fd, arg2) in pre_handler; syscall return value ignored.
- */
-static int kasumi_prctl_pre(struct kprobe *p, struct pt_regs *regs)
-{
-#if defined(__aarch64__)
-	struct pt_regs *real_regs;
-	unsigned long option;
-	unsigned long arg2;
-	int __user *fd_ptr;
-	int fd;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-	real_regs = (struct pt_regs *)regs->regs[0];
-#else
-	real_regs = regs;
-#endif
-	option = real_regs->regs[0];
-	arg2 = real_regs->regs[1];
-
-	if (option != (unsigned long)KSM_PRCTL_GET_FD)
-		return 0;
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return 0;
-
-	fd = kasumi_get_anon_fd();
-	if (fd < 0)
-		return 0;
-
-	fd_ptr = (int __user *)(unsigned long)arg2;
-	if (fd_ptr && put_user(fd, fd_ptr) != 0)
-		pr_err("Kasumi: prctl GET_FD put_user failed\n");
-#elif defined(__x86_64__)
-	unsigned long option = regs->di;
-	unsigned long arg2 = regs->si;
-
-	if (option != (unsigned long)KSM_PRCTL_GET_FD)
-		return 0;
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return 0;
-	{
-		int fd = kasumi_get_anon_fd();
-		int __user *fd_ptr;
-
-		if (fd < 0)
-			return 0;
-		fd_ptr = (int __user *)(unsigned long)arg2;
-		if (fd_ptr && put_user(fd, fd_ptr) != 0)
-			pr_err("Kasumi: prctl GET_FD put_user failed\n");
-	}
-#endif
-	return 0;
-}
-
-static struct kprobe kasumi_kp_prctl = {
-	.pre_handler = kasumi_prctl_pre,
-};
-static int kasumi_prctl_kprobe_registered;
 
 /* ======================================================================
  * cmdline spoofing: kprobe pre_handler on cmdline_proc_show
@@ -312,48 +209,7 @@ static struct kprobe kasumi_kp_cmdline = {
 int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes)
 {
 	(void)no_tracepoint;
-	if (skip_getfd)
-		pr_alert("Kasumi: skipping GET_FD kprobes (kasumi_skip_getfd=1)\n");
-
-	if (kasumi_syscall_nr_param <= 0) {
-		pr_err("Kasumi: kasumi_syscall_nr must be positive (got %d)\n", kasumi_syscall_nr_param);
-		return -EINVAL;
-	}
-
-	if (!skip_getfd && kasumi_syscall_dispatcher_nr < 0) {
-		const char *ni_names[] = { "__arm64_sys_ni_syscall", "sys_ni_syscall",
-					   "__x64_sys_ni_syscall", NULL };
-		unsigned long ni_addr = 0;
-		int i, ret;
-
-		for (i = 0; ni_names[i]; i++) {
-			ni_addr = kasumi_lookup_name(ni_names[i]);
-			if (ni_addr)
-				break;
-		}
-		if (!ni_addr) {
-			pr_err("Kasumi: ni_syscall not found\n");
-			return -ENOENT;
-		}
-		kasumi_kp_ni.addr = (kprobe_opcode_t *)ni_addr;
-		kasumi_krp_ni.kp.addr = (kprobe_opcode_t *)ni_addr;
-		ret = register_kprobe(&kasumi_kp_ni);
-		if (ret) {
-			pr_err("Kasumi: register_kprobe(ni_syscall) failed: %d\n", ret);
-			return ret;
-		}
-		ret = register_kretprobe(&kasumi_krp_ni);
-		if (ret) {
-			unregister_kprobe(&kasumi_kp_ni);
-			return ret;
-		}
-		kasumi_ni_kprobe_registered = 1;
-		pr_info("Kasumi: GET_FD via kprobe on ni_syscall (nr=%d)\n", kasumi_syscall_nr_param);
-	} else if (skip_getfd) {
-		pr_alert("Kasumi: skipping GET_FD kprobes (kasumi_skip_getfd=1)\n");
-	}
-
-	if (!skip_extra_kprobes && kasumi_syscall_dispatcher_nr < 0) {
+	if (!skip_getfd) {
 		static const char *reboot_symbols[] = {
 #if defined(__aarch64__)
 			"__arm64_sys_reboot", "sys_reboot", NULL
@@ -371,47 +227,21 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 			if (reboot_addr)
 				break;
 		}
-		if (reboot_addr) {
-			kasumi_kp_reboot.addr = (kprobe_opcode_t *)reboot_addr;
-			kasumi_krp_reboot.kp.addr = (kprobe_opcode_t *)reboot_addr;
-			kasumi_krp_reboot.maxactive = 16;
-			ret = register_kprobe(&kasumi_kp_reboot);
-			if (ret == 0) {
-				ret = register_kretprobe(&kasumi_krp_reboot);
-				if (ret)
-					unregister_kprobe(&kasumi_kp_reboot);
-				else
-					kasumi_reboot_kprobe_registered = 1;
-			}
+		if (!reboot_addr) {
+			pr_err("Kasumi: reboot syscall symbol not found\n");
+			return -ENOENT;
 		}
-	}
 
-	if (!skip_extra_kprobes && kasumi_syscall_dispatcher_nr < 0) {
-		static const char *prctl_symbols[] = {
-#if defined(__aarch64__)
-			"__arm64_sys_prctl", "sys_prctl", NULL
-#elif defined(__x86_64__)
-			"__x64_sys_prctl", "sys_prctl", NULL
-#else
-			NULL
-#endif
-		};
-		void *prctl_addr = NULL;
-		int i, ret;
-
-		for (i = 0; prctl_symbols[i]; i++) {
-			prctl_addr = (void *)kasumi_lookup_name(prctl_symbols[i]);
-			if (prctl_addr)
-				break;
+		kasumi_kp_reboot.addr = (kprobe_opcode_t *)reboot_addr;
+		ret = register_kprobe(&kasumi_kp_reboot);
+		if (ret) {
+			pr_err("Kasumi: register_kprobe(reboot) failed: %d\n", ret);
+			return ret;
 		}
-		if (prctl_addr) {
-			kasumi_kp_prctl.addr = (kprobe_opcode_t *)prctl_addr;
-			ret = register_kprobe(&kasumi_kp_prctl);
-			if (ret == 0)
-				kasumi_prctl_kprobe_registered = 1;
-		}
-	} else if (skip_extra_kprobes) {
-		pr_alert("Kasumi: skipping extra kprobes (reboot,prctl,uname,cmdline)\n");
+		kasumi_reboot_kprobe_registered = 1;
+		pr_info("Kasumi: GET_FD via reboot kprobe\n");
+	} else {
+		pr_alert("Kasumi: skipping GET_FD reboot kprobe\n");
 	}
 
 	if (kasumi_uname_init() != 0)
@@ -455,14 +285,6 @@ void kasumi_proc_hooks_exit(void)
 	kasumi_proc_read_hooks_exit();
 	if (kasumi_cmdline_kprobe_registered)
 		unregister_kprobe(&kasumi_kp_cmdline);
-	if (kasumi_prctl_kprobe_registered)
-		unregister_kprobe(&kasumi_kp_prctl);
-	if (kasumi_reboot_kprobe_registered) {
-		unregister_kretprobe(&kasumi_krp_reboot);
+	if (kasumi_reboot_kprobe_registered)
 		unregister_kprobe(&kasumi_kp_reboot);
-	}
-	if (kasumi_ni_kprobe_registered) {
-		unregister_kretprobe(&kasumi_krp_ni);
-		unregister_kprobe(&kasumi_kp_ni);
-	}
 }

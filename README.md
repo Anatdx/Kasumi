@@ -44,7 +44,7 @@ Use in controlled environments only. This module hooks selected VFS operations a
 ## Hook Overview
 
 - TSR: `sys_enter` redirects registered syscall numbers to one shared dispatcher installed in an unused `ni_syscall` table slot; target syscall-table entries are never patched
-- GET_FD path: TSR routes `reboot`/`prctl`, with legacy kprobe fallbacks
+- GET_FD path: a root-only `reboot` kprobe queues fd installation through task work; `reboot` and `prctl` are not TSR routes
 - Path syscalls: TSR covers `openat/openat2`, `statfs`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
 - Data-plane syscalls: `read`, `write`, `getdents64`, and `fstatfs` are not TSR routes; cmdline, proc attr, directory iteration, and statfs spoofing run at their producer/VFS operation layers
 - KernelSU coexistence: Kasumi selects a different unused dispatcher slot and does not overwrite a syscall number already redirected by another TSR consumer
@@ -97,17 +97,14 @@ ksud insmod kasumi_lkm.ko
 
 Common module parameters in `src/core/kasumi_bootstrap.c`:
 
-- `kasumi_syscall_nr`
 - `kasumi_no_tracepoint=1` (disable TSR; virtual path redirection is unavailable, while independent operation-level features may remain active)
-- `kasumi_skip_vfs=1`
-- `kasumi_skip_extra_kprobes=1`
-- `kasumi_skip_getfd=1`
+- `kasumi_tsr_basic=1` (debug: keep only the `openat/openat2` TSR routes)
 - `kasumi_skip_kallsyms=1`
 - `kasumi_dummy_mode=1`
 
 ## Userspace Control Plane
 
-1. Userspace obtains an anonymous fd through GET_FD (root-only).
+1. Userspace obtains an anonymous fd through the root-only `reboot` GET_FD command.
 2. Userspace sends `ioctl` on that fd to manage rules/features.
 
 Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):

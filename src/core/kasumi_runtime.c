@@ -105,9 +105,7 @@ int kasumi_mount_hide_mountinfo_registered;
 int kasumi_proc_proxy_registered;
 int kasumi_feature_enabled_mask;
 int kasumi_statfs_kretprobe_registered;
-int kasumi_ni_kprobe_registered;
 int kasumi_reboot_kprobe_registered;
-int kasumi_syscall_nr_param = 142;
 bool kasumi_vfs_use_ftrace;
 
 DECLARE_BITMAP(kasumi_path_bloom, KASUMI_BLOOM_SIZE);

@@ -64,8 +64,6 @@ extern struct kasumi_hook_stats kasumi_hook_stats;
 struct kasumi_percpu {
 	int iterate_did_swap;
 	int in_populate_inject;
-	int override_fd;
-	int override_active;
 };
 
 extern struct kasumi_percpu *kasumi_percpu_base;
@@ -121,9 +119,7 @@ extern int kasumi_mount_hide_mountinfo_registered;
 extern int kasumi_proc_proxy_registered;
 extern int kasumi_feature_enabled_mask;
 extern int kasumi_statfs_kretprobe_registered;
-extern int kasumi_ni_kprobe_registered;
 extern int kasumi_reboot_kprobe_registered;
-extern int kasumi_syscall_nr_param;
 extern bool kasumi_vfs_use_ftrace;
 extern dev_t kasumi_system_dev;
 

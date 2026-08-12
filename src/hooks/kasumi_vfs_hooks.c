@@ -953,11 +953,11 @@ int kasumi_vfs_hooks_init(bool skip_vfs)
 		kasumi_getxattr_kprobe_registered = 0;
 
 		pr_info("Kasumi: initialized (getattr=iop, readdir=fop, d_path=disabled, getxattr kprobe=disabled, GET_FD via %s)\n",
-			kasumi_syscall_dispatcher_nr >= 0 ? "TSR" : "kprobes");
+			kasumi_reboot_kprobe_registered ? "reboot kprobe" : "none");
 	} else {
 		pr_alert("Kasumi: skipping VFS hooks (kasumi_skip_vfs=1)\n");
 		pr_info("Kasumi: initialized (VFS hooks skipped, GET_FD via %s)\n",
-			kasumi_syscall_dispatcher_nr >= 0 ? "TSR" : "kprobes");
+			kasumi_reboot_kprobe_registered ? "reboot kprobe" : "none");
 	}
 #else
 	pr_info("Kasumi: initialized (GET_FD only, VFS kprobes disabled)\n");

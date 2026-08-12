@@ -60,7 +60,7 @@
 #include "kasumi_fake_selinuxfs_access.h"
 /* ======================================================================
  * Part 15: Dispatch Handler (ioctl only; all commands use KSM_IOC_* from kasumi_uapi.h)
- * GET_FD is syscall-only -> kasumi_get_anon_fd()
+ * GET_FD is delivered by reboot task_work -> kasumi_install_anon_fd()
  * ====================================================================== */
 
 static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
@@ -619,16 +619,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			return -ENOMEM;
 
 		/* GET_FD */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    (kasumi_has_syscall_hook(__NR_reboot) ||
-		     kasumi_has_syscall_hook(__NR_prctl)))
-			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: TSR\n");
-		else if (kasumi_ni_kprobe_registered)
+		if (kasumi_reboot_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "GET_FD: kprobe (ni_syscall nr=%d)\n", kasumi_syscall_nr_param);
-		else if (kasumi_reboot_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "GET_FD: kprobe (reboot nr=%d)\n", kasumi_syscall_nr_param);
+				     "GET_FD: kprobe (reboot nr=%d)\n", __NR_reboot);
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: none\n");
 		written += n;
@@ -1294,7 +1287,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 }
 
 /* ======================================================================
- * Part 17: Anonymous fd (no device node; syscall returns this fd)
+ * Part 17: Anonymous fd (no device node; reboot task_work installs it)
  * ====================================================================== */
 
 static const struct file_operations kasumi_anon_fops = {
@@ -1305,22 +1298,44 @@ static const struct file_operations kasumi_anon_fops = {
 };
 
 /**
- * kasumi_get_anon_fd - Create and return anonymous fd for Kasumi.
+ * kasumi_install_anon_fd - Install a Kasumi fd and publish its number.
+ * @outp: userspace pointer receiving the new fd
+ *
+ * The fd number is copied before fd_install(), so a failed userspace write can
+ * release both the reserved descriptor and file without requiring close_fd().
  * Returns fd on success, negative errno on failure.
  */
-int kasumi_get_anon_fd(void)
+int kasumi_install_anon_fd(int __user *outp)
 {
+	struct file *file;
 	int fd;
 	pid_t pid;
 
 	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
 		return -EPERM;
-	fd = anon_inode_getfd("kasumi", &kasumi_anon_fops, NULL, O_RDWR | O_CLOEXEC);
+	if (!outp)
+		return -EINVAL;
+
+	file = anon_inode_getfile("kasumi", &kasumi_anon_fops, NULL, O_RDWR);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)
-		return fd;
+		goto err_file;
+	if (put_user(fd, outp)) {
+		put_unused_fd(fd);
+		fd = -EFAULT;
+		goto err_file;
+	}
+
+	fd_install(fd, file);
 	pid = task_tgid_vnr(current);
 	WRITE_ONCE(kasumi_daemon_pid, pid);
-	kasumi_log("Daemon PID auto-registered: %d\n", pid);
+	kasumi_log("Controller PID auto-registered: %d\n", pid);
+	return fd;
+
+err_file:
+	fput(file);
 	return fd;
 }
-EXPORT_SYMBOL_GPL(kasumi_get_anon_fd);

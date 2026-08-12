@@ -58,9 +58,6 @@
 /* Only one syscall command: Get anonymous FD */
 #define KSM_CMD_GET_FD 0x48021
 
-/* prctl option for GET_FD (SECCOMP-safe path). arg2 = (int *) for fd output. */
-#define KSM_PRCTL_GET_FD 0x48021
-
 struct kasumi_syscall_arg {
     const char *src;
     const char *target;

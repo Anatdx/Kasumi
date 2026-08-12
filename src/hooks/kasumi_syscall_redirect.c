@@ -46,7 +46,7 @@ void *kasumi_syscall_table;
 int  kasumi_syscall_dispatcher_nr = -1;
 static int kasumi_tsr_basic_param;
 module_param_named(kasumi_tsr_basic, kasumi_tsr_basic_param, int, 0600);
-MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/openat2/reboot/prctl (skip path/stat routes) to isolate crashing handler.");
+MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/openat2 (skip path/stat routes) to isolate crashing handler.");
 
 static kasumi_syscall_hook_fn hooks[__NR_syscalls];
 static kasumi_syscall_hook_fn saved_ni_syscall;
@@ -168,80 +168,6 @@ static void kasumi_add_syscall_hook_counted(int nr, kasumi_syscall_hook_fn fn,
 #ifndef KASUMI_HIDE_PATH
 #define KASUMI_HIDE_PATH "/.kasumi_hidden_placeholder"
 #endif
-
-/* ---- GET_FD via reboot / prctl ---------------------------------------- */
-
-static long h_getfd(const struct pt_regs *regs, int nr)
-{
-#if defined(__aarch64__)
-	unsigned long a0 = regs->regs[0];
-	unsigned long a1 = regs->regs[1];
-	unsigned long a2 = regs->regs[2];
-#else
-	unsigned long a0 = regs->di;
-	unsigned long a1 = regs->si;
-	unsigned long a2 = regs->dx;
-#endif
-	int fd;
-
-	(void)nr;
-	if (a0 != KSM_MAGIC1 || a1 != KSM_MAGIC2 ||
-	    a2 != (unsigned long)KSM_CMD_GET_FD)
-		return -ENOSYS;
-
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return -ENOSYS;
-
-	fd = kasumi_get_anon_fd();
-	if (fd < 0)
-		return -ENOSYS;
-
-#if defined(__aarch64__)
-	{
-		int __user *fd_ptr = (int __user *)(unsigned long)regs->regs[3];
-		if (fd_ptr)
-			put_user(fd, fd_ptr);
-	}
-#endif
-	return fd;
-}
-
-static long h_reboot(const struct pt_regs *regs)
-{
-	long ret = h_getfd(regs, __NR_reboot);
-	return ret >= 0 ? ret : kasumi_call_original(__NR_reboot, regs);
-}
-
-static long h_prctl(const struct pt_regs *regs)
-{
-#if defined(__aarch64__)
-	unsigned long option = regs->regs[0];
-	unsigned long arg2 = regs->regs[1];
-#else
-	unsigned long option = regs->di;
-	unsigned long arg2 = regs->si;
-#endif
-
-	if (option != (unsigned long)KSM_PRCTL_GET_FD)
-		return kasumi_call_original(__NR_prctl, regs);
-
-	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return kasumi_call_original(__NR_prctl, regs);
-
-	{
-		int fd = kasumi_get_anon_fd();
-		if (fd < 0)
-			return kasumi_call_original(__NR_prctl, regs);
-#if defined(__aarch64__)
-		{
-			int __user *fd_ptr = (int __user *)(unsigned long)arg2;
-			if (fd_ptr)
-				put_user(fd, fd_ptr);
-		}
-#endif
-		return fd;
-	}
-}
 
 /* ---- path redirect + mount proxy via TSR ------------------------------- */
 
@@ -648,8 +574,6 @@ int kasumi_syscall_redirect_init(void)
 
 	kasumi_add_syscall_hook_counted(__NR_openat, h_openat, &n);
 	kasumi_add_syscall_hook_counted(__NR_openat2, h_openat2, &n);
-	kasumi_add_syscall_hook_counted(__NR_reboot, h_reboot, &n);
-	kasumi_add_syscall_hook_counted(__NR_prctl, h_prctl, &n);
 	if (!kasumi_tsr_basic_param) {
 		kasumi_add_syscall_hook_counted(__NR_statfs, h_statfs, &n);
 #ifdef __NR_statx
