@@ -22,7 +22,7 @@ English version： [README.md](./README.md)
 - 仓库形态：LKM（不是 in-tree 内核补丁）
 - 主代码目录：`src/`
 - 协议定义：`src/include/kasumi_uapi.h`
-- 当前协议版本：`KSM_PROTOCOL_VERSION = 16`
+- 当前协议版本：`KSM_PROTOCOL_VERSION = 17`
 - Hook 策略：优先使用 fop/iop/VFS 操作层 hook；TSR 只保留给当前 LKM inode 模型无法表达的虚拟路径查找
 - 已包含 `arch_ftrace_get_regs` 在 6.6+ 的兼容处理
 
@@ -114,6 +114,16 @@ ksud insmod kasumi_lkm.ko
 - `KSM_IOC_SET_UNAME`、`KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`、`KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`、`KSM_IOC_SET_MAPS_SPOOF`、`KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_REPLACE_POLICY`、`KSM_IOC_GET_POLICY`、`KSM_IOC_GET_POLICY_UIDS`
+- `KSM_IOC_RESET_POLICY`（policy 必须显式重置；`KSM_IOC_CLEAR_ALL` 保留 policy）
+
+API 17 将 owner、flags 与两张 UID 表作为一个 RCU snapshot 一次发布。热路径不会
+观察到重建一半的列表，替换失败也不会破坏旧 policy。`MANUAL` 必须配置显式 allow
+列表，deny 始终拥有最终否决权。用户态应优先使用 `KSM_IOC_REPLACE_POLICY`，并在组合
+查询 policy state 与 UID 列表时检查返回的 generation。generation 只覆盖配置的
+owner、flags 与列表；provider 检测及 `effective_owner` 是实时状态。
+policy 只能在 Kasumi disabled 状态修改。用户态必须先调用
+`KSM_IOC_SET_ENABLED(0)`，完成 SET/REPLACE/CLEAR/RESET 后再显式启用完整配置。
 
 Anatdx 本人维护的 [YukiSU](https://github.com/Anatdx/YukiSU) 提供与 KernelSU 集成的实现（C++），
 以及 Anatdx 参与开发的 [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) 元模块也加入了 Kasumi 支持与用户态实现（Rust）。

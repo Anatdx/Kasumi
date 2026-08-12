@@ -22,7 +22,7 @@
 
 #define KSM_MAGIC1 0x4B534D31  // "KSM1"
 #define KSM_MAGIC2 0x524F4F54  // "ROOT"
-#define KSM_PROTOCOL_VERSION 16
+#define KSM_PROTOCOL_VERSION 17
 
 #define KSM_MAX_LEN_PATHNAME 256
 #define KSM_FAKE_CMDLINE_SIZE 4096
@@ -73,6 +73,92 @@ struct kasumi_uid_list_arg {
     __u32 count;
     __u32 reserved;
     __aligned_u64 uids;
+};
+
+#define KSM_POLICY_API_VERSION 1
+
+/*
+ * AUTO uses the detected root provider. MANUAL is driven only by the explicit
+ * UID policy below. MAGISK is reported for diagnostics but is not currently a
+ * supported provider; use MANUAL when running on Magisk.
+ */
+#define KSM_POLICY_OWNER_AUTO       0
+#define KSM_POLICY_OWNER_KERNELSU   1
+#define KSM_POLICY_OWNER_APATCH     2
+#define KSM_POLICY_OWNER_MAGISK     3
+#define KSM_POLICY_OWNER_MANUAL     4
+#define KSM_POLICY_OWNER_DISABLED   5
+
+/* detected_roots bitmask returned by KSM_IOC_GET_POLICY. */
+#define KSM_POLICY_ROOT_KERNELSU          (1U << 0)
+#define KSM_POLICY_ROOT_KERNELSU_REDIRECT (1U << 1)
+#define KSM_POLICY_ROOT_APATCH            (1U << 2)
+#define KSM_POLICY_ROOT_MAGISK            (1U << 3)
+#define KSM_POLICY_ROOT_MULTI             (1U << 4)
+#define KSM_POLICY_ROOT_NO_PROVIDER       (1U << 5)
+
+/* DENY wins over ALLOW. INCLUDE_ISOLATED_UIDS affects non-strict app views. */
+#define KSM_POLICY_FLAG_USE_ALLOW_UIDS        (1U << 0)
+#define KSM_POLICY_FLAG_USE_DENY_UIDS         (1U << 1)
+#define KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS (1U << 2)
+
+#define KSM_POLICY_UID_LIST_ALLOW 1
+#define KSM_POLICY_UID_LIST_DENY  2
+#define KSM_POLICY_UID_LIST_ALL   3
+
+struct kasumi_policy_config_arg {
+	__u32 version;
+	__u32 size;
+	__u32 owner;
+	__u32 flags;
+	__u32 reserved[4];
+	__s32 err;
+};
+
+struct kasumi_policy_state_arg {
+	__u32 version;
+	__u32 size;
+	__u32 owner;
+	__u32 effective_owner;
+	__u32 flags;
+	__u32 detected_roots;
+	__u32 allow_count;
+	__u32 deny_count;
+	__u32 max_uid_count;
+	/* Covers configured owner, flags, and lists; provider detection is live. */
+	__aligned_u64 generation;
+	__u32 enabled;
+	__u32 reserved[3];
+	__s32 err;
+};
+
+struct kasumi_policy_uid_list_arg {
+	__u32 version;
+	__u32 size;
+	__u32 list;
+	__u32 count;
+	__u32 total;
+	__u32 reserved;
+	__aligned_u64 uids;
+	__aligned_u64 generation; /* configured-policy snapshot generation */
+	__s32 err;
+};
+
+/*
+ * Atomically replace owner, flags, and both UID lists. Userspace controllers
+ * should prefer this over the incremental SET_POLICY/SET_POLICY_UIDS ioctls.
+ */
+struct kasumi_policy_replace_arg {
+	__u32 version;
+	__u32 size;
+	__u32 owner;
+	__u32 flags;
+	__u32 allow_count;
+	__u32 deny_count;
+	__aligned_u64 allow_uids;
+	__aligned_u64 deny_uids;
+	__u32 reserved[4];
+	__s32 err;
 };
 
 /*
@@ -210,5 +296,15 @@ struct kasumi_statfs_spoof_arg {
  */
 #define KSM_IOC_SET_UNAME_GLOBAL  _IOW(KSM_IOC_MAGIC, 28, struct kasumi_spoof_uname)
 #define KSM_IOC_SELINUX_FIX       _IOW(KSM_IOC_MAGIC, 29, int)
+/* Policy mutations require SET_ENABLED(0) first and return -EBUSY otherwise. */
+#define KSM_IOC_SET_POLICY        _IOWR(KSM_IOC_MAGIC, 30, struct kasumi_policy_config_arg)
+#define KSM_IOC_SET_POLICY_OWNER  KSM_IOC_SET_POLICY
+#define KSM_IOC_SET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 31, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_CLEAR_POLICY_UIDS _IOWR(KSM_IOC_MAGIC, 32, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_GET_POLICY        _IOWR(KSM_IOC_MAGIC, 33, struct kasumi_policy_state_arg)
+#define KSM_IOC_GET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 34, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_REPLACE_POLICY    _IOWR(KSM_IOC_MAGIC, 35, struct kasumi_policy_replace_arg)
+/* Unlike CLEAR_ALL, RESET_POLICY discards the configured policy. */
+#define KSM_IOC_RESET_POLICY      _IOWR(KSM_IOC_MAGIC, 36, struct kasumi_policy_config_arg)
 
 #endif /* _KASUMI_UAPI_H */

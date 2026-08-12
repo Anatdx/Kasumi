@@ -147,7 +147,7 @@ enum kasumi_proc_proxy_kind {
 
 static enum kasumi_proc_proxy_kind kasumi_proc_proxy_kind_for_path(const char *path)
 {
-	if (!kasumi_root_allows_spoofing() || !kasumi_should_apply_hide_rules())
+	if (!kasumi_should_apply_hide_rules())
 		return KASUMI_PROC_PROXY_NONE;
 	if ((kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) &&
 	    kasumi_path_is_proc_mountinfo(path))
@@ -170,7 +170,7 @@ bool kasumi_proc_proxy_should_try(void)
 {
 	if (!READ_ONCE(kasumi_proc_proxy_registered))
 		return false;
-	if (!kasumi_root_allows_spoofing() || !kasumi_should_apply_hide_rules())
+	if (!kasumi_should_apply_hide_rules())
 		return false;
 	return (kasumi_feature_enabled_mask &
 		(KSM_FEATURE_MOUNT_HIDE | KSM_FEATURE_MAPS_SPOOF)) != 0;

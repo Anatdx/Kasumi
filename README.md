@@ -22,7 +22,7 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - Repository type: LKM (not an in-tree kernel patch set)
 - Main code: `src/`
 - Control protocol: `src/include/kasumi_uapi.h`
-- Current protocol version: `KSM_PROTOCOL_VERSION = 16`
+- Current protocol version: `KSM_PROTOCOL_VERSION = 17`
 - Hook strategy: operation-level fop/iop/VFS hooks first; TSR is limited to virtual-path lookups that cannot yet be represented by the current LKM inode model
 - 6.6+ compatibility for `arch_ftrace_get_regs` is included in current code
 
@@ -116,6 +116,19 @@ Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
 - `KSM_IOC_SET_UNAME`, `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_REPLACE_POLICY`, `KSM_IOC_GET_POLICY`, `KSM_IOC_GET_POLICY_UIDS`
+- `KSM_IOC_RESET_POLICY` (policy reset is explicit; `KSM_IOC_CLEAR_ALL` preserves policy)
+
+API 17 publishes owner, flags, and both UID lists as one RCU snapshot. Readers
+never observe a partially rebuilt list, and a failed replacement leaves the
+previous policy active. `MANUAL` requires an explicit allow list; deny entries
+always win. Userspace should prefer `KSM_IOC_REPLACE_POLICY` over incremental
+policy updates and use the returned generation when combining state and UID
+list queries. The generation covers configured owner, flags, and lists;
+provider detection and `effective_owner` are live status fields.
+Policy mutations are accepted only while Kasumi is disabled. Userspace must
+issue `KSM_IOC_SET_ENABLED(0)` before SET/REPLACE/CLEAR/RESET, then explicitly
+enable the completed configuration.
 
 You can use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
 In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) meta-module includes Kasumi support with a Rust userspace implementation.

@@ -48,6 +48,7 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
 #include "kasumi_syscall_redirect.h"
@@ -62,6 +63,290 @@
  * Part 15: Dispatch Handler (ioctl only; all commands use KSM_IOC_* from kasumi_uapi.h)
  * GET_FD is delivered by reboot task_work -> kasumi_install_anon_fd()
  * ====================================================================== */
+
+static bool kasumi_policy_header_valid(u32 version, u32 size, size_t min_size)
+{
+	return version == KSM_POLICY_API_VERSION && size >= min_size;
+}
+
+static bool kasumi_u32_reserved_zero(const u32 *reserved, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		if (reserved[i])
+			return false;
+	return true;
+}
+
+static int kasumi_ioctl_set_policy(void __user *arg)
+{
+	struct kasumi_policy_config_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_set_policy_owner(a.owner, a.flags);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy(void __user *arg)
+{
+	struct kasumi_policy_state_arg input;
+	struct kasumi_policy_state_arg a = { };
+	int ret = 0;
+
+	if (copy_from_user(&input, arg, sizeof(input)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(input.version, input.size,
+					sizeof(input)) ||
+	    input.enabled ||
+	    !kasumi_u32_reserved_zero(input.reserved,
+				      ARRAY_SIZE(input.reserved)))
+		ret = -EINVAL;
+	else
+		kasumi_policy_get_state(&a);
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_set_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	u32 *uids = NULL;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.reserved || a.generation || a.total ||
+	    (!a.count && a.uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if (a.count) {
+		if (!a.uids) {
+			ret = -EINVAL;
+			goto out;
+		}
+		uids = kmalloc_array(a.count, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(uids,
+				   (const void __user *)(unsigned long)a.uids,
+				   a.count * sizeof(*uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = kasumi_replace_policy_uid_list(a.list, uids, a.count);
+	if (!ret) {
+		u32 copied;
+
+		ret = kasumi_policy_copy_uids(a.list, NULL, 0, &copied,
+					      &a.total, &a.generation);
+	}
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		ret = -EFAULT;
+	kfree(uids);
+	return ret;
+}
+
+static int kasumi_ioctl_clear_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.reserved || a.generation || a.count || a.total || a.uids)
+		ret = -EINVAL;
+	else
+		ret = kasumi_clear_policy_uid_list(a.list);
+	a.count = 0;
+	a.total = 0;
+	if (!ret) {
+		struct kasumi_policy_state_arg state = { };
+
+		kasumi_policy_get_state(&state);
+		a.generation = state.generation;
+	}
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg input;
+	struct kasumi_policy_uid_list_arg a = { };
+	u32 *uids = NULL;
+	u32 copied = 0;
+	u32 total = 0;
+	u64 generation = 0;
+	int ret = 0;
+
+	if (copy_from_user(&input, arg, sizeof(input)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(input.version, input.size,
+					sizeof(input)) || input.reserved ||
+	    input.generation || input.total || (!input.count && input.uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (input.count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if (input.count && !input.uids) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (input.count) {
+		uids = kmalloc_array(input.count, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	ret = kasumi_policy_copy_uids(input.list, uids, input.count,
+				      &copied, &total, &generation);
+	if (!ret && copied &&
+	    copy_to_user((void __user *)(unsigned long)input.uids, uids,
+			 copied * sizeof(*uids)))
+		ret = -EFAULT;
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.list = input.list;
+	a.count = copied;
+	a.total = total;
+	a.uids = input.uids;
+	a.generation = generation;
+	a.err = ret;
+	kfree(uids);
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_replace_policy(void __user *arg)
+{
+	struct kasumi_policy_replace_arg a;
+	u32 *allow_uids = NULL;
+	u32 *deny_uids = NULL;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.allow_count > KASUMI_ALLOWLIST_UID_MAX ||
+	    a.deny_count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if ((a.allow_count && !a.allow_uids) ||
+	    (a.deny_count && !a.deny_uids) ||
+	    (!a.allow_count && a.allow_uids) ||
+	    (!a.deny_count && a.deny_uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.allow_count) {
+		allow_uids = kmalloc_array(a.allow_count, sizeof(*allow_uids),
+					   GFP_KERNEL);
+		if (!allow_uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(allow_uids,
+				   (const void __user *)(unsigned long)a.allow_uids,
+				   a.allow_count * sizeof(*allow_uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	if (a.deny_count) {
+		deny_uids = kmalloc_array(a.deny_count, sizeof(*deny_uids),
+					  GFP_KERNEL);
+		if (!deny_uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(deny_uids,
+				   (const void __user *)(unsigned long)a.deny_uids,
+				   a.deny_count * sizeof(*deny_uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = kasumi_policy_replace(a.owner, a.flags, allow_uids, a.allow_count,
+				    deny_uids, a.deny_count);
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		ret = -EFAULT;
+	kfree(allow_uids);
+	kfree(deny_uids);
+	return ret;
+}
+
+static int kasumi_ioctl_reset_policy(void __user *arg)
+{
+	struct kasumi_policy_config_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.owner || a.flags ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_policy_reset();
+	a.owner = KSM_POLICY_OWNER_AUTO;
+	a.flags = 0;
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
 
 static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 {
@@ -94,6 +379,21 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
+	if (cmd == KSM_IOC_SET_POLICY)
+		return kasumi_ioctl_set_policy(arg);
+	if (cmd == KSM_IOC_GET_POLICY)
+		return kasumi_ioctl_get_policy(arg);
+	if (cmd == KSM_IOC_SET_POLICY_UIDS)
+		return kasumi_ioctl_set_policy_uids(arg);
+	if (cmd == KSM_IOC_CLEAR_POLICY_UIDS)
+		return kasumi_ioctl_clear_policy_uids(arg);
+	if (cmd == KSM_IOC_GET_POLICY_UIDS)
+		return kasumi_ioctl_get_policy_uids(arg);
+	if (cmd == KSM_IOC_REPLACE_POLICY)
+		return kasumi_ioctl_replace_policy(arg);
+	if (cmd == KSM_IOC_RESET_POLICY)
+		return kasumi_ioctl_reset_policy(arg);
+
 	if (cmd == KSM_IOC_SET_DEBUG) {
 		int val;
 		if (copy_from_user(&val, arg, sizeof(val)))
@@ -116,12 +416,15 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		int val;
 		if (copy_from_user(&val, arg, sizeof(val)))
 			return -EFAULT;
+		if (val && !kasumi_policy_prepare_enable())
+			return -ENODEV;
 		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = !!val;
+		WRITE_ONCE(kasumi_enabled, !!val);
+		if (!kasumi_enabled)
+			kasumi_policy_disable_provider_locked();
 		mutex_unlock(&kasumi_config_mutex);
-		kasumi_log("Kasumi %s\n", kasumi_enabled ? "enabled" : "disabled");
-		if (kasumi_enabled)
-			kasumi_reload_ksu_allowlist();
+		kasumi_log("Kasumi %s\n", READ_ONCE(kasumi_enabled) ?
+			   "enabled" : "disabled");
 		return 0;
 	}
 
@@ -470,7 +773,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				 existing->target_ino, existing->spoofed_ino);
 		}
 
-		kasumi_enabled = true;
 		mutex_unlock(&kasumi_config_mutex);
 
 		k->err = 0;
@@ -831,19 +1133,18 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			kfree(mat_src);
 			kfree(mat_tgt);
 		}
-		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = true;
-		mutex_unlock(&kasumi_config_mutex);
 		break;
 	}
 
 	case KSM_IOC_ADD_RULE: {
 		char *parent_dir = NULL;
 		char *resolved_src = NULL;
+		struct kasumi_entry *new_entry = NULL;
 		struct path path;
 		struct inode *src_inode = NULL;
 		struct inode *parent_inode = NULL;
 		struct inode *target_inode = NULL;
+		bool install_side_effects = true;
 		char *tmp_buf;
 
 		if (!src || !target) { ret = -EINVAL; break; }
@@ -915,63 +1216,78 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 
 		hash = full_name_hash(NULL, src, strlen(src));
+		new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+		if (!new_entry) {
+			ret = -ENOMEM;
+			goto add_rule_done;
+		}
+		new_entry->src = kstrdup(src, GFP_KERNEL);
+		new_entry->target = kstrdup(target, GFP_KERNEL);
+		new_entry->type = req.type;
+		new_entry->src_hash = hash;
+		if (!new_entry->src || !new_entry->target) {
+			ret = -ENOMEM;
+			goto add_rule_done;
+		}
+
 		mutex_lock(&kasumi_config_mutex);
 
 		hlist_for_each_entry(entry,
 			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 			if (entry->src_hash == hash && strcmp(entry->src, src) == 0) {
-				char *old_t = entry->target;
-				char *new_t = kstrdup(target, GFP_KERNEL);
-				if (new_t) {
-					hlist_del_rcu(&entry->target_node);
-					rcu_assign_pointer(entry->target, new_t);
-					entry->type = req.type;
-					hlist_add_head_rcu(&entry->target_node,
-						&kasumi_targets[hash_min(
-							full_name_hash(NULL, new_t, strlen(new_t)),
-							KASUMI_HASH_BITS)]);
-					kfree(old_t);
+				hlist_add_head_rcu(&new_entry->node,
+					&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+				hlist_add_head_rcu(&new_entry->target_node,
+					&kasumi_targets[hash_min(
+						full_name_hash(NULL, new_entry->target,
+							       strlen(new_entry->target)),
+						KASUMI_HASH_BITS)]);
+				hlist_del_rcu(&entry->node);
+				hlist_del_rcu(&entry->target_node);
+				install_side_effects =
+					strcmp(entry->target, new_entry->target) != 0;
+				if (install_side_effects) {
+					kasumi_clear_inode_flags_for_path(
+						entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
+					(void)kasumi_dop_uninstall_path(entry->target);
+					(void)kasumi_xattr_sid_uninstall_path_ancestors(
+						entry->target);
 				}
+				call_rcu(&entry->rcu, kasumi_entry_free_rcu);
+				new_entry = NULL;
 				found = true;
+				kasumi_log("replace rule: src=%s, target=%s, type=%d\n",
+					   src, target, req.type);
 				break;
 			}
 		}
 		if (!found) {
-			entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-			if (entry) {
-				entry->src = kstrdup(src, GFP_KERNEL);
-				entry->target = kstrdup(target, GFP_KERNEL);
-				entry->type = req.type;
-				entry->src_hash = hash;
-				if (entry->src && entry->target) {
-					unsigned long h1, h2;
-					hlist_add_head_rcu(&entry->node,
-						&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
-					hlist_add_head_rcu(&entry->target_node,
-						&kasumi_targets[hash_min(
-							full_name_hash(NULL, entry->target,
-								strlen(entry->target)),
-							KASUMI_HASH_BITS)]);
-					h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
-					h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
-					set_bit(h1, kasumi_path_bloom);
-					set_bit(h2, kasumi_path_bloom);
-					atomic_inc(&kasumi_rule_count);
-					kasumi_log("add rule: src=%s, target=%s, type=%d\n", src, target, req.type);
-				} else {
-					kfree(entry->src);
-					kfree(entry->target);
-					kfree(entry);
-				}
-			}
+			unsigned long h1, h2;
+
+			hlist_add_head_rcu(&new_entry->node,
+				&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+			hlist_add_head_rcu(&new_entry->target_node,
+				&kasumi_targets[hash_min(
+					full_name_hash(NULL, new_entry->target,
+						       strlen(new_entry->target)),
+					KASUMI_HASH_BITS)]);
+			h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
+			h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
+			set_bit(h1, kasumi_path_bloom);
+			set_bit(h2, kasumi_path_bloom);
+			atomic_inc(&kasumi_rule_count);
+			new_entry = NULL;
+			kasumi_log("add rule: src=%s, target=%s, type=%d\n",
+				   src, target, req.type);
 		}
 		mutex_unlock(&kasumi_config_mutex);
 
-		if (parent_dir) {
+		if (install_side_effects && parent_dir) {
 			kasumi_mark_dir_has_inject(parent_dir);
 			kasumi_add_inject_rule(parent_dir);
+			parent_dir = NULL;
 		}
-		if (target && kasumi_kern_path &&
+		if (install_side_effects && target && kasumi_kern_path &&
 		    kasumi_kern_path(target, LOOKUP_FOLLOW, &path) == 0) {
 			if (path.dentry && d_inode(path.dentry)) {
 				target_inode = d_inode(path.dentry);
@@ -992,14 +1308,17 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		/* Do not mark redirect source as hidden: we do not inject a virtual
 		 * entry for simple ADD_RULE, so hiding would make the file disappear
 		 * from the listing. Open of the path is still redirected by exact TSR. */
+add_rule_done:
+		if (new_entry) {
+			kfree(new_entry->src);
+			kfree(new_entry->target);
+			kfree(new_entry);
+		}
+		kfree(parent_dir);
 		if (src_inode)
 			iput(src_inode);
 		if (parent_inode)
 			iput(parent_inode);
-
-		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = true;
-		mutex_unlock(&kasumi_config_mutex);
 		break;
 	}
 
@@ -1096,7 +1415,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				}
 			}
 		}
-		kasumi_enabled = true;
 		mutex_unlock(&kasumi_config_mutex);
 		if (parent_dir) {
 			kasumi_mark_dir_has_inject(parent_dir);
@@ -1133,7 +1451,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 					kasumi_log("hide xattrs for sb %p (path: %s)\n", sb, src);
 				}
 			}
-			kasumi_enabled = true;
 			mutex_unlock(&kasumi_config_mutex);
 			kasumi_path_put(&path);
 		} else {
@@ -1244,11 +1561,20 @@ del_done:
  * Part 16: Ioctl Handler
  * ====================================================================== */
 
+/*
+ * Rule updates have side effects outside kasumi_config_mutex (inode/dentry
+ * overrides and injected-directory state). Serialize the control plane so a
+ * concurrent CLEAR_ALL cannot return while an older update is still applying
+ * those side effects or re-enable the module afterwards.
+ */
+static DEFINE_MUTEX(kasumi_ioctl_mutex);
+
 static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 					unsigned long arg)
 {
 	long ret;
 
+	mutex_lock(&kasumi_ioctl_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
 	switch (cmd) {
 	case KSM_IOC_GET_VERSION:
@@ -1274,6 +1600,13 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_SET_MAPS_SPOOF:
 	case KSM_IOC_SET_STATFS_SPOOF:
 	case KSM_IOC_SELINUX_FIX:
+	case KSM_IOC_SET_POLICY_OWNER:
+	case KSM_IOC_SET_POLICY_UIDS:
+	case KSM_IOC_CLEAR_POLICY_UIDS:
+	case KSM_IOC_GET_POLICY:
+	case KSM_IOC_GET_POLICY_UIDS:
+	case KSM_IOC_REPLACE_POLICY:
+	case KSM_IOC_RESET_POLICY:
 	case KSM_IOC_ADD_SPOOF_KSTAT:
 	case KSM_IOC_UPDATE_SPOOF_KSTAT:
 		ret = kasumi_dispatch_cmd(cmd, (void __user *)arg);
@@ -1283,6 +1616,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
+	mutex_unlock(&kasumi_ioctl_mutex);
 	return ret;
 }
 

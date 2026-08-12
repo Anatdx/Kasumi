@@ -17,6 +17,7 @@
 #include "kasumi_bootstrap.h"
 #include "kasumi_runtime.h"
 #include "kasumi_root_detection.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_store.h"
 #include "kasumi_file_view.h"
 #include "kasumi_entrypoints.h"
@@ -48,6 +49,11 @@ MODULE_PARM_DESC(kasumi_skip_kallsyms, "1=skip kallsyms resolution, use per-symb
 static int kasumi_dummy_mode_param;
 module_param_named(kasumi_dummy_mode, kasumi_dummy_mode_param, int, 0600);
 MODULE_PARM_DESC(kasumi_dummy_mode, "1=exit immediately after init starts (for testing).");
+
+static char kasumi_owner_nonce[33];
+module_param_string(kasumi_owner_nonce, kasumi_owner_nonce,
+		    sizeof(kasumi_owner_nonce), 0400);
+MODULE_PARM_DESC(kasumi_owner_nonce, "Per-load userspace ownership token.");
 
 static noinline KASUMI_NOCFI void kasumi_resolve_system_dev(void)
 {
@@ -140,31 +146,6 @@ static int kasumi_resolve_runtime_symbols(void)
 	}
 	if (!kasumi_free_inode_nonrcu_ptr)
 		pr_warn("Kasumi: free_inode_nonrcu not found, sop fallback disabled\n");
-	if (!kasumi_filp_open || !kasumi_kernel_read)
-		pr_warn("Kasumi: filp_open/kernel_read not found, allowlist disabled\n");
-
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_callable("ksu_uid_should_umount");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_uid_should_umount_ptr = (kasumi_ksu_uid_should_umount_fn)addr;
-	}
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid_for_current");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing() && !kasumi_ksu_is_allow_uid_ptr) {
-		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-
 	if (!kasumi_vfs_getattr || !kasumi_dentry_open)
 		pr_warn("Kasumi: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
 	if (!kasumi_d_absolute_path && !kasumi_dentry_path_raw)
@@ -313,6 +294,7 @@ void kasumi_bootstrap_exit(void)
 
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();
+	kasumi_policy_shutdown_locked();
 	old_cmdline = rcu_dereference_protected(kasumi_spoof_cmdline_ptr,
 						lockdep_is_held(&kasumi_config_mutex));
 	rcu_assign_pointer(kasumi_spoof_cmdline_ptr, NULL);

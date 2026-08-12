@@ -46,6 +46,7 @@
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
 #include "kasumi_file_view.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_dop_override.h"
 #include "kasumi_xattr_sid_override.h"
 #include "kasumi_fop_override.h"
@@ -68,7 +69,6 @@ unsigned long (*kasumi_kallsyms_lookup_name)(const char *name);
 DEFINE_HASHTABLE(kasumi_paths, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_targets, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_hide_paths, KASUMI_HASH_BITS);
-DEFINE_XARRAY(kasumi_allow_uids_xa);
 DEFINE_HASHTABLE(kasumi_inject_dirs, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_xattr_sbs, KASUMI_HASH_BITS);
 DEFINE_HASHTABLE(kasumi_merge_dirs, KASUMI_HASH_BITS);
@@ -81,8 +81,6 @@ DEFINE_MUTEX(kasumi_config_mutex);
 LIST_HEAD(kasumi_maps_rules);
 DEFINE_MUTEX(kasumi_maps_mutex);
 
-bool kasumi_allowlist_loaded;
-kasumi_ksu_is_allow_uid_fn kasumi_ksu_is_allow_uid_ptr;
 kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 
 bool kasumi_debug_enabled;
@@ -135,7 +133,6 @@ long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t si
 void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 			     rcu_callback_t func);
 void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
-kasumi_ksu_get_allow_list_fn kasumi_ksu_get_allow_list_ptr;
 
 bool kasumi_valid_kernel_addr(unsigned long addr)
 {
@@ -453,10 +450,12 @@ void kasumi_cleanup_locked(void)
 	struct hlist_node *tmp;
 	int bkt;
 
-	kasumi_enabled = false;
+	WRITE_ONCE(kasumi_enabled, false);
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
 	kasumi_file_view_clear();
+	/* Stop provider calls and release any external module reference. */
+	kasumi_policy_disable_provider_locked();
 
 	hash_for_each_safe(kasumi_paths, bkt, tmp, entry, node) {
 		kasumi_clear_inode_flags_for_path(entry->src, AS_FLAGS_KASUMI_HIDE);
@@ -472,7 +471,6 @@ void kasumi_cleanup_locked(void)
 		hlist_del_rcu(&hide_entry->node);
 		call_rcu(&hide_entry->rcu, kasumi_hide_entry_free_rcu);
 	}
-	xa_destroy(&kasumi_allow_uids_xa);
 	hash_for_each_safe(kasumi_inject_dirs, bkt, tmp, inject_entry, node) {
 		kasumi_clear_inode_flags_for_path(inject_entry->dir, AS_FLAGS_KASUMI_DIR_HAS_INJECT);
 		hlist_del_rcu(&inject_entry->node);
@@ -508,5 +506,4 @@ void kasumi_cleanup_locked(void)
 	bitmap_zero(kasumi_hide_bloom, KASUMI_BLOOM_SIZE);
 	atomic_set(&kasumi_rule_count, 0);
 	atomic_set(&kasumi_hide_count, 0);
-	kasumi_allowlist_loaded = false;
 }

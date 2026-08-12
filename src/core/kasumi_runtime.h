@@ -88,14 +88,9 @@ void kasumi_resolve_kallsyms_lookup(void);
 int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *source_inode);
 int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path);
 
-typedef bool (*kasumi_ksu_is_allow_uid_fn)(uid_t uid);
 typedef bool (*kasumi_ksu_uid_should_umount_fn)(uid_t uid);
-typedef bool (*kasumi_ksu_get_allow_list_fn)(int *array, u16 length, u16 *out_length,
-					   u16 *out_total, bool allow);
 
-extern kasumi_ksu_is_allow_uid_fn kasumi_ksu_is_allow_uid_ptr;
 extern kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
-extern kasumi_ksu_get_allow_list_fn kasumi_ksu_get_allow_list_ptr;
 
 extern bool kasumi_stealth_enabled;
 extern char kasumi_mirror_path_buf[PATH_MAX];
