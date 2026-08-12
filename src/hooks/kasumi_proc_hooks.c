@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
- * Kasumi - proc, mountinfo, maps, and read-path hooks layered over syscall flow.
+ * Kasumi - proc producer hooks and GET_FD compatibility paths.
  *
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
@@ -54,7 +54,7 @@
 #include "kasumi_syscall_redirect.h"
 #include "kasumi_uname.h"
 #include "kasumi_fake_mountinfo.h"
-/* override_fd/override_active and cmdline_ctx now in kasumi_percpu_base */
+/* override_fd/override_active live in kasumi_percpu_base. */
 
 static int kasumi_ni_syscall_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -309,33 +309,6 @@ static struct kprobe kasumi_kp_cmdline = {
 	.pre_handler = kasumi_cmdline_pre,
 };
 
-/* kretprobe fallback for cmdline when TSR read hook is unavailable */
-static int kasumi_cmdline_read_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	kasumi_handle_sys_enter_cmdline(regs, __NR_read);
-	return 0;
-}
-
-static int kasumi_cmdline_read_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	long ret;
-#if defined(__aarch64__)
-	ret = (long)regs->regs[0];
-#elif defined(__x86_64__)
-	ret = (long)regs->ax;
-#else
-	ret = 0;
-#endif
-	kasumi_handle_sys_exit_cmdline(regs, ret);
-	return 0;
-}
-
-static struct kretprobe kasumi_krp_cmdline_read = {
-	.entry_handler = kasumi_cmdline_read_entry,
-	.handler = kasumi_cmdline_read_ret,
-	.maxactive = 64,
-};
-
 int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes)
 {
 	(void)no_tracepoint;
@@ -446,46 +419,20 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 
 	if (!skip_extra_kprobes) {
 		int ret;
+		unsigned long cmdline_addr = kasumi_lookup_name("cmdline_proc_show");
 
-		if (kasumi_syscall_dispatcher_nr < 0 ||
-		    !kasumi_has_syscall_hook(__NR_read)) {
-			const char *read_sym =
-#if defined(__aarch64__)
-				"__arm64_sys_read";
-#elif defined(__x86_64__)
-				"__x64_sys_read";
-#else
-				NULL;
-#endif
-			unsigned long read_addr = read_sym ? kasumi_lookup_name(read_sym) : 0;
-
-			if (read_addr) {
-				kasumi_krp_cmdline_read.kp.addr = (kprobe_opcode_t *)read_addr;
-				ret = register_kretprobe(&kasumi_krp_cmdline_read);
-				if (ret == 0) {
-					pr_info("Kasumi: cmdline spoofing via kretprobe on %s\n", read_sym);
-					kasumi_cmdline_kretprobe_registered = 1;
-				}
-			}
-			if (!kasumi_cmdline_kretprobe_registered) {
-				unsigned long cmdline_addr = kasumi_lookup_name("cmdline_proc_show");
-
-				if (cmdline_addr) {
-					kasumi_kp_cmdline.addr = (kprobe_opcode_t *)cmdline_addr;
-					ret = register_kprobe(&kasumi_kp_cmdline);
-					if (ret == 0) {
-						pr_info("Kasumi: cmdline spoofing via kprobe on cmdline_proc_show\n");
-						kasumi_cmdline_kprobe_registered = 1;
-					} else {
-						pr_warn("Kasumi: register_kprobe(cmdline_proc_show) failed: %d\n",
-							ret);
-					}
-				} else {
-					pr_warn("Kasumi: cmdline_proc_show not found, cmdline spoofing disabled\n");
-				}
+		if (cmdline_addr) {
+			kasumi_kp_cmdline.addr = (kprobe_opcode_t *)cmdline_addr;
+			ret = register_kprobe(&kasumi_kp_cmdline);
+			if (ret == 0) {
+				pr_info("Kasumi: cmdline spoofing via cmdline_proc_show\n");
+				kasumi_cmdline_kprobe_registered = 1;
+			} else {
+				pr_warn("Kasumi: register_kprobe(cmdline_proc_show) failed: %d\n",
+					ret);
 			}
 		} else {
-			pr_info("Kasumi: cmdline spoofing via TSR read route\n");
+			pr_warn("Kasumi: cmdline_proc_show not found, cmdline spoofing disabled\n");
 		}
 	}
 
@@ -502,12 +449,10 @@ void kasumi_proc_hooks_exit(void)
 	 * dispatcher slot in PHASE 1 (before any
 	 * handler-reachable resource is freed) so that proc-fd proxies, fake
 	 * mountinfo, and other state cleaned up below cannot be raced against
-	 * by a high-frequency syscall (read/openat) still being dispatched into
+	 * by openat still being dispatched into
 	 * our redirect.
 	 */
 	kasumi_proc_read_hooks_exit();
-	if (kasumi_cmdline_kretprobe_registered)
-		unregister_kretprobe(&kasumi_krp_cmdline_read);
 	if (kasumi_cmdline_kprobe_registered)
 		unregister_kprobe(&kasumi_kp_cmdline);
 	if (kasumi_prctl_kprobe_registered)

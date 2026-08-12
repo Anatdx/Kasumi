@@ -15,6 +15,7 @@
 
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/kprobes.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/namei.h>
@@ -84,6 +85,85 @@ static struct kasumi_selinuxfs_txn_meta __rcu *kasumi_selinuxfs_status_meta;
 static DEFINE_SPINLOCK(kasumi_selinuxfs_lock);
 static bool kasumi_selinuxfs_ready;
 static struct page *kasumi_selinuxfs_status_page;
+static bool kasumi_proc_attr_write_registered;
+static bool kasumi_selinuxfs_sensitive_context(char *context);
+
+static KASUMI_NOCFI int kasumi_proc_attr_write_pre(struct kprobe *p,
+						   struct pt_regs *regs)
+{
+	struct file *file;
+	struct dentry *dentry, *parent;
+	const char __user *buf;
+	size_t count;
+	char context[KASUMI_SELINUX_CTX_MAX];
+
+	(void)p;
+	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
+	    !kasumi_current_is_selinux_guard_target() ||
+	    !kasumi_copy_from_user_nofault)
+		return 0;
+
+#if defined(__aarch64__)
+	file = (struct file *)regs->regs[0];
+	buf = (const char __user *)(uintptr_t)regs->regs[1];
+	count = (size_t)regs->regs[2];
+#elif defined(__x86_64__)
+	file = (struct file *)regs->di;
+	buf = (const char __user *)(uintptr_t)regs->si;
+	count = (size_t)regs->dx;
+#else
+	return 0;
+#endif
+	if (!file || !buf || count == 0 || count >= sizeof(context))
+		return 0;
+
+	dentry = file->f_path.dentry;
+	parent = dentry ? dentry->d_parent : NULL;
+	if (!dentry || !parent ||
+	    dentry->d_name.len != 7 ||
+	    memcmp(dentry->d_name.name, "current", 7) != 0 ||
+	    parent->d_name.len != 4 ||
+	    memcmp(parent->d_name.name, "attr", 4) != 0)
+		return 0;
+	if (kasumi_copy_from_user_nofault(context, buf, count) != 0)
+		return 0;
+	context[count] = '\0';
+	if (!kasumi_selinuxfs_sensitive_context(context))
+		return 0;
+
+	kasumi_log("fake_selinuxfs: rejected attr/current write pid=%d uid=%u comm=%s\n",
+		   task_tgid_vnr(current), __kuid_val(current_uid()), current->comm);
+#if defined(__aarch64__)
+	instruction_pointer_set(regs, regs->regs[30]);
+	regs->regs[0] = (unsigned long)-EINVAL;
+#elif defined(__x86_64__)
+	instruction_pointer_set(regs, *(unsigned long *)regs->sp);
+	regs->sp += sizeof(unsigned long);
+	regs->ax = (unsigned long)-EINVAL;
+#endif
+	return 1;
+}
+
+static struct kprobe kasumi_kp_proc_attr_write = {
+	.pre_handler = kasumi_proc_attr_write_pre,
+};
+
+static int kasumi_fake_selinuxfs_proc_attr_init(void)
+{
+	unsigned long addr;
+	int ret;
+
+	addr = kasumi_lookup_name("proc_pid_attr_write");
+	if (!addr)
+		return -ENOENT;
+	kasumi_kp_proc_attr_write.addr = (kprobe_opcode_t *)addr;
+	ret = register_kprobe(&kasumi_kp_proc_attr_write);
+	if (ret)
+		return ret;
+	WRITE_ONCE(kasumi_proc_attr_write_registered, true);
+	pr_info("Kasumi: fake_selinuxfs attr/current filter via proc_pid_attr_write\n");
+	return 0;
+}
 
 static int kasumi_selinuxfs_init_status_page(void)
 {
@@ -581,9 +661,18 @@ bool kasumi_fake_selinuxfs_status_active(void)
 	       rcu_access_pointer(kasumi_selinuxfs_status_meta) != NULL;
 }
 
+bool kasumi_fake_selinuxfs_proc_attr_active(void)
+{
+	return READ_ONCE(kasumi_proc_attr_write_registered);
+}
+
 int kasumi_fake_selinuxfs_access_init(void)
 {
-	int access_ret, context_ret, status_ret;
+	int access_ret, context_ret, status_ret, attr_ret;
+
+	attr_ret = kasumi_fake_selinuxfs_proc_attr_init();
+	if (attr_ret)
+		pr_warn("Kasumi: proc attr/current filter unavailable: %d\n", attr_ret);
 
 	status_ret = kasumi_selinuxfs_init_status_page();
 	if (status_ret)
@@ -610,11 +699,13 @@ int kasumi_fake_selinuxfs_access_init(void)
 									KASUMI_SELINUXFS_STATUS);
 	}
 
-	if (access_ret || context_ret || status_ret)
-		pr_warn("Kasumi: fake_selinuxfs partial install (access=%d context=%d status=%d)\n",
-			access_ret, context_ret, status_ret);
-	return kasumi_fake_selinuxfs_access_active() ? 0 :
-	       (access_ret ? access_ret : (context_ret ? context_ret : status_ret));
+	if (access_ret || context_ret || status_ret || attr_ret)
+		pr_warn("Kasumi: fake_selinuxfs partial install (access=%d context=%d status=%d attr=%d)\n",
+			access_ret, context_ret, status_ret, attr_ret);
+	return (kasumi_fake_selinuxfs_access_active() ||
+		kasumi_fake_selinuxfs_proc_attr_active()) ? 0 :
+	       (access_ret ? access_ret : (context_ret ? context_ret :
+		(status_ret ? status_ret : attr_ret)));
 }
 
 static void kasumi_fake_selinuxfs_uninstall_slot(struct kasumi_selinuxfs_txn_meta __rcu **slot)
@@ -634,6 +725,10 @@ static void kasumi_fake_selinuxfs_uninstall_slot(struct kasumi_selinuxfs_txn_met
 void kasumi_fake_selinuxfs_access_exit(void)
 {
 	WRITE_ONCE(kasumi_selinuxfs_ready, false);
+	if (kasumi_proc_attr_write_registered) {
+		WRITE_ONCE(kasumi_proc_attr_write_registered, false);
+		unregister_kprobe(&kasumi_kp_proc_attr_write);
+	}
 
 	spin_lock(&kasumi_selinuxfs_lock);
 	kasumi_fake_selinuxfs_uninstall_slot(&kasumi_selinuxfs_access_meta);

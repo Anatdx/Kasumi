@@ -62,29 +62,10 @@ struct kasumi_hook_stats {
 extern struct kasumi_hook_stats kasumi_hook_stats;
 
 struct kasumi_percpu {
-	unsigned int kprobe_reent;
 	int iterate_did_swap;
 	int in_populate_inject;
 	int override_fd;
 	int override_active;
-#if defined(__aarch64__) || defined(__x86_64__)
-	struct {
-		char __user *buf;
-		size_t count;
-		int active;
-	} cmdline_ctx;
-	struct {
-		struct statx __user *buf;
-		char path[KSM_MAX_LEN_PATHNAME];
-		int active;
-	} statx_ctx;
-	struct {
-		void __user *buf;
-		unsigned long spoof_f_type;
-		int active;
-	} statfs_ctx;
-#endif
-	int mount_proxy_pending;
 };
 
 extern struct kasumi_percpu *kasumi_percpu_base;
@@ -94,7 +75,6 @@ static inline struct kasumi_percpu *kasumi_this_cpu(void)
 	return kasumi_percpu_base + smp_processor_id();
 }
 
-extern char *kasumi_getname_buf_base;
 extern char *kasumi_iterate_buf_base;
 extern atomic_long_t kasumi_ioctl_tgid;
 extern atomic_long_t kasumi_xattr_source_tgid;
@@ -135,22 +115,15 @@ extern bool kasumi_cmdline_spoof_active;
 extern pid_t kasumi_daemon_pid;
 
 extern int kasumi_cmdline_kprobe_registered;
-extern int kasumi_cmdline_kretprobe_registered;
 extern int kasumi_getxattr_kprobe_registered;
 extern int kasumi_mount_hide_vfsmnt_registered;
 extern int kasumi_mount_hide_mountinfo_registered;
-extern int kasumi_mount_hide_vfs_read_registered;
-extern int kasumi_mount_hide_read_fallback_registered;
-extern int kasumi_mount_hide_pread_fallback_registered;
-extern int kasumi_maps_seq_read_registered;
 extern int kasumi_proc_proxy_registered;
 extern int kasumi_feature_enabled_mask;
 extern int kasumi_statfs_kretprobe_registered;
-extern int kasumi_statfs_tracepoint_registered;
 extern int kasumi_ni_kprobe_registered;
 extern int kasumi_reboot_kprobe_registered;
 extern int kasumi_syscall_nr_param;
-extern bool kasumi_getname_kprobe_registered;
 extern bool kasumi_vfs_use_ftrace;
 extern dev_t kasumi_system_dev;
 
@@ -169,7 +142,6 @@ extern struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 extern int (*kasumi_filp_close)(struct file *, fl_owner_t);
 extern ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
 extern char *(*kasumi_strndup_user)(const char __user *, long);
-extern struct filename *(*kasumi_getname_kernel)(const char *);
 extern void (*kasumi_ihold)(struct inode *);
 extern long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
 extern long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);

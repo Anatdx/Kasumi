@@ -19,12 +19,12 @@ void kasumi_fake_mi_exit(void);
 
 /* Refresh the cached fake mountinfo snapshot when it is missing or stale.
  * Safe to call from process context before userland starts reading
- * /proc/.../mountinfo; the read hook itself should stay copy-only.
+ * /proc/.../mountinfo; the per-open producer proxy should stay copy-only.
  */
 int kasumi_fake_mi_prepare(bool force);
 
 /* True while this CPU is currently performing a kernel-internal mountinfo
- * read for cache regeneration. The read hook must bypass filtering in this
+ * read for cache regeneration. The proxy must bypass filtering in this
  * state to avoid infinite recursion.
  */
 bool kasumi_fake_mi_is_internal_read(void);

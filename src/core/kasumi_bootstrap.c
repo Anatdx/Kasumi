@@ -39,7 +39,7 @@
 
 static int kasumi_no_tracepoint_param;
 module_param_named(kasumi_no_tracepoint, kasumi_no_tracepoint_param, int, 0600);
-MODULE_PARM_DESC(kasumi_no_tracepoint, "1=disable TSR and use legacy kprobe/ftrace fallbacks.");
+MODULE_PARM_DESC(kasumi_no_tracepoint, "1=disable TSR; virtual path redirect is unavailable.");
 
 static int kasumi_skip_kallsyms_param;
 module_param_named(kasumi_skip_kallsyms, kasumi_skip_kallsyms_param, int, 0600);
@@ -102,10 +102,6 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_err("Kasumi: FATAL - ihold not found\n");
 		return -ENOENT;
 	}
-
-	kasumi_getname_kernel = (void *)kasumi_lookup_callable("getname_kernel");
-	if (!kasumi_getname_kernel)
-		pr_warn("Kasumi: getname_kernel not found, path redirect may fail\n");
 
 	kasumi_filp_open = (void *)kasumi_lookup_callable("filp_open");
 	kasumi_filp_close = (void *)kasumi_lookup_callable("filp_close");
@@ -214,9 +210,8 @@ int kasumi_bootstrap_init(void)
 	hash_init(kasumi_merge_dirs);
 
 	kasumi_percpu_base = vmalloc(nr_cpu_ids * sizeof(struct kasumi_percpu));
-	kasumi_getname_buf_base = vmalloc(nr_cpu_ids * KASUMI_PATH_BUF);
 	kasumi_iterate_buf_base = vmalloc(nr_cpu_ids * KASUMI_ITERATE_PATH_BUF);
-	if (!kasumi_percpu_base || !kasumi_getname_buf_base || !kasumi_iterate_buf_base) {
+	if (!kasumi_percpu_base || !kasumi_iterate_buf_base) {
 		ret = -ENOMEM;
 		pr_err("Kasumi: failed to allocate per-CPU buffers\n");
 		goto err_buffers;
@@ -228,12 +223,12 @@ int kasumi_bootstrap_init(void)
 	if (!kasumi_no_tracepoint_param) {
 		ret = kasumi_syscall_redirect_init();
 		if (ret) {
-			pr_warn("Kasumi: TSR dispatcher unavailable: %d; using fallbacks\n",
+			pr_warn("Kasumi: TSR dispatcher unavailable: %d; virtual path redirect disabled\n",
 				ret);
 		} else {
 			ret = kasumi_tracepoint_hooks_init();
 			if (ret) {
-				pr_warn("Kasumi: TSR tracepoint unavailable: %d; using fallbacks\n",
+				pr_warn("Kasumi: TSR tracepoint unavailable: %d; virtual path redirect disabled\n",
 					ret);
 				kasumi_syscall_redirect_exit();
 			}
@@ -271,10 +266,8 @@ err_redirect:
 	kasumi_syscall_redirect_exit();
 err_buffers:
 	vfree(kasumi_percpu_base);
-	vfree(kasumi_getname_buf_base);
 	vfree(kasumi_iterate_buf_base);
 	kasumi_percpu_base = NULL;
-	kasumi_getname_buf_base = NULL;
 	kasumi_iterate_buf_base = NULL;
 err_cache:
 	if (kasumi_filldir_cache) {
@@ -300,9 +293,7 @@ void kasumi_bootstrap_exit(void)
 	 * Ordering matters: relative to KSU's manager_exit, this is the
 	 * tracepoint -> dispatcher -> hooks teardown. Any cleanup that frees
 	 * resources reachable from h_openat/h_statfs/etc. (proc fd proxies,
-	 * fake mountinfo, fop/iop shadows, vfs ftrace hooks) MUST run after
-	 * this phase, otherwise a high-frequency syscall (e.g. read) will UAF
-	 * those resources mid-teardown.
+	 * fake mountinfo, fop/iop shadows, vfs hooks) MUST run after this phase.
 	 */
 	kasumi_tracepoint_hooks_exit();
 	kasumi_syscall_redirect_exit();
@@ -332,10 +323,8 @@ void kasumi_bootstrap_exit(void)
 	if (kasumi_filldir_cache)
 		kmem_cache_destroy(kasumi_filldir_cache);
 	vfree(kasumi_percpu_base);
-	vfree(kasumi_getname_buf_base);
 	vfree(kasumi_iterate_buf_base);
 	kasumi_percpu_base = NULL;
-	kasumi_getname_buf_base = NULL;
 	kasumi_iterate_buf_base = NULL;
 	pr_alert("Kasumi: Goseichou thank you!!!\n");
 }

@@ -56,7 +56,6 @@ atomic_t kasumi_hide_count = ATOMIC_INIT(0);
 struct kasumi_hook_stats kasumi_hook_stats;
 
 struct kasumi_percpu *kasumi_percpu_base;
-char *kasumi_getname_buf_base;
 char *kasumi_iterate_buf_base;
 
 atomic_long_t kasumi_ioctl_tgid = ATOMIC_LONG_INIT(0);
@@ -100,22 +99,15 @@ bool kasumi_cmdline_spoof_active;
 pid_t kasumi_daemon_pid;
 
 int kasumi_cmdline_kprobe_registered;
-int kasumi_cmdline_kretprobe_registered;
 int kasumi_getxattr_kprobe_registered;
 int kasumi_mount_hide_vfsmnt_registered;
 int kasumi_mount_hide_mountinfo_registered;
-int kasumi_mount_hide_vfs_read_registered;
-int kasumi_mount_hide_read_fallback_registered;
-int kasumi_mount_hide_pread_fallback_registered;
-int kasumi_maps_seq_read_registered;
 int kasumi_proc_proxy_registered;
 int kasumi_feature_enabled_mask;
 int kasumi_statfs_kretprobe_registered;
-int kasumi_statfs_tracepoint_registered;
 int kasumi_ni_kprobe_registered;
 int kasumi_reboot_kprobe_registered;
 int kasumi_syscall_nr_param = 142;
-bool kasumi_getname_kprobe_registered;
 bool kasumi_vfs_use_ftrace;
 
 DECLARE_BITMAP(kasumi_path_bloom, KASUMI_BLOOM_SIZE);
@@ -138,7 +130,6 @@ struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 int (*kasumi_filp_close)(struct file *, fl_owner_t);
 ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
 char *(*kasumi_strndup_user)(const char __user *, long);
-struct filename *(*kasumi_getname_kernel)(const char *);
 void (*kasumi_ihold)(struct inode *);
 long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
 long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);

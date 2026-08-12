@@ -15,8 +15,6 @@
 #include <linux/slab.h>
 #include <linux/srcu.h>
 #include <linux/completion.h>
-#include <linux/delay.h>
-#include <linux/reboot.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/file.h>
@@ -39,33 +37,8 @@
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_syscall_redirect.h"
-#include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_uname.h"
 #include "kasumi_patch_memory.h"
-
-/* ---- Runtime-resolved kernel patching functions ------------------------ */
-
-/*
- * emergency_sync() lives in fs/sync.c but is not EXPORT_SYMBOL — resolved by
- * kallsyms.  It is the same primitive that sysrq-s uses: schedules an async
- * worker that calls ksys_sync().  We rely on the worker completing within
- * the post-timeout msleep before kernel_restart() is invoked.
- */
-static void (*ksm_emergency_sync)(void);
-
-static int ksm_resolve_patch_api(void)
-{
-	/* Best effort — if missing we'll skip the sync before reboot. */
-	ksm_emergency_sync = (void *)kasumi_lookup_name("emergency_sync");
-	if (ksm_emergency_sync &&
-	    kasumi_valid_kernel_addr((unsigned long)ksm_emergency_sync))
-		pr_info("Kasumi: emergency_sync @ %lx\n",
-			(unsigned long)ksm_emergency_sync);
-	else
-		pr_warn("Kasumi: emergency_sync not resolved (reboot fallback will skip fs sync)\n");
-
-	return 0;
-}
 
 /* ---- Syscall table & redirect ------------------------------------------ */
 
@@ -73,7 +46,7 @@ void *kasumi_syscall_table;
 int  kasumi_syscall_dispatcher_nr = -1;
 static int kasumi_tsr_basic_param;
 module_param_named(kasumi_tsr_basic, kasumi_tsr_basic_param, int, 0600);
-MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/reboot/prctl (skip stat/statfs/read/write/getdents/xattr) to isolate crashing handler.");
+MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/openat2/reboot/prctl (skip path/stat routes) to isolate crashing handler.");
 
 static kasumi_syscall_hook_fn hooks[__NR_syscalls];
 static kasumi_syscall_hook_fn saved_ni_syscall;
@@ -270,164 +243,6 @@ static long h_prctl(const struct pt_regs *regs)
 	}
 }
 
-/* ---- /proc/cmdline spoof via TSR -------------------------------------- *
- *
- * read() is a blockable high-frequency syscall.  Hooking it means
- * the dispatcher's SRCU read-side can be held indefinitely while any
- * process is parked in a blocking read (sockets, pipes, ttys — there are
- * always dozens of these in an Android system).  Plain synchronize_srcu()
- * at module exit would never drain.
- *
- * Safety on unload is guaranteed by the bounded drain implemented in
- * kasumi_syscall_redirect_exit(): call_srcu() + wait_for_completion_timeout().
- * If the drain does not complete within 5 seconds we orderly-reboot rather
- * than free module .text out from under in-flight callers.  This is the
- * only correct way to hook a blockable syscall from an LKM — KSU avoids
- * the question entirely by hooking only short, non-blocking syscalls
- * (setresuid/execve/newfstatat/faccessat).
- */
-#if defined(__aarch64__) || defined(__x86_64__)
-static long h_read(const struct pt_regs *regs)
-{
-	long ret;
-	int fd;
-	char __user *buf;
-	size_t count;
-	struct kasumi_cmdline_rcu *c;
-	bool is_cmdline;
-
-	/*
-	 * Daemon's own reads of /proc/cmdline must observe the truth (otherwise
-	 * the userspace controller can't tell the spoofed cmdline apart from
-	 * its own bookkeeping).  Match the policy of the legacy
-	 * kasumi_handle_sys_enter_cmdline() path.
-	 */
-	if (READ_ONCE(kasumi_daemon_pid) > 0 &&
-	    task_tgid_vnr(current) == READ_ONCE(kasumi_daemon_pid))
-		return kasumi_call_original(__NR_read, regs);
-
-	if (!READ_ONCE(kasumi_cmdline_spoof_active) ||
-	    !kasumi_should_apply_hide_rules())
-		return kasumi_call_original(__NR_read, regs);
-
-#if defined(__aarch64__)
-	fd = (int)regs->regs[0];
-	buf = (char __user *)(uintptr_t)regs->regs[1];
-	count = (size_t)regs->regs[2];
-#else
-	fd = (int)regs->di;
-	buf = (char __user *)(uintptr_t)regs->si;
-	count = (size_t)regs->dx;
-#endif
-
-	/*
-	 * Resolve the fd's identity BEFORE the read so we don't race a
-	 * concurrent close().  fget()/fput() in process context is safe — we
-	 * are the syscall body, not a tracepoint or atomic notifier.
-	 */
-	is_cmdline = kasumi_fd_is_proc_cmdline(fd);
-
-	ret = kasumi_call_original(__NR_read, regs);
-
-	if (!is_cmdline || ret <= 0)
-		return ret;
-
-	/*
-	 * Overwrite the kernel-supplied buffer in-place with the configured
-	 * spoof, mirroring the post-conditions the legacy
-	 * kasumi_handle_sys_exit_cmdline() leaves behind: \n-terminated, length
-	 * clamped to userspace count, ret reset to bytes actually written.
-	 */
-	rcu_read_lock();
-	c = rcu_dereference(kasumi_spoof_cmdline_ptr);
-	if (c && c->cmdline[0]) {
-		size_t spoof_len = strnlen(c->cmdline, sizeof(c->cmdline) - 1);
-		size_t write_len = spoof_len + 1; /* +1 for trailing \n */
-		size_t n;
-
-		if (write_len > count)
-			write_len = count;
-		n = (spoof_len < write_len) ? spoof_len : write_len - 1;
-		if (write_len > 0 && copy_to_user(buf, c->cmdline, n) == 0) {
-			if (n < write_len &&
-			    copy_to_user(buf + n, "\n", 1) == 0)
-				ret = (long)(n + 1);
-			else
-				ret = (long)n;
-		}
-	}
-	rcu_read_unlock();
-
-	return ret;
-}
-#endif /* __aarch64__ || __x86_64__ */
-
-/* ---- /proc/self/attr/current dyntransition probe filtering ------------ */
-#if defined(__aarch64__) || defined(__x86_64__)
-static bool kasumi_fd_is_proc_attr_current(int fd)
-{
-	struct file *file;
-	struct dentry *dentry, *parent;
-	bool is_attr_current = false;
-
-	file = fget(fd);
-	if (!file)
-		return false;
-
-	dentry = file->f_path.dentry;
-	parent = dentry ? dentry->d_parent : NULL;
-	if (dentry && parent &&
-	    dentry->d_name.len == 7 &&
-	    memcmp(dentry->d_name.name, "current", 7) == 0 &&
-	    parent->d_name.len == 4 &&
-	    memcmp(parent->d_name.name, "attr", 4) == 0)
-		is_attr_current = true;
-
-	fput(file);
-	return is_attr_current;
-}
-
-static long h_write(const struct pt_regs *regs)
-{
-	int fd;
-	const char __user *buf;
-	size_t count;
-	char context[KASUMI_SELINUX_CTX_MAX];
-	size_t len;
-
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
-	    !kasumi_current_is_selinux_guard_target())
-		return kasumi_call_original(__NR_write, regs);
-
-#if defined(__aarch64__)
-	fd = (int)regs->regs[0];
-	buf = (const char __user *)(uintptr_t)regs->regs[1];
-	count = (size_t)regs->regs[2];
-#else
-	fd = (int)regs->di;
-	buf = (const char __user *)(uintptr_t)regs->si;
-	count = (size_t)regs->dx;
-#endif
-	if (!buf || count == 0 || count >= sizeof(context))
-		return kasumi_call_original(__NR_write, regs);
-	if (!kasumi_fd_is_proc_attr_current(fd))
-		return kasumi_call_original(__NR_write, regs);
-
-	len = count;
-	if (copy_from_user(context, buf, len))
-		return kasumi_call_original(__NR_write, regs);
-	context[len] = '\0';
-
-	if (kasumi_fake_selinuxfs_context_is_sensitive(context)) {
-		kasumi_log("fake_selinuxfs: rejected attr/current write pid=%d uid=%u comm=%s\n",
-			   task_tgid_vnr(current), __kuid_val(current_uid()), current->comm);
-		return -EINVAL;
-	}
-
-	return kasumi_call_original(__NR_write, regs);
-}
-#endif /* __aarch64__ || __x86_64__ */
-
 /* ---- path redirect + mount proxy via TSR ------------------------------- */
 
 static void kasumi_set_path_arg1(const struct pt_regs *regs, unsigned long value)
@@ -581,26 +396,18 @@ static long do_statfs(const struct pt_regs *regs, int nr)
 {
 	char path[KSM_MAX_LEN_PATHNAME];
 	const char __user *u;
-	void __user *buf;
 	char *target = NULL;
-	unsigned long s = 0;
 	long ret;
 
 #if defined(__aarch64__)
 	u = (const char __user *)(uintptr_t)regs->regs[0];
-	buf = (void __user *)(uintptr_t)regs->regs[1];
 #else
 	u = (const char __user *)(uintptr_t)regs->di;
-	buf = (void __user *)(uintptr_t)regs->si;
 #endif
 	if (kasumi_copy_user_path_at(AT_FDCWD, u, path, sizeof(path)) <= 0)
 		return kasumi_call_original(nr, regs);
 	if (path[0] == '/' && kasumi_should_hide(path))
 		return -ENOENT;
-
-	if ((kasumi_feature_enabled_mask & KSM_FEATURE_STATFS_SPOOF) &&
-	    kasumi_should_apply_hide_rules())
-		s = kasumi_statfs_resolve_spoof_magic(path);
 
 	if (path[0] == '/') {
 		target = kasumi_resolve_target_slow(path);
@@ -616,8 +423,6 @@ static long do_statfs(const struct pt_regs *regs, int nr)
 	}
 
 	ret = kasumi_call_original(nr, regs);
-	if (ret >= 0 && s)
-		kasumi_statfs_apply_spoof(buf, s);
 	kfree(target);
 	return ret;
 }
@@ -625,50 +430,6 @@ static long do_statfs(const struct pt_regs *regs, int nr)
 static long h_statfs(const struct pt_regs *regs)
 {
 	return do_statfs(regs, __NR_statfs);
-}
-
-/*
- * fstatfs(fd, buf): same INCONSISTENT_MOUNT bypass as statfs, but we resolve
- * the dentry through the open file rather than re-walking the pathname.  This
- * matters because (a) bionic's fstatfs/fstatfs64 wrappers route here, not
- * __NR_statfs, and (b) we avoid kern_path() altogether on a path the caller
- * already opened, which is both faster and not subject to symlink/automount
- * tricks the path-based hook had to compensate for via LOOKUP_FOLLOW.
- */
-static long do_fstatfs(const struct pt_regs *regs, int nr)
-{
-	void __user *buf;
-	int fd;
-	unsigned long s = 0;
-	struct file *file;
-	long ret;
-
-#if defined(__aarch64__)
-	fd = (int)regs->regs[0];
-	buf = (void __user *)(uintptr_t)regs->regs[1];
-#else
-	fd = (int)regs->di;
-	buf = (void __user *)(uintptr_t)regs->si;
-#endif
-
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_STATFS_SPOOF) ||
-	    !kasumi_should_apply_hide_rules())
-		return kasumi_call_original(nr, regs);
-
-	file = fget(fd);
-	if (file) {
-		s = kasumi_statfs_resolve_spoof_magic_dentry(file->f_path.dentry);
-		fput(file);
-	}
-	ret = kasumi_call_original(nr, regs);
-	if (ret >= 0 && s)
-		kasumi_statfs_apply_spoof(buf, s);
-	return ret;
-}
-
-static long h_fstatfs(const struct pt_regs *regs)
-{
-	return do_fstatfs(regs, __NR_fstatfs);
 }
 
 #ifdef __NR_statx
@@ -742,101 +503,6 @@ static long h_statx(const struct pt_regs *regs)
 }
 #endif
 
-struct kasumi_linux_dirent64 {
-	u64 d_ino;
-	s64 d_off;
-	unsigned short d_reclen;
-	unsigned char d_type;
-	char d_name[];
-};
-
-static KASUMI_NOCFI long h_getdents64(const struct pt_regs *regs)
-{
-	char *kbuf = NULL;
-	char *pathbuf = NULL;
-	char *dir_path;
-	unsigned int pos = 0, out = 0;
-	unsigned int max_name_off = offsetof(struct kasumi_linux_dirent64, d_name);
-	long ret;
-	int fd;
-	void __user *udirent;
-	struct file *file;
-
-#if defined(__aarch64__)
-	fd = (int)regs->regs[0];
-	udirent = (void __user *)(uintptr_t)regs->regs[1];
-#else
-	fd = (int)regs->di;
-	udirent = (void __user *)(uintptr_t)regs->si;
-#endif
-	ret = kasumi_call_original(__NR_getdents64, regs);
-	if (ret <= 0 || atomic_read(&kasumi_hide_count) == 0 || !udirent)
-		return ret;
-	if (ret > 256 * 1024)
-		return ret;
-
-	file = fget(fd);
-	if (!file)
-		return ret;
-	pathbuf = (char *)__get_free_page(GFP_KERNEL);
-	if (!pathbuf) {
-		fput(file);
-		return ret;
-	}
-	dir_path = kasumi_d_path ? kasumi_d_path(&file->f_path, pathbuf, PAGE_SIZE) : ERR_PTR(-ENOENT);
-	fput(file);
-	if (IS_ERR_OR_NULL(dir_path) || *dir_path != '/') {
-		free_page((unsigned long)pathbuf);
-		return ret;
-	}
-
-	kbuf = kmalloc(ret, GFP_KERNEL);
-	if (!kbuf) {
-		free_page((unsigned long)pathbuf);
-		return ret;
-	}
-	if (copy_from_user(kbuf, udirent, ret))
-		goto out;
-
-	while (pos < ret) {
-		struct kasumi_linux_dirent64 *d = (void *)(kbuf + pos);
-		unsigned short reclen = d->d_reclen;
-		bool hide = false;
-
-		if (reclen < max_name_off + 1 || pos + reclen > ret)
-			goto out;
-		if (!(d->d_name[0] == '.' &&
-		      (d->d_name[1] == '\0' ||
-		       (d->d_name[1] == '.' && d->d_name[2] == '\0')))) {
-			char *full;
-
-			if (strcmp(dir_path, "/") == 0)
-				full = kasprintf(GFP_KERNEL, "/%s", d->d_name);
-			else
-				full = kasprintf(GFP_KERNEL, "%s/%s", dir_path, d->d_name);
-			if (full) {
-				hide = kasumi_should_hide(full);
-				kfree(full);
-			}
-		}
-		if (hide) {
-			atomic64_inc(&kasumi_hook_stats.filldir_hidden);
-		} else {
-			if (out != pos)
-				memmove(kbuf + out, d, reclen);
-			out += reclen;
-		}
-		pos += reclen;
-	}
-	if (out != ret && !copy_to_user(udirent, kbuf, out))
-		ret = out;
-
-out:
-	kfree(kbuf);
-	free_page((unsigned long)pathbuf);
-	return ret;
-}
-
 static long do_path1_hide(const struct pt_regs *regs, int nr)
 {
 	char path[KSM_MAX_LEN_PATHNAME];
@@ -902,20 +568,6 @@ static long do_path0_hide(const struct pt_regs *regs, int nr)
 	return kasumi_call_original(nr, regs);
 }
 
-#ifdef __NR_statfs64
-static long h_statfs64(const struct pt_regs *regs)
-{
-	return do_statfs(regs, __NR_statfs64);
-}
-#endif
-
-#ifdef __NR_fstatfs64
-static long h_fstatfs64(const struct pt_regs *regs)
-{
-	return do_fstatfs(regs, __NR_fstatfs64);
-}
-#endif
-
 #ifdef __NR_newfstatat
 static long h_newfstatat(const struct pt_regs *regs)
 {
@@ -966,10 +618,6 @@ int kasumi_syscall_redirect_init(void)
 	int ret;
 	int slot;
 
-	ret = ksm_resolve_patch_api();
-	if (ret)
-		return ret;
-
 	kasumi_syscall_table = (void *)kasumi_lookup_name("sys_call_table");
 	if (!kasumi_syscall_table)
 		return -ENOENT;
@@ -1004,21 +652,9 @@ int kasumi_syscall_redirect_init(void)
 	kasumi_add_syscall_hook_counted(__NR_prctl, h_prctl, &n);
 	if (!kasumi_tsr_basic_param) {
 		kasumi_add_syscall_hook_counted(__NR_statfs, h_statfs, &n);
-		kasumi_add_syscall_hook_counted(__NR_fstatfs, h_fstatfs, &n);
 #ifdef __NR_statx
 		kasumi_add_syscall_hook_counted(__NR_statx, h_statx, &n);
 #endif
-#ifdef __NR_statfs64
-		kasumi_add_syscall_hook_counted(__NR_statfs64, h_statfs64, &n);
-#endif
-#ifdef __NR_fstatfs64
-		kasumi_add_syscall_hook_counted(__NR_fstatfs64, h_fstatfs64, &n);
-#endif
-#if defined(__aarch64__) || defined(__x86_64__)
-		kasumi_add_syscall_hook_counted(__NR_read, h_read, &n);
-		kasumi_add_syscall_hook_counted(__NR_write, h_write, &n);
-#endif
-		kasumi_add_syscall_hook_counted(__NR_getdents64, h_getdents64, &n);
 #ifdef __NR_newfstatat
 		kasumi_add_syscall_hook_counted(__NR_newfstatat, h_newfstatat, &n);
 #endif
@@ -1044,12 +680,7 @@ int kasumi_syscall_redirect_init(void)
 	return 0;
 }
 
-/*
- * Per-call drain bookkeeping for kasumi_syscall_redirect_exit().  The
- * struct lives as a function-static so it survives if we hit the reboot
- * fallback path — we never want call_srcu's callback writing into a freed
- * stack frame.
- */
+/* Per-call drain bookkeeping for kasumi_syscall_redirect_exit(). */
 struct kasumi_drain_state {
 	struct rcu_head head;
 	struct completion *done;
@@ -1065,11 +696,10 @@ static void kasumi_redirect_drain_done(struct rcu_head *head)
 KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 {
 	DECLARE_COMPLETION_ONSTACK(drain_done);
-	static struct kasumi_drain_state drain;
+	struct kasumi_drain_state drain;
 	kasumi_syscall_hook_fn installed;
 	int slot;
 	int i;
-	bool drained;
 	bool active;
 
 	slot = READ_ONCE(kasumi_syscall_dispatcher_nr);
@@ -1087,13 +717,10 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 	 *      is still intact. Any task already inside the dispatcher can finish
 	 *      with a valid handler lookup.
 	 *
-	 *   3. Drain in-flight handlers via SRCU with a bounded timeout. For
-	 *      the short syscalls we currently hook (openat / openat2 / statfs
-	 *      / reboot / prctl) this completes in well under a millisecond.
-	 *      If a future blockable hook (e.g. h_read) is registered, an
-	 *      in-flight call can hang in vfs_read indefinitely; in that case
-	 *      we cannot safely free module .text — fall through to an orderly
-	 *      reboot instead.
+	 *   3. Drain in-flight handlers via SRCU. Blockable
+	 *      data-plane syscalls such as read/write are deliberately excluded
+	 *      from TSR so ordinary long-lived I/O cannot pin this read-side
+	 *      section across module unload.
 	 *
 	 *   4. Now we can clear the hook table; no reader can observe it.
 	 *
@@ -1108,39 +735,10 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 		pr_warn("Kasumi: TSR slot %d changed by another owner; not restoring it\n",
 			slot);
 
-	/*
-	 * Async SRCU drain so we can bound the wait.  `drain` is a static so
-	 * it survives if we hit the timeout path and reboot — we don't want
-	 * the callback writing to a freed stack frame.
-	 */
+	/* Wait until every already-redirected syscall has left module text. */
 	drain.done = &drain_done;
 	kasumi_call_srcu_ptr(&kasumi_redirect_srcu, &drain.head, kasumi_redirect_drain_done);
-	drained = wait_for_completion_timeout(&drain_done, 5 * HZ) != 0;
-
-	if (!drained) {
-		/*
-		 * In-flight syscall handler stuck in our .text — most likely
-		 * a future read/write/poll-class hook waiting on I/O.  Freeing
-		 * module memory now would leave that handler with a dangling
-		 * return address.  Sync filesystems and reboot.
-		 */
-		pr_emerg("Kasumi: syscall handlers did not drain in 5s; rebooting in 3s to keep module .text alive for in-flight callers\n");
-
-		if (ksm_emergency_sync) {
-			pr_emerg("Kasumi: emergency_sync() before reboot\n");
-			ksm_emergency_sync();
-		}
-
-		/*
-		 * Give emergency_sync's workqueue time to finish (its worker
-		 * is async) and userspace a moment to read the dmesg banner.
-		 */
-		msleep(3000);
-
-		kernel_restart("kasumi: unload SRCU drain timeout");
-		/* unreachable */
-		return;
-	}
+	wait_for_completion(&drain_done);
 
 	for (i = 0; i < __NR_syscalls; i++)
 		WRITE_ONCE(hooks[i], NULL);

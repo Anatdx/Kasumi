@@ -254,9 +254,8 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 	}
 
 	if (should_inject && match_src) {
-		/* Only scan kasumi_paths when a merge rule matched. For simple
-		 * ADD_RULE redirects the source is hidden and getname_flags
-		 * handles the redirect transparently — no injection needed. */
+		/* Only scan kasumi_paths when a merge rule matched. Simple ADD_RULE
+		 * entries are handled by exact path TSR routes without injection. */
 		const char *pfx = match_src;
 		size_t pfx_len = match_src_len;
 
@@ -338,7 +337,7 @@ next_entry:
  *
  * Called from KSM_IOC_ADD_MERGE_RULE ioctl (process context, can sleep).
  * Recursively scans the merge target directory and creates exact-match
- * redirect rules so getname_flags works without blind trie redirect.
+ * redirect rules for the exact path TSR routes.
  * ====================================================================== */
 
 void kasumi_materialize_merge(const char *src_prefix,
@@ -408,7 +407,7 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
  *
  * Used so that DT_DIR children discovered while materializing a parent merge
  * become their own merge rules, instead of being registered as DT_DIR
- * entries in kasumi_paths. The latter would cause getname_flags to
+ * entries in kasumi_paths. The latter would cause exact path redirect to
  * wholesale-redirect any lookup of that subdir to the module's (typically
  * incomplete) copy, destroying real subdir content. A nested merge rule, by
  * contrast, keeps the real subdir intact and only performs iterate_dir-time
@@ -526,8 +525,7 @@ kasumi_mat_filldir(struct dir_context *ctx, const char *name,
 	}
 
 	/* For DT_DIR: register a nested merge_entry and recurse. Do NOT add a
-	 * DT_DIR entry to kasumi_paths — kasumi_resolve_target() matches it by
-	 * exact strcmp in getname_flags, which would wholesale-redirect every
+	 * DT_DIR entry to kasumi_paths — exact path redirect would redirect every
 	 * lookup of this subdir (e.g. an open of /product/overlay/foo would
 	 * resolve against the module's incomplete foo, hiding all real
 	 * siblings). The nested merge_entry gives this subdir its own

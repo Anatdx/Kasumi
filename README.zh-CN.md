@@ -23,12 +23,12 @@ English version： [README.md](./README.md)
 - 主代码目录：`src/`
 - 协议定义：`src/include/kasumi_uapi.h`
 - 当前协议版本：`KSM_PROTOCOL_VERSION = 16`
-- Hook 策略：热路径优先使用 Tracepoint Syscall Redirect（TSR），必要时配合 fop/iop shadow 与 kprobe/ftrace 回退
+- Hook 策略：优先使用 fop/iop/VFS 操作层 hook；TSR 只保留给当前 LKM inode 模型无法表达的虚拟路径查找
 - 已包含 `arch_ftrace_get_regs` 在 6.6+ 的兼容处理
 
 ## 主要能力
 
-- 路径重定向：`src -> target`，覆盖 `openat`、`statx`、`newfstatat`、`faccessat` 以及 xattr 路径类 syscall
+- 路径重定向：`src -> target`，覆盖 `openat`、`statfs`、`statx`、`newfstatat`、`faccessat` 以及 xattr 路径类 syscall
 - 路径展示反向映射（`d_path` 相关）
 - 目录隐藏（`iterate_dir` 过滤）
 - 目录合并/注入
@@ -39,15 +39,16 @@ English version： [README.md](./README.md)
 - `/proc/<pid>/maps` 规则伪装（ino/dev/pathname）
 - mount hide、statfs spoof
 
-> 该模块会拦截 VFS 与 syscall 热路径，请仅在可控环境使用。
+> 该模块会拦截部分 VFS 操作与路径 syscall，请仅在可控环境使用。
 
 ## Hook 架构
 
 - TSR：`sys_enter` 将已注册的 syscall number 重定向到一个共享 dispatcher；dispatcher 只占用一个空闲 `ni_syscall` 表项，不再修改目标 syscall 表项
 - GET_FD：通过 TSR 路由 `reboot`/`prctl`，保留旧 kprobe 回退
-- 路径 syscall：TSR 覆盖 `openat/openat2`、`statx`、`newfstatat`、`faccessat`、`getxattr/lgetxattr` 与 `listxattr/llistxattr`
+- 路径 syscall：TSR 覆盖 `openat/openat2`、`statfs`、`statx`、`newfstatat`、`faccessat`、`getxattr/lgetxattr` 与 `listxattr/llistxattr`
+- 数据面 syscall：`read`、`write`、`getdents64`、`fstatfs` 不再是 TSR 路由；cmdline、proc attr、目录遍历与 statfs 伪装分别下沉到 producer/VFS 操作层
 - KernelSU 共存：Kasumi 选择另一个空闲 dispatcher 槽位，并且不会覆盖已被其他 TSR 使用者重定向的 syscall number
-- VFS：`getattr` 与 `readdir` 使用 iop/fop shadow hook；必要时仍可使用 ftrace/kretprobe 回退路径
+- VFS：`getattr` 与 `readdir` 使用 iop/fop shadow hook；statfs 伪装挂在 `vfs_statfs`
 - 符号解析：优先 `kallsyms_lookup_name`，失败回退逐符号 kprobe 解析
 
 ## CI 覆盖 KMI
@@ -95,7 +96,7 @@ ksud insmod kasumi_lkm.ko
 常用参数（定义于 `src/core/kasumi_bootstrap.c`）：
 
 - `kasumi_syscall_nr`
-- `kasumi_no_tracepoint=1`（禁用 TSR 并使用旧回退路径）
+- `kasumi_no_tracepoint=1`（禁用 TSR；虚拟路径重定向将不可用，独立的操作层功能可继续工作）
 - `kasumi_skip_vfs=1`
 - `kasumi_skip_extra_kprobes=1`
 - `kasumi_skip_getfd=1`
@@ -124,7 +125,7 @@ Anatdx 本人维护的 [YukiSU](https://github.com/Anatdx/YukiSU) 提供与 Kern
 
 ## 快速排障
 
-- TSR 初始化报告 `sys_enter` 不可用：尝试 `kasumi_no_tracepoint=1`
+- TSR 初始化报告 `sys_enter` 不可用：`kasumi_no_tracepoint=1` 只用于操作层诊断，不再提供全局路径 hook 回退
 - 可编译但无法加载：检查 `vermagic`、模块签名策略和 `dmesg`
 - 调整 hook/ABI 后：优先用 `KSM_IOC_GET_HOOKS` 与 `KSM_IOC_GET_FEATURES` 做运行态自检
 - 排查合并/注入回归：同时检查 canonical 与 symlink 路径下的 `ls`、`ls -l`、`ls -Z` 和 `getfattr -n security.selinux`

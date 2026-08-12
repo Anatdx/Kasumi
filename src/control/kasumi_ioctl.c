@@ -577,30 +577,22 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		int features = 0;
 		if (kasumi_uname_capable())
 			features |= KSM_FEATURE_UNAME_SPOOF;
-		if (kasumi_cmdline_kprobe_registered || kasumi_cmdline_kretprobe_registered ||
-		    (kasumi_syscall_dispatcher_nr >= 0 &&
-		     kasumi_has_syscall_hook(__NR_read)))
+		if (kasumi_cmdline_kprobe_registered)
 			features |= KSM_FEATURE_CMDLINE_SPOOF;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
 		features |= KSM_FEATURE_MERGE_DIR;
 		if (kasumi_getxattr_kprobe_registered)
 			features |= KSM_FEATURE_SELINUX_BYPASS;
 		if (kasumi_proc_proxy_registered ||
-		    kasumi_mount_hide_vfsmnt_registered || kasumi_mount_hide_mountinfo_registered ||
-		    kasumi_mount_hide_vfs_read_registered ||
-		    kasumi_mount_hide_read_fallback_registered ||
-		    kasumi_mount_hide_pread_fallback_registered)
+		    kasumi_mount_hide_vfsmnt_registered ||
+		    kasumi_mount_hide_mountinfo_registered)
 			features |= KSM_FEATURE_MOUNT_HIDE;
-		if (kasumi_proc_proxy_registered ||
-		    kasumi_mount_hide_vfs_read_registered ||
-		    kasumi_mount_hide_read_fallback_registered ||
-		    kasumi_mount_hide_pread_fallback_registered ||
-		    kasumi_maps_seq_read_registered)
+		if (kasumi_proc_proxy_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
-		if (kasumi_statfs_kretprobe_registered ||
-		    kasumi_statfs_tracepoint_registered)
+		if (kasumi_statfs_kretprobe_registered)
 			features |= KSM_FEATURE_STATFS_SPOOF;
-		if (kasumi_fake_selinuxfs_access_active())
+		if (kasumi_fake_selinuxfs_access_active() ||
+		    kasumi_fake_selinuxfs_proc_attr_active())
 			features |= KSM_FEATURE_SELINUX_FIX;
 		if (copy_to_user(arg, &features, sizeof(features)))
 			return -EFAULT;
@@ -657,8 +649,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 #endif
 		if (path_tsr)
 			n = scnprintf(kbuf + written, buf_size - written, "path: TSR\n");
-		else if (kasumi_getname_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "path: kprobe (getname_flags)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
 		written += n;
@@ -678,9 +668,11 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				     "vfs: getattr=iop readdir=fop d_path=none getxattr=none\n");
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "selinuxfs/access,context,status,proc_attr_current: access=%s status=%s\n",
+			      "selinuxfs: access=%s status=%s attr/current=%s\n",
 			      kasumi_fake_selinuxfs_access_active() ? "shadow fop" : "none",
-			      kasumi_fake_selinuxfs_status_active() ? "shadow fop" : "none");
+			      kasumi_fake_selinuxfs_status_active() ? "shadow fop" : "none",
+			      kasumi_fake_selinuxfs_proc_attr_active() ?
+				      "proc op kprobe" : "none");
 		written += n;
 
 		/* uname */
@@ -697,12 +689,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 
 		/* cmdline */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_read))
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: TSR\n");
-		else if (kasumi_cmdline_kretprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kretprobe (read)\n");
-		else if (kasumi_cmdline_kprobe_registered)
+		if (kasumi_cmdline_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kprobe (cmdline_proc_show)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: none\n");
@@ -721,52 +708,20 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		else if (kasumi_mount_hide_mountinfo_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "mountinfo: kprobe (show_mountinfo)\n");
-		else if (kasumi_mount_hide_vfs_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (vfs_read buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered &&
-			 kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (read/pread64 syscall buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (read syscall buffer filter)\n");
-		else if (kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (pread64 syscall buffer filter)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "mountinfo/mounts: none\n");
 		written += n;
 
-		/* maps spoof (read kretprobe or seq_read fallback) */
+		/* maps spoof */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "maps: proxy (open fd read filter)\n");
-		else if (kasumi_maps_seq_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (seq_read fallback)\n");
-		else if (kasumi_mount_hide_vfs_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (vfs_read buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered &&
-		    kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (read/pread64 buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (read buffer filter)\n");
-		else if (kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (pread64 buffer filter)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_statfs))
-			n = scnprintf(kbuf + written, buf_size - written, "statfs: TSR\n");
-		else if (kasumi_statfs_kretprobe_registered)
+		if (kasumi_statfs_kretprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "statfs: kretprobe (f_type spoof for INCONSISTENT_MOUNT)\n");
+				     "statfs/fstatfs: kretprobe (vfs_statfs)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "statfs: none\n");
 		written += n;
@@ -1043,7 +998,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		/* Do not mark redirect source as hidden: we do not inject a virtual
 		 * entry for simple ADD_RULE, so hiding would make the file disappear
-		 * from the listing. Open of the path is still redirected via getname. */
+		 * from the listing. Open of the path is still redirected by exact TSR. */
 		if (src_inode)
 			iput(src_inode);
 		if (parent_inode)

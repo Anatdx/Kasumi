@@ -23,12 +23,12 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - Main code: `src/`
 - Control protocol: `src/include/kasumi_uapi.h`
 - Current protocol version: `KSM_PROTOCOL_VERSION = 16`
-- Hook strategy: Tracepoint Syscall Redirect (TSR) for the hot path, with fop/iop shadows and kprobe/ftrace fallbacks where needed
+- Hook strategy: operation-level fop/iop/VFS hooks first; TSR is limited to virtual-path lookups that cannot yet be represented by the current LKM inode model
 - 6.6+ compatibility for `arch_ftrace_get_regs` is included in current code
 
 ## Core Capabilities
 
-- Path redirect: `src -> target`, including `openat`, `statx`, `newfstatat`, `faccessat`, and xattr path syscalls
+- Path redirect: `src -> target`, including `openat`, `statfs`, `statx`, `newfstatat`, `faccessat`, and xattr path syscalls
 - Reverse mapping for path presentation (`d_path` related flow)
 - Directory entry hiding (`iterate_dir` filtering)
 - Directory merge/injection behavior
@@ -39,15 +39,16 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - `/proc/<pid>/maps` spoofing rules (ino/dev/pathname)
 - Mount-hide and statfs spoof features
 
-Use in controlled environments only. This module hooks VFS and syscall hot paths.
+Use in controlled environments only. This module hooks selected VFS operations and path syscalls.
 
 ## Hook Overview
 
 - TSR: `sys_enter` redirects registered syscall numbers to one shared dispatcher installed in an unused `ni_syscall` table slot; target syscall-table entries are never patched
 - GET_FD path: TSR routes `reboot`/`prctl`, with legacy kprobe fallbacks
-- Path syscalls: TSR covers `openat/openat2`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
+- Path syscalls: TSR covers `openat/openat2`, `statfs`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
+- Data-plane syscalls: `read`, `write`, `getdents64`, and `fstatfs` are not TSR routes; cmdline, proc attr, directory iteration, and statfs spoofing run at their producer/VFS operation layers
 - KernelSU coexistence: Kasumi selects a different unused dispatcher slot and does not overwrite a syscall number already redirected by another TSR consumer
-- VFS path: iop/fop shadow hooks handle `getattr` and `readdir`; ftrace/kretprobe paths remain as fallbacks where enabled
+- VFS path: iop/fop shadows handle `getattr` and `readdir`; statfs spoofing is attached to `vfs_statfs`
 - Symbol resolution: prefer `kallsyms_lookup_name`, fallback to per-symbol kprobe resolution
 
 ## CI KMI Targets
@@ -97,7 +98,7 @@ ksud insmod kasumi_lkm.ko
 Common module parameters in `src/core/kasumi_bootstrap.c`:
 
 - `kasumi_syscall_nr`
-- `kasumi_no_tracepoint=1` (disable TSR and use legacy fallbacks)
+- `kasumi_no_tracepoint=1` (disable TSR; virtual path redirection is unavailable, while independent operation-level features may remain active)
 - `kasumi_skip_vfs=1`
 - `kasumi_skip_extra_kprobes=1`
 - `kasumi_skip_getfd=1`
@@ -126,7 +127,7 @@ In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_moun
 
 ## Quick Troubleshooting
 
-- If TSR initialization reports that `sys_enter` is unavailable, try `kasumi_no_tracepoint=1`
+- If TSR initialization reports that `sys_enter` is unavailable, `kasumi_no_tracepoint=1` can be used for operation-level diagnostics only; it does not provide a global path-hook fallback
 - Builds but cannot load: check `vermagic`, module signature policy, and `dmesg`
 - Hook/ABI changes: validate with `KSM_IOC_GET_HOOKS` and `KSM_IOC_GET_FEATURES`
 - Merge/injection regressions: compare `ls`, `ls -l`, `ls -Z`, and `getfattr -n security.selinux` on both canonical and symlinked paths
