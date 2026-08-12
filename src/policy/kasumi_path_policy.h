@@ -16,14 +16,14 @@ struct kasumi_entry;
 struct kasumi_policy_state_arg;
 
 bool kasumi_is_privileged_process(void);
-bool kasumi_policy_prepare_enable(void);
+bool kasumi_policy_prepare_enable_locked(void);
 void kasumi_policy_disable_provider_locked(void);
+bool kasumi_policy_should_trace_uid(uid_t uid);
 u32 kasumi_policy_configured_owner(void);
 u32 kasumi_policy_effective_owner(void);
 int kasumi_policy_replace(u32 owner, u32 flags,
 			  const u32 *allow_uids, u32 allow_count,
 			  const u32 *deny_uids, u32 deny_count);
-bool kasumi_policy_mutation_allowed(void);
 int kasumi_set_policy_owner(u32 owner, u32 flags);
 int kasumi_replace_policy_uid_list(u32 list, const u32 *uids, u32 count);
 int kasumi_clear_policy_uid_list(u32 list);

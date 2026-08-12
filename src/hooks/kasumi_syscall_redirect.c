@@ -641,10 +641,11 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 	 *      is still intact. Any task already inside the dispatcher can finish
 	 *      with a valid handler lookup.
 	 *
-	 *   3. Drain in-flight handlers via SRCU. Blockable
-	 *      data-plane syscalls such as read/write are deliberately excluded
-	 *      from TSR so ordinary long-lived I/O cannot pin this read-side
-	 *      section across module unload.
+	 *   3. sys_enter queues a task-work guard and pins THIS_MODULE before it
+	 *      redirects a syscall.  The guard releases that reference through
+	 *      RCU only after the task returns from the syscall or exits.  Module
+	 *      exit therefore cannot begin while a dispatcher is in flight,
+	 *      including an openat blocked on a FIFO or slow filesystem.
 	 *
 	 *   4. Now we can clear the hook table; no reader can observe it.
 	 *
@@ -659,9 +660,10 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 		pr_warn("Kasumi: TSR slot %d changed by another owner; not restoring it\n",
 			slot);
 
-	/* Wait until every already-redirected syscall has left module text. */
+	/* Defensive drain; task-work guards make this grace period normally empty. */
 	drain.done = &drain_done;
-	kasumi_call_srcu_ptr(&kasumi_redirect_srcu, &drain.head, kasumi_redirect_drain_done);
+	kasumi_call_srcu_ptr(&kasumi_redirect_srcu, &drain.head,
+			     kasumi_redirect_drain_done);
 	wait_for_completion(&drain_done);
 
 	for (i = 0; i < __NR_syscalls; i++)

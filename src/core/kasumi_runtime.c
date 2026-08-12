@@ -47,6 +47,7 @@
 #include "kasumi_store.h"
 #include "kasumi_file_view.h"
 #include "kasumi_path_policy.h"
+#include "kasumi_task_marker.h"
 #include "kasumi_dop_override.h"
 #include "kasumi_xattr_sid_override.h"
 #include "kasumi_fop_override.h"
@@ -450,7 +451,9 @@ void kasumi_cleanup_locked(void)
 	struct hlist_node *tmp;
 	int bkt;
 
-	WRITE_ONCE(kasumi_enabled, false);
+	/* Pair with policy readers before cleanup withdraws provider state. */
+	smp_store_release(&kasumi_enabled, false);
+	kasumi_task_marker_set_enabled(false);
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
 	kasumi_file_view_clear();

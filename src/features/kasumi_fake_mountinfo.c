@@ -24,6 +24,8 @@
 #include <linux/kernel.h>
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
+#include <linux/nsproxy.h>
+#include <linux/version.h>
 
 /* Cache sizing: mountinfo is typically 20-80KB on Android; cap at 512KB. */
 #define FAKE_MI_BUF_MAX    (512 * 1024)
@@ -41,6 +43,8 @@ struct fake_mi_cache {
     struct {
         char *buf;
         size_t len;
+        struct nsproxy *nsproxy;
+        struct mnt_namespace *mnt_ns;
     } slots[FAKE_MI_BUF_SLOTS];
     int active_slot;
     unsigned long last_jiffies;
@@ -61,7 +65,10 @@ static struct fake_mi_cache g_cache = {
     .valid = false,
 };
 
+static bool fake_mi_initialized;
+
 static u64 g_cache_gen;  /* bumped every regenerate */
+static int fake_mi_last_error;
 
 static struct fake_mi_cursor g_cursors[FAKE_MI_CURSORS];
 static DEFINE_SPINLOCK(g_cursors_lock);
@@ -72,6 +79,47 @@ static atomic_t fake_mi_reader_pid = ATOMIC_INIT(0);
 static struct file *(*ptr_filp_open)(const char *, int, umode_t);
 static int (*ptr_filp_close)(struct file *, fl_owner_t);
 static ssize_t (*ptr_kernel_read)(struct file *, void *, size_t, loff_t *);
+static void (*ptr_free_nsproxy)(struct nsproxy *);
+
+static struct mnt_namespace *fake_mi_current_mnt_ns(void)
+{
+    struct nsproxy *nsproxy = current->nsproxy;
+
+    return nsproxy ? nsproxy->mnt_ns : NULL;
+}
+
+/* put_nsproxy() calls the non-exported free_nsproxy() on the final reference.
+ * Keep the inline refcount operation here and call its kallsyms-resolved body
+ * without adding an exported-symbol dependency.
+ */
+static KASUMI_NOCFI void fake_mi_put_nsproxy(struct nsproxy *nsproxy)
+{
+    bool release;
+
+    if (!nsproxy)
+        return;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+    release = refcount_dec_and_test(&nsproxy->count);
+#else
+    release = atomic_dec_and_test(&nsproxy->count);
+#endif
+    if (release)
+        ptr_free_nsproxy(nsproxy);
+}
+
+static void fake_mi_release_slot_owner_locked(int slot)
+{
+    struct nsproxy *nsproxy;
+
+    if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
+        return;
+
+    nsproxy = g_cache.slots[slot].nsproxy;
+    g_cache.slots[slot].nsproxy = NULL;
+    g_cache.slots[slot].mnt_ns = NULL;
+    fake_mi_put_nsproxy(nsproxy);
+}
 
 static char *fake_mi_active_buf_locked(size_t *len)
 {
@@ -168,12 +216,13 @@ static bool parse_line(const char *line, size_t len,
                        size_t *mi_start, size_t *mi_end,
                        size_t *pi_start, size_t *pi_end,
                        struct fake_mi_prop_ref *prop_refs, size_t *prop_count,
-                       bool *is_ksu)
+                       bool *is_ksu, bool *is_namespace_root)
 {
     size_t i = 0, token_start, token_end;
     size_t j;
 
     *is_ksu = false;
+    *is_namespace_root = false;
     if (prop_count)
         *prop_count = 0;
 
@@ -199,10 +248,15 @@ static bool parse_line(const char *line, size_t len,
         return false;
     i++;
 
-    /* Skip major:minor, root, mountpoint, mount opts. */
+    /* Skip major:minor, root, mountpoint, mount opts. A self-parent entry is
+     * only a legitimate graph terminator when it is mounted at namespace /.
+     */
     for (j = 0; j < 4; j++) {
+        token_start = i;
         if (!skip_token(line, len, &i))
             return false;
+        if (j == 2 && i == token_start + 2 && line[token_start] == '/')
+            *is_namespace_root = true;
     }
 
     while (i < len) {
@@ -311,10 +365,21 @@ static bool parse_line_target(const char *line, size_t len,
 /* ------------------------------------------------------------------ */
 
 #define MAX_MOUNTS 4096
+#define MAX_PROP_IDS (MAX_MOUNTS * FAKE_MI_MAX_PROP_FIELDS)
 
 struct id_map_entry {
     int old_id;
     int new_id;
+};
+
+struct mount_map_entry {
+    int old_id;
+    int parent_id;
+    int new_id;
+    int resolved_parent_id;
+    unsigned int walk_cookie;
+    bool graph_validated;
+    bool namespace_root;
 };
 
 static int map_lookup(const struct id_map_entry *map, int nmap, int old_id)
@@ -328,17 +393,168 @@ static int map_lookup(const struct id_map_entry *map, int nmap, int old_id)
     return -1;
 }
 
-static void map_add_if_missing(struct id_map_entry *map, int *nmap,
-                               int max_entries, int old_id, int *next_id)
+static int map_add_if_missing(struct id_map_entry *map, int *nmap,
+                              int max_entries, int old_id, int *next_id)
 {
-    if (!map || !nmap || !next_id || old_id <= 0 || *nmap >= max_entries)
-        return;
+    if (!map || !nmap || !next_id || old_id <= 0)
+        return -EINVAL;
     if (map_lookup(map, *nmap, old_id) >= 0)
-        return;
+        return 0;
+    if (*nmap >= max_entries)
+        return -E2BIG;
 
     map[*nmap].old_id = old_id;
     map[*nmap].new_id = (*next_id)++;
     (*nmap)++;
+    return 0;
+}
+
+static int mount_map_lookup(const struct mount_map_entry *map, int nmap,
+                            int old_id)
+{
+    int i;
+
+    for (i = 0; i < nmap; i++) {
+        if (map[i].old_id == old_id)
+            return i;
+    }
+    return -1;
+}
+
+static int mount_map_add(struct mount_map_entry *map, int *nmap,
+                         int old_id, int parent_id, bool visible,
+                         bool namespace_root, int *next_id)
+{
+    if (!map || !nmap || !next_id || old_id <= 0 || parent_id <= 0)
+        return -EINVAL;
+    if (mount_map_lookup(map, *nmap, old_id) >= 0)
+        return -EEXIST;
+    if (*nmap >= MAX_MOUNTS)
+        return -E2BIG;
+
+    map[*nmap].old_id = old_id;
+    map[*nmap].parent_id = parent_id;
+    map[*nmap].new_id = visible ? (*next_id)++ : -1;
+    map[*nmap].resolved_parent_id = 0;
+    map[*nmap].walk_cookie = 0;
+    map[*nmap].graph_validated = false;
+    map[*nmap].namespace_root = namespace_root;
+    (*nmap)++;
+    return 0;
+}
+
+static int mount_map_validate_graph(struct mount_map_entry *map, int nmap)
+{
+    unsigned int cookie = 0;
+    int i;
+
+    for (i = 0; i < nmap; i++) {
+        int node_idx = i;
+        int hops;
+        int j;
+
+        if (map[i].graph_validated)
+            continue;
+        cookie++;
+        for (hops = 0; hops <= nmap; hops++) {
+            int parent;
+
+            if (map[node_idx].graph_validated)
+                break;
+            if (map[node_idx].walk_cookie == cookie)
+                return -ELOOP;
+            map[node_idx].walk_cookie = cookie;
+            if (map[node_idx].old_id == map[node_idx].parent_id) {
+                if (!map[node_idx].namespace_root)
+                    return -ELOOP;
+                break;
+            }
+            parent = mount_map_lookup(map, nmap,
+                                      map[node_idx].parent_id);
+            if (parent < 0)
+                break;
+            node_idx = parent;
+        }
+        if (hops > nmap)
+            return -ELOOP;
+        for (j = 0; j < nmap; j++) {
+            if (map[j].walk_cookie == cookie)
+                map[j].graph_validated = true;
+        }
+    }
+
+    for (i = 0; i < nmap; i++)
+        map[i].walk_cookie = 0;
+    return 0;
+}
+
+static int mount_map_resolve_parent(struct mount_map_entry *map, int nmap,
+                                    const struct id_map_entry *external_map,
+                                    int n_external, int old_parent_id,
+                                    unsigned int walk_cookie, int *resolved)
+{
+    int current_id = old_parent_id;
+    int result = -1;
+    int hops;
+
+    if (!resolved)
+        return -EINVAL;
+
+    for (hops = 0; hops <= nmap; hops++) {
+        int idx = mount_map_lookup(map, nmap, current_id);
+
+        /* A parent outside the visible mountinfo root has no line of its own. */
+        if (idx < 0) {
+            result = map_lookup(external_map, n_external, current_id);
+            if (result < 0)
+                return -ENOENT;
+            break;
+        }
+        if (map[idx].new_id > 0) {
+            result = map[idx].new_id;
+            break;
+        }
+        if (map[idx].resolved_parent_id > 0) {
+            result = map[idx].resolved_parent_id;
+            break;
+        }
+
+        /* A mount tree cannot contain a parent cycle. Reject malformed input. */
+        if (map[idx].walk_cookie == walk_cookie)
+            return -ELOOP;
+
+        map[idx].walk_cookie = walk_cookie;
+        current_id = map[idx].parent_id;
+    }
+
+    if (result < 0)
+        return -ELOOP;
+
+    /* Cache the resolved visible/external ancestor on every hidden node in
+     * this walk. Shared hidden chains are then resolved once rather than once
+     * per visible child.
+     */
+    current_id = old_parent_id;
+    for (hops = 0; hops <= nmap; hops++) {
+        int idx = mount_map_lookup(map, nmap, current_id);
+
+        if (idx < 0 || map[idx].new_id > 0 ||
+            map[idx].resolved_parent_id > 0 ||
+            map[idx].walk_cookie != walk_cookie)
+            break;
+        map[idx].resolved_parent_id = result;
+        current_id = map[idx].parent_id;
+    }
+
+    *resolved = result;
+    return 0;
+}
+
+static size_t decimal_len(int value)
+{
+    char buf[16];
+
+    return scnprintf(buf, sizeof(buf), "%d", value);
 }
 
 /* Build the new mountinfo buffer from the current hidden task's real
@@ -349,25 +565,39 @@ static void map_add_if_missing(struct id_map_entry *map, int *nmap,
 static int build_fake_buffer(const char *raw, size_t raw_len,
                              char *out, size_t out_cap, size_t *out_len)
 {
-    struct id_map_entry *mount_map;
+    struct mount_map_entry *mount_map;
     struct id_map_entry *prop_map;
+    struct id_map_entry *external_map;
     int n_mount_map = 0;
     int n_prop_map = 0;
+    int n_external = 0;
     int next_mount_id = 1;
     int next_prop_id = 1;
+    unsigned int parent_walk_cookie = 1;
+    int i;
+    int ret = 0;
     size_t in = 0, o = 0;
 
     mount_map = kvmalloc_array(MAX_MOUNTS, sizeof(*mount_map), GFP_KERNEL);
     if (!mount_map)
         return -ENOMEM;
 
-    prop_map = kvmalloc_array(MAX_MOUNTS, sizeof(*prop_map), GFP_KERNEL);
+    prop_map = kvmalloc_array(MAX_PROP_IDS, sizeof(*prop_map), GFP_KERNEL);
     if (!prop_map) {
         kvfree(mount_map);
         return -ENOMEM;
     }
+    external_map = kvmalloc_array(MAX_MOUNTS, sizeof(*external_map),
+                                  GFP_KERNEL);
+    if (!external_map) {
+        kvfree(prop_map);
+        kvfree(mount_map);
+        return -ENOMEM;
+    }
 
-    /* Pass 1: assign new ids to non-KSU lines in original order. */
+    /* Pass 1: retain the complete parent graph and assign compact ids only
+     * to non-KSU lines in original order.
+     */
     in = 0;
     while (in < raw_len) {
         size_t ls = in;
@@ -376,22 +606,49 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         struct fake_mi_prop_ref prop_refs[FAKE_MI_MAX_PROP_FIELDS];
         size_t prop_count = 0;
         bool ksu;
+        bool namespace_root;
         size_t j;
 
         while (in < raw_len && raw[in] != '\n') in++;
-        if (parse_line(raw + ls, in - ls, &mi, &pi,
-                       &ms, &me, &ps, &pe,
-                       prop_refs, &prop_count, &ksu)) {
-            if (!ksu) {
-                map_add_if_missing(mount_map, &n_mount_map, MAX_MOUNTS,
-                                   mi, &next_mount_id);
-                for (j = 0; j < prop_count; j++) {
-                    map_add_if_missing(prop_map, &n_prop_map, MAX_MOUNTS,
-                                       prop_refs[j].old_id, &next_prop_id);
-                }
+        if (!parse_line(raw + ls, in - ls, &mi, &pi,
+                        &ms, &me, &ps, &pe,
+                        prop_refs, &prop_count, &ksu, &namespace_root)) {
+            ret = -EINVAL;
+            goto out;
+        }
+        ret = mount_map_add(mount_map, &n_mount_map, mi, pi, !ksu,
+                            namespace_root, &next_mount_id);
+        if (ret)
+            goto out;
+        if (!ksu) {
+            for (j = 0; j < prop_count; j++) {
+                ret = map_add_if_missing(prop_map, &n_prop_map,
+                                         MAX_PROP_IDS,
+                                         prop_refs[j].old_id,
+                                         &next_prop_id);
+                if (ret)
+                    goto out;
             }
         }
         if (in < raw_len) in++;
+    }
+
+    ret = mount_map_validate_graph(mount_map, n_mount_map);
+    if (ret)
+        goto out;
+
+    /* Compact external parents after all visible IDs so a namespace-root
+     * parent cannot collide with any emitted mount ID.
+     */
+    for (i = 0; i < n_mount_map; i++) {
+        if (mount_map_lookup(mount_map, n_mount_map,
+                             mount_map[i].parent_id) >= 0)
+            continue;
+        ret = map_add_if_missing(external_map, &n_external, MAX_MOUNTS,
+                                 mount_map[i].parent_id,
+                                 &next_mount_id);
+        if (ret)
+            goto out;
     }
 
     /* Pass 2: rewrite. */
@@ -403,8 +660,9 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         struct fake_mi_prop_ref prop_refs[FAKE_MI_MAX_PROP_FIELDS];
         size_t prop_count = 0;
         bool ksu;
+        bool namespace_root;
         size_t line_len;
-        int new_mi = -1, new_pi = -1;
+        int new_mi, new_pi;
         size_t cursor;
         int n;
         size_t j;
@@ -414,23 +672,51 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
 
         if (!parse_line(raw + ls, line_len, &mi, &pi,
                         &ms, &me, &ps, &pe,
-                        prop_refs, &prop_count, &ksu) || ksu) {
+                        prop_refs, &prop_count, &ksu, &namespace_root)) {
+            ret = -EINVAL;
+            goto out;
+        }
+        if (ksu) {
             if (in < raw_len) in++;
             continue;
         }
 
-        new_mi = map_lookup(mount_map, n_mount_map, mi);
-        new_pi = map_lookup(mount_map, n_mount_map, pi);
-        if (new_mi < 0) new_mi = mi;
-        /* If parent was filtered (shouldn't happen: KSU mounts are leaves in
-         * practice), leave parent_id as its original value — detectors would
-         * see an orphan id rather than a contradiction.
-         */
-        if (new_pi < 0) new_pi = pi;
+        n = mount_map_lookup(mount_map, n_mount_map, mi);
+        if (n < 0 || mount_map[n].new_id <= 0) {
+            ret = -ENOENT;
+            goto out;
+        }
+        new_mi = mount_map[n].new_id;
+        parent_walk_cookie++;
+        ret = mount_map_resolve_parent(mount_map, n_mount_map,
+                                       external_map, n_external, pi,
+                                       parent_walk_cookie, &new_pi);
+        if (ret)
+            goto out;
 
-        /* Reserve for "\n" + safety margin. */
-        if (o + line_len + 32 > out_cap)
-            break;
+        {
+            size_t rewritten_len = line_len - (me - ms) - (pe - ps) +
+                                   decimal_len(new_mi) + decimal_len(new_pi);
+
+            for (j = 0; j < prop_count; j++) {
+                int new_prop = map_lookup(prop_map, n_prop_map,
+                                          prop_refs[j].old_id);
+
+                if (new_prop < 0) {
+                    ret = -ENOENT;
+                    goto out;
+                }
+                rewritten_len -= prop_refs[j].value_end -
+                                 prop_refs[j].value_start;
+                rewritten_len += decimal_len(new_prop);
+            }
+            if (in < raw_len)
+                rewritten_len++;
+            if (rewritten_len > out_cap - o) {
+                ret = -E2BIG;
+                goto out;
+            }
+        }
 
         n = scnprintf(out + o, out_cap - o, "%d", new_mi);
         o += n;
@@ -443,8 +729,10 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         for (j = 0; j < prop_count; j++) {
             int new_prop = map_lookup(prop_map, n_prop_map, prop_refs[j].old_id);
 
-            if (new_prop < 0)
-                new_prop = prop_refs[j].old_id;
+            if (new_prop < 0) {
+                ret = -ENOENT;
+                goto out;
+            }
             memcpy(out + o, raw + ls + cursor,
                    prop_refs[j].value_start - cursor);
             o += prop_refs[j].value_start - cursor;
@@ -462,10 +750,12 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         }
     }
 
+    *out_len = o;
+out:
+    kvfree(external_map);
     kvfree(prop_map);
     kvfree(mount_map);
-    *out_len = o;
-    return 0;
+    return ret;
 }
 
 /* Caller must hold g_cache.lock.
@@ -479,7 +769,7 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
  * on this function's outbound indirect calls is the only fix (BTI is still
  * satisfied: the raw bodies start with paciasp/bti-c landing pads).
  */
-static KASUMI_NOCFI int regenerate_cache_locked(void)
+static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
 {
     struct file *f;
     char *scratch = NULL;
@@ -491,7 +781,8 @@ static KASUMI_NOCFI int regenerate_cache_locked(void)
     int new_slot;
     int ret = -EIO;
 
-    if (!ptr_filp_open || !ptr_kernel_read || !ptr_filp_close)
+    if (!ptr_filp_open || !ptr_kernel_read || !ptr_filp_close ||
+        !owner_nsproxy || !owner_nsproxy->mnt_ns)
         return -ENOSYS;
 
     new_slot = READ_ONCE(g_cache.active_slot) ^ 1;
@@ -504,6 +795,7 @@ static KASUMI_NOCFI int regenerate_cache_locked(void)
      * atomic readers to leave before reusing its storage.
      */
     synchronize_rcu();
+    fake_mi_release_slot_owner_locked(new_slot);
 
     atomic_set(&fake_mi_reader_pid, task_pid_nr(current));
     f = ptr_filp_open("/proc/self/mountinfo", O_RDONLY, 0);
@@ -535,15 +827,35 @@ static KASUMI_NOCFI int regenerate_cache_locked(void)
         total += r;
     }
 
+    if (total == FAKE_MI_SCRATCH) {
+        char extra;
+
+        r = ptr_kernel_read(f, &extra, 1, &pos);
+        if (r < 0) {
+            ret = r;
+            goto out_free;
+        }
+        if (r > 0) {
+            ret = -E2BIG;
+            kasumi_log("fake_mi: mountinfo exceeds scratch capacity pid=%d comm=%s\n",
+                     task_pid_nr(current), current->comm);
+            goto out_free;
+        }
+    }
+
     ret = build_fake_buffer(scratch, total, new_buf, FAKE_MI_BUF_MAX, &new_len);
-    if (ret != 0)
+    if (ret != 0) {
+        kasumi_log("fake_mi: rebuild failed pid=%d comm=%s ret=%d raw_len=%zu\n",
+                 task_pid_nr(current), current->comm, ret, total);
         goto out_free;
+    }
 
     g_cache.slots[new_slot].len = new_len;
-    smp_wmb();
-    WRITE_ONCE(g_cache.active_slot, new_slot);
+    g_cache.slots[new_slot].nsproxy = owner_nsproxy;
+    g_cache.slots[new_slot].mnt_ns = owner_nsproxy->mnt_ns;
+    smp_store_release(&g_cache.active_slot, new_slot);
     WRITE_ONCE(g_cache.last_jiffies, jiffies);
-    WRITE_ONCE(g_cache.valid, true);
+    smp_store_release(&g_cache.valid, true);
     g_cache_gen++;
     ret = 0;
     kasumi_log("fake_mi: regenerated pid=%d comm=%s raw_len=%zu fake_len=%zu gen=%llu\n",
@@ -555,6 +867,49 @@ out_free:
 out_close:
     ptr_filp_close(f, NULL);
     atomic_set(&fake_mi_reader_pid, 0);
+    return ret;
+}
+
+/* Caller must hold g_cache.lock. This makes namespace selection, cache
+ * generation and the caller's subsequent cache access one transaction.
+ */
+static int fake_mi_prepare_locked(bool force)
+{
+    struct mnt_namespace *mnt_ns = fake_mi_current_mnt_ns();
+    struct nsproxy *owner_nsproxy;
+    int slot;
+    int ret;
+
+    if (!mnt_ns)
+        ret = -ESRCH;
+    else {
+        slot = READ_ONCE(g_cache.active_slot);
+        if (!force && g_cache.valid &&
+            slot >= 0 && slot < FAKE_MI_BUF_SLOTS &&
+            g_cache.slots[slot].mnt_ns == mnt_ns &&
+            !time_after(jiffies, g_cache.last_jiffies +
+                                  msecs_to_jiffies(FAKE_MI_TTL_MS)))
+            return 0;
+
+        owner_nsproxy = current->nsproxy;
+        if (!owner_nsproxy || owner_nsproxy->mnt_ns != mnt_ns)
+            ret = -ESRCH;
+        else {
+            get_nsproxy(owner_nsproxy);
+            ret = regenerate_cache_locked(owner_nsproxy);
+            if (!ret)
+                owner_nsproxy = NULL;
+            fake_mi_put_nsproxy(owner_nsproxy);
+        }
+    }
+
+    if (ret) {
+        /* Never let an older namespace snapshot survive a failed rebuild. */
+        smp_store_release(&g_cache.valid, false);
+        fake_mi_last_error = ret;
+    } else {
+        fake_mi_last_error = 0;
+    }
     return ret;
 }
 
@@ -626,8 +981,12 @@ void kasumi_fake_mi_invalidate_all(void)
     spin_unlock_irqrestore(&g_cursors_lock, flags);
 
     mutex_lock(&g_cache.lock);
-    g_cache.valid = false;
+    smp_store_release(&g_cache.valid, false);
+    fake_mi_last_error = 0;
     g_cache.last_jiffies = 0;
+    synchronize_rcu();
+    for (i = 0; i < FAKE_MI_BUF_SLOTS; i++)
+        fake_mi_release_slot_owner_locked(i);
     mutex_unlock(&g_cache.lock);
 }
 
@@ -646,10 +1005,7 @@ int kasumi_fake_mi_prepare(bool force)
         return 0;
 
     mutex_lock(&g_cache.lock);
-    if (force || !g_cache.valid ||
-        time_after(jiffies, g_cache.last_jiffies +
-                             msecs_to_jiffies(FAKE_MI_TTL_MS)))
-        ret = regenerate_cache_locked();
+    ret = fake_mi_prepare_locked(force);
     mutex_unlock(&g_cache.lock);
 
     return ret;
@@ -675,15 +1031,18 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
     size_t cache_len;
 
     if (!file || !userbuf)
-        return 0;
-
-    (void)kasumi_fake_mi_prepare(false);
+        return -EINVAL;
 
     mutex_lock(&g_cache.lock);
+    ret = fake_mi_prepare_locked(false);
+    if (ret) {
+        mutex_unlock(&g_cache.lock);
+        return ret;
+    }
     cache_buf = fake_mi_active_buf_locked(&cache_len);
     if (!g_cache.valid || !cache_buf) {
         mutex_unlock(&g_cache.lock);
-        return 0;
+        return READ_ONCE(fake_mi_initialized) ? -EAGAIN : 0;
     }
     gen = g_cache_gen;
 
@@ -703,7 +1062,7 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
         /* Also clear cursor so a subsequent lseek-to-0 would start fresh;
          * simpler: leave it, a reused fd gets cursor=0 when cache_gen bumps.
          */
-        return -1;  /* caller interprets: override ret to 0 */
+        return -ENODATA;  /* caller interprets: override ret to 0 */
     }
 
     avail = cache_len - pos;
@@ -711,7 +1070,7 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
 
     if (copy_to_user(userbuf, cache_buf + pos, to_copy)) {
         mutex_unlock(&g_cache.lock);
-        return 0;
+        return -EFAULT;
     }
     mutex_unlock(&g_cache.lock);
 
@@ -739,6 +1098,7 @@ ssize_t kasumi_fake_mi_read_iter(struct kiocb *iocb, struct iov_iter *to)
     loff_t pos;
     char *cache_buf;
     size_t cache_len;
+    int ret;
 
     if (!iocb || !to)
         return -EINVAL;
@@ -746,9 +1106,12 @@ ssize_t kasumi_fake_mi_read_iter(struct kiocb *iocb, struct iov_iter *to)
     if (!file)
         return -EINVAL;
 
-    (void)kasumi_fake_mi_prepare(false);
-
     mutex_lock(&g_cache.lock);
+    ret = fake_mi_prepare_locked(false);
+    if (ret) {
+        mutex_unlock(&g_cache.lock);
+        return ret;
+    }
     cache_buf = fake_mi_active_buf_locked(&cache_len);
     if (!g_cache.valid || !cache_buf) {
         mutex_unlock(&g_cache.lock);
@@ -785,9 +1148,10 @@ int kasumi_fake_mi_lookup_mount_id(const char *path)
         return -EINVAL;
 
     path_len = strlen(path);
-    (void)kasumi_fake_mi_prepare(false);
-
     mutex_lock(&g_cache.lock);
+    ret = fake_mi_prepare_locked(false);
+    if (ret)
+        goto out_unlock;
     cache_buf = fake_mi_active_buf_locked(&cache_len);
     if (!g_cache.valid || !cache_buf) {
         ret = -EAGAIN;
@@ -826,6 +1190,7 @@ int kasumi_fake_mi_lookup_mount_id_cached(const char *path)
     size_t in = 0;
     int ret = -ENOENT;
     int slot;
+    struct mnt_namespace *mnt_ns;
     char *cache_buf;
     size_t cache_len;
 
@@ -835,18 +1200,23 @@ int kasumi_fake_mi_lookup_mount_id_cached(const char *path)
     path_len = strlen(path);
 
     rcu_read_lock();
-    if (!READ_ONCE(g_cache.valid)) {
+    if (!smp_load_acquire(&g_cache.valid)) {
         ret = -EAGAIN;
         goto out_unlock;
     }
 
-    slot = READ_ONCE(g_cache.active_slot);
+    slot = smp_load_acquire(&g_cache.active_slot);
     if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS) {
         ret = -EAGAIN;
         goto out_unlock;
     }
 
-    smp_rmb();
+    mnt_ns = fake_mi_current_mnt_ns();
+    if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns) {
+        ret = -EAGAIN;
+        goto out_unlock;
+    }
+
     cache_buf = READ_ONCE(g_cache.slots[slot].buf);
     cache_len = READ_ONCE(g_cache.slots[slot].len);
     if (!cache_buf || cache_len == 0) {
@@ -894,10 +1264,13 @@ int kasumi_fake_mi_init(void)
     ptr_filp_open  = (void *)kasumi_lookup_callable("filp_open");
     ptr_filp_close = (void *)kasumi_lookup_callable("filp_close");
     ptr_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
+    ptr_free_nsproxy = (void *)kasumi_lookup_callable("free_nsproxy");
 
-    if (!ptr_filp_open || !ptr_filp_close || !ptr_kernel_read) {
-        pr_warn("Kasumi fake_mi: symbol resolution failed (filp_open=%p filp_close=%p kernel_read=%p); feature disabled\n",
-                ptr_filp_open, ptr_filp_close, ptr_kernel_read);
+    if (!ptr_filp_open || !ptr_filp_close || !ptr_kernel_read ||
+        !ptr_free_nsproxy) {
+        pr_warn("Kasumi fake_mi: symbol resolution failed (filp_open=%p filp_close=%p kernel_read=%p free_nsproxy=%p); feature disabled\n",
+                ptr_filp_open, ptr_filp_close, ptr_kernel_read,
+                ptr_free_nsproxy);
         return -ENOSYS;
     }
 
@@ -906,9 +1279,14 @@ int kasumi_fake_mi_init(void)
         if (!g_cache.slots[i].buf)
             goto out_free_slots;
         g_cache.slots[i].len = 0;
+        g_cache.slots[i].nsproxy = NULL;
+        g_cache.slots[i].mnt_ns = NULL;
     }
     g_cache.active_slot = 0;
-    g_cache.valid = false;
+    smp_store_release(&g_cache.valid, false);
+    fake_mi_last_error = 0;
+
+    WRITE_ONCE(fake_mi_initialized, true);
 
     pr_info("Kasumi fake_mi: initialized (current-view mountinfo)\n");
     return 0;
@@ -926,18 +1304,25 @@ void kasumi_fake_mi_exit(void)
 {
     int i;
 
-    mutex_lock(&g_cache.lock);
-    g_cache.valid = false;
-    mutex_unlock(&g_cache.lock);
+    if (!READ_ONCE(fake_mi_initialized))
+        return;
 
+    WRITE_ONCE(fake_mi_initialized, false);
+    mutex_lock(&g_cache.lock);
+    smp_store_release(&g_cache.valid, false);
+    fake_mi_last_error = 0;
     synchronize_rcu();
-
-    mutex_lock(&g_cache.lock);
     for (i = 0; i < FAKE_MI_BUF_SLOTS; i++) {
+        fake_mi_release_slot_owner_locked(i);
         vfree(g_cache.slots[i].buf);
         g_cache.slots[i].buf = NULL;
         g_cache.slots[i].len = 0;
     }
     g_cache.valid = false;
     mutex_unlock(&g_cache.lock);
+}
+
+bool kasumi_fake_mi_active(void)
+{
+    return READ_ONCE(fake_mi_initialized);
 }

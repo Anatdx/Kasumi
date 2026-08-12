@@ -16,8 +16,10 @@
 
 int kasumi_fake_mi_init(void);
 void kasumi_fake_mi_exit(void);
+bool kasumi_fake_mi_active(void);
 
-/* Refresh the cached fake mountinfo snapshot when it is missing or stale.
+/* Refresh the current mount namespace's fake mountinfo snapshot when it is
+ * missing, stale, or belongs to another namespace.
  * Safe to call from process context before userland starts reading
  * /proc/.../mountinfo; the per-open producer proxy should stay copy-only.
  */
@@ -40,9 +42,9 @@ bool kasumi_fake_mi_is_internal_read(void);
  * @explicit_pos: byte offset requested by pread64, or -1 for normal read()
  *
  * Returns:
- *   > 0  — new ret value to report to user (caller must override regs return)
- *   0    — feature disabled / cache unavailable, caller falls back
- *   < 0  — error (caller keeps kernel_ret)
+ *   > 0: new ret value to report to user
+ *   0: feature disabled, caller may fall back
+ *   < 0: cache/copy error; an active fake view must fail closed
  *
  * On success the function has already overwritten userbuf with fake content
  * and, for read(), advanced the per-file cursor.

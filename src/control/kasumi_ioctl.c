@@ -52,6 +52,8 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
 #include "kasumi_syscall_redirect.h"
+#include "kasumi_task_marker.h"
+#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_uname.h"
 #include "kasumi_dop_override.h"
 #include "kasumi_xattr_sid_override.h"
@@ -416,13 +418,44 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		int val;
 		if (copy_from_user(&val, arg, sizeof(val)))
 			return -EFAULT;
-		if (val && !kasumi_policy_prepare_enable())
-			return -ENODEV;
-		mutex_lock(&kasumi_config_mutex);
-		WRITE_ONCE(kasumi_enabled, !!val);
-		if (!kasumi_enabled)
+		if (val) {
+			if (kasumi_tracepoint_hooks_active() &&
+			    !kasumi_task_marker_ready())
+				return -ENODEV;
+			mutex_lock(&kasumi_config_mutex);
+			if (READ_ONCE(kasumi_enabled)) {
+				if (kasumi_task_marker_active())
+					kasumi_task_marker_refresh();
+				mutex_unlock(&kasumi_config_mutex);
+				return 0;
+			}
+			if (!kasumi_policy_prepare_enable_locked()) {
+				mutex_unlock(&kasumi_config_mutex);
+				return -ENODEV;
+			}
+			/*
+			 * Arm lifecycle probes and mark existing targets before exposing
+			 * the enabled state. UID transitions during the scan queue their
+			 * own post-syscall reconciliation before returning to userspace.
+			 */
+			if (kasumi_tracepoint_hooks_active())
+				kasumi_task_marker_set_enabled(true);
+			/* Publish provider state and completed task scan together. */
+			smp_store_release(&kasumi_enabled, true);
+			mutex_unlock(&kasumi_config_mutex);
+		} else {
+			mutex_lock(&kasumi_config_mutex);
+			if (!READ_ONCE(kasumi_enabled) &&
+			    !kasumi_task_marker_active()) {
+				mutex_unlock(&kasumi_config_mutex);
+				return 0;
+			}
+			/* Stop policy readers before provider pointers are withdrawn. */
+			smp_store_release(&kasumi_enabled, false);
+			kasumi_task_marker_set_enabled(false);
 			kasumi_policy_disable_provider_locked();
-		mutex_unlock(&kasumi_config_mutex);
+			mutex_unlock(&kasumi_config_mutex);
+		}
 		kasumi_log("Kasumi %s\n", READ_ONCE(kasumi_enabled) ?
 			   "enabled" : "disabled");
 		return 0;
@@ -889,6 +922,10 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    kasumi_mount_hide_vfsmnt_registered ||
 		    kasumi_mount_hide_mountinfo_registered)
 			features |= KSM_FEATURE_MOUNT_HIDE;
+		if (kasumi_proc_proxy_registered && kasumi_fake_mi_active() &&
+		    kasumi_tracepoint_hooks_active() &&
+		    kasumi_task_marker_ready())
+			features |= KSM_FEATURE_FAKE_MOUNTINFO;
 		if (kasumi_proc_proxy_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
 		if (kasumi_statfs_kretprobe_registered)
@@ -929,16 +966,22 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		written += n;
 
 		/* Path redirect */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
+		if (kasumi_tracepoint_hooks_active() &&
+		    kasumi_task_marker_ready() &&
+		    kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_openat))
 			path_tsr = true;
 #ifdef __NR_getxattr
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
+		if (kasumi_tracepoint_hooks_active() &&
+		    kasumi_task_marker_ready() &&
+		    kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_getxattr))
 			xattr_path_tsr = true;
 #endif
 #ifdef __NR_listxattr
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
+		if (kasumi_tracepoint_hooks_active() &&
+		    kasumi_task_marker_ready() &&
+		    kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_listxattr))
 			xattr_path_tsr = true;
 #endif
@@ -949,6 +992,11 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written, "xattr path: %s\n",
 			      xattr_path_tsr ? "TSR" : "none");
+		written += n;
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "task marker: %s%s\n",
+			      kasumi_task_marker_ready() ? "uid lifecycle" : "none",
+			      kasumi_task_marker_active() ? " (active)" : "");
 		written += n;
 
 		/* VFS hooks */
@@ -1005,6 +1053,14 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				     "mountinfo: kprobe (show_mountinfo)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "mountinfo/mounts: none\n");
+		written += n;
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "fake mountinfo: %s\n",
+			      kasumi_proc_proxy_registered &&
+			      kasumi_fake_mi_active() &&
+			      kasumi_tracepoint_hooks_active() &&
+			      kasumi_task_marker_ready() ?
+				      "compact ids" : "none");
 		written += n;
 
 		/* maps spoof */

@@ -26,6 +26,7 @@
 #include <linux/fdtable.h>
 #include <linux/namei.h>
 #include <linux/path.h>
+#include <linux/rcupdate.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
 #include <linux/uidgid.h>
@@ -63,8 +64,21 @@
  */
 struct kasumi_getfd_task_work {
 	struct callback_head cb;
+	struct rcu_head rcu;
 	int __user *outp;
 };
+
+static void kasumi_getfd_task_work_release_rcu(struct rcu_head *rcu)
+{
+	struct kasumi_getfd_task_work *tw =
+		container_of(rcu, struct kasumi_getfd_task_work, rcu);
+
+	kfree(tw);
+	/* kasumi_bootstrap_exit() ends with rcu_barrier(), which covers this
+	 * callback's epilogue if this is the last module reference.
+	 */
+	module_put(THIS_MODULE);
+}
 
 static void kasumi_getfd_task_work_func(struct callback_head *cb)
 {
@@ -74,8 +88,8 @@ static void kasumi_getfd_task_work_func(struct callback_head *cb)
 
 	if (fd < 0)
 		(void)put_user(fd, tw->outp);
-	module_put(THIS_MODULE);
-	kfree(tw);
+	/* Do not drop the last module reference from module text directly. */
+	call_rcu(&tw->rcu, kasumi_getfd_task_work_release_rcu);
 }
 
 static int kasumi_queue_getfd_task_work(int __user *outp)
@@ -96,8 +110,7 @@ static int kasumi_queue_getfd_task_work(int __user *outp)
 	tw->outp = outp;
 	tw->cb.func = kasumi_getfd_task_work_func;
 	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
-		module_put(THIS_MODULE);
-		kfree(tw);
+		call_rcu(&tw->rcu, kasumi_getfd_task_work_release_rcu);
 		return -ESRCH;
 	}
 
