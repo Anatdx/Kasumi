@@ -485,7 +485,7 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 				}
 			}
 		} else {
-			pr_info("Kasumi: cmdline spoofing via syscall-table read hook\n");
+			pr_info("Kasumi: cmdline spoofing via TSR read route\n");
 		}
 	}
 
@@ -497,8 +497,9 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 void kasumi_proc_hooks_exit(void)
 {
 	/*
-	 * Note: syscall table restoration is intentionally NOT performed here.
-	 * kasumi_bootstrap_exit() drives that as PHASE 1 (before any
+	 * Note: TSR teardown is intentionally NOT performed here.
+	 * kasumi_bootstrap_exit() unregisters the tracepoint and restores the
+	 * dispatcher slot in PHASE 1 (before any
 	 * handler-reachable resource is freed) so that proc-fd proxies, fake
 	 * mountinfo, and other state cleaned up below cannot be raced against
 	 * by a high-frequency syscall (read/openat) still being dispatched into

@@ -23,7 +23,7 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - Main code: `src/`
 - Control protocol: `src/include/kasumi_uapi.h`
 - Current protocol version: `KSM_PROTOCOL_VERSION = 16`
-- Hook strategy: syscall-table TSR for the hot path, with fop/iop shadows and kprobe/ftrace fallbacks where needed
+- Hook strategy: Tracepoint Syscall Redirect (TSR) for the hot path, with fop/iop shadows and kprobe/ftrace fallbacks where needed
 - 6.6+ compatibility for `arch_ftrace_get_regs` is included in current code
 
 ## Core Capabilities
@@ -43,8 +43,10 @@ Use in controlled environments only. This module hooks VFS and syscall hot paths
 
 ## Hook Overview
 
-- GET_FD path: syscall-table TSR through `reboot`/`prctl`, with legacy kprobe fallbacks
-- Path syscalls: syscall-table TSR covers `openat/openat2`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
+- TSR: `sys_enter` redirects registered syscall numbers to one shared dispatcher installed in an unused `ni_syscall` table slot; target syscall-table entries are never patched
+- GET_FD path: TSR routes `reboot`/`prctl`, with legacy kprobe fallbacks
+- Path syscalls: TSR covers `openat/openat2`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
+- KernelSU coexistence: Kasumi selects a different unused dispatcher slot and does not overwrite a syscall number already redirected by another TSR consumer
 - VFS path: iop/fop shadow hooks handle `getattr` and `readdir`; ftrace/kretprobe paths remain as fallbacks where enabled
 - Symbol resolution: prefer `kallsyms_lookup_name`, fallback to per-symbol kprobe resolution
 
@@ -95,7 +97,7 @@ ksud insmod kasumi_lkm.ko
 Common module parameters in `src/core/kasumi_bootstrap.c`:
 
 - `kasumi_syscall_nr`
-- `kasumi_no_tracepoint=1`
+- `kasumi_no_tracepoint=1` (disable TSR and use legacy fallbacks)
 - `kasumi_skip_vfs=1`
 - `kasumi_skip_extra_kprobes=1`
 - `kasumi_skip_getfd=1`
@@ -124,7 +126,7 @@ In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_moun
 
 ## Quick Troubleshooting
 
-- `Unknown symbol __tracepoint_sys_enter`: try `kasumi_no_tracepoint=1`
+- If TSR initialization reports that `sys_enter` is unavailable, try `kasumi_no_tracepoint=1`
 - Builds but cannot load: check `vermagic`, module signature policy, and `dmesg`
 - Hook/ABI changes: validate with `KSM_IOC_GET_HOOKS` and `KSM_IOC_GET_FEATURES`
 - Merge/injection regressions: compare `ls`, `ls -l`, `ls -Z`, and `getfattr -n security.selinux` on both canonical and symlinked paths

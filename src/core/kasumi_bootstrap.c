@@ -31,6 +31,7 @@
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_syscall_redirect.h"
+#include "kasumi_tracepoint_hooks.h"
 
 #ifndef KASUMI_VERSION
 #define KASUMI_VERSION "0.1.0-dev"
@@ -38,7 +39,7 @@
 
 static int kasumi_no_tracepoint_param;
 module_param_named(kasumi_no_tracepoint, kasumi_no_tracepoint_param, int, 0600);
-MODULE_PARM_DESC(kasumi_no_tracepoint, "Deprecated compatibility knob; syscall hooks now patch syscall table entries directly.");
+MODULE_PARM_DESC(kasumi_no_tracepoint, "1=disable TSR and use legacy kprobe/ftrace fallbacks.");
 
 static int kasumi_skip_kallsyms_param;
 module_param_named(kasumi_skip_kallsyms, kasumi_skip_kallsyms_param, int, 0600);
@@ -224,15 +225,30 @@ int kasumi_bootstrap_init(void)
 
 	kasumi_resolve_system_dev();
 
-	(void)kasumi_syscall_redirect_init();
+	if (!kasumi_no_tracepoint_param) {
+		ret = kasumi_syscall_redirect_init();
+		if (ret) {
+			pr_warn("Kasumi: TSR dispatcher unavailable: %d; using fallbacks\n",
+				ret);
+		} else {
+			ret = kasumi_tracepoint_hooks_init();
+			if (ret) {
+				pr_warn("Kasumi: TSR tracepoint unavailable: %d; using fallbacks\n",
+					ret);
+				kasumi_syscall_redirect_exit();
+			}
+		}
+	} else {
+		pr_alert("Kasumi: TSR disabled (kasumi_no_tracepoint=1)\n");
+	}
 
 	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param, 0);
 	if (ret)
-		goto err_buffers;
+		goto err_redirect;
 
 	ret = kasumi_vfs_hooks_init(0);
 	if (ret)
-		goto err_proc;
+		goto err_active;
 
 	(void)kasumi_sop_override_init();
 	(void)kasumi_dop_override_init();
@@ -245,8 +261,14 @@ int kasumi_bootstrap_init(void)
 	pr_alert("Kasumi: Chikyuu ga buttobu kurai tanoshinjaoo!!\n");
 	return 0;
 
-err_proc:
+err_active:
+	kasumi_tracepoint_hooks_exit();
+	kasumi_syscall_redirect_exit();
 	kasumi_proc_hooks_exit();
+	goto err_buffers;
+err_redirect:
+	kasumi_tracepoint_hooks_exit();
+	kasumi_syscall_redirect_exit();
 err_buffers:
 	vfree(kasumi_percpu_base);
 	vfree(kasumi_getname_buf_base);
@@ -271,17 +293,18 @@ void kasumi_bootstrap_exit(void)
 	/*
 	 * PHASE 1: Sever every entry point that can drive a syscall hook.
 	 *
-	 *  1. syscall_redirect_exit() restores every patched sys_call_table
-	 *     entry and waits via SRCU for in-flight syscall-table wrappers and
-	 *     their handlers to drain.
+	 *  1. tracepoint_hooks_exit() stops new redirects and waits for callbacks.
+	 *  2. syscall_redirect_exit() restores the single dispatcher slot and
+	 *     waits via SRCU for in-flight dispatchers and handlers to drain.
 	 *
 	 * Ordering matters: relative to KSU's manager_exit, this is the
-	 * syscall_table -> hooks teardown.  Any cleanup that frees
+	 * tracepoint -> dispatcher -> hooks teardown. Any cleanup that frees
 	 * resources reachable from h_openat/h_statfs/etc. (proc fd proxies,
 	 * fake mountinfo, fop/iop shadows, vfs ftrace hooks) MUST run after
 	 * this phase, otherwise a high-frequency syscall (e.g. read) will UAF
 	 * those resources mid-teardown.
 	 */
+	kasumi_tracepoint_hooks_exit();
 	kasumi_syscall_redirect_exit();
 
 	/* PHASE 2: handlers can no longer be reached, free their dependencies. */

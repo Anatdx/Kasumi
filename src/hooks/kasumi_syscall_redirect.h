@@ -21,17 +21,4 @@ void kasumi_syscall_redirect_exit(void);
 int  kasumi_register_syscall_hook(int nr, kasumi_syscall_hook_fn fn);
 void kasumi_unregister_syscall_hook(int nr);
 bool kasumi_has_syscall_hook(int nr);
-extern kasumi_syscall_hook_fn orig_kernel_openat;
-extern kasumi_syscall_hook_fn orig_kernel_openat2;
-extern kasumi_syscall_hook_fn orig_kernel_statfs;
-extern kasumi_syscall_hook_fn orig_kernel_fstatfs;
-#ifdef __NR_statx
-extern kasumi_syscall_hook_fn orig_kernel_statx;
-#endif
-#ifdef __NR_statfs64
-extern kasumi_syscall_hook_fn orig_kernel_statfs64;
-#endif
-#ifdef __NR_fstatfs64
-extern kasumi_syscall_hook_fn orig_kernel_fstatfs64;
-#endif
 #endif
