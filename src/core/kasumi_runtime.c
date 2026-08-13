@@ -133,9 +133,17 @@ long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t si
 int (*kasumi_task_work_add_ptr)(struct task_struct *task,
 				struct callback_head *work,
 				enum task_work_notify_mode notify);
+struct llist_node *(*kasumi_llist_del_first_ptr)(struct llist_head *head);
 void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 			     rcu_callback_t func);
 void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
+
+/* Avoid a load-time dependency on a GKI-trimmed export. */
+noinline KASUMI_NOCFI struct llist_node *
+kasumi_llist_del_first(struct llist_head *head)
+{
+	return kasumi_llist_del_first_ptr(head);
+}
 
 bool kasumi_valid_kernel_addr(unsigned long addr)
 {

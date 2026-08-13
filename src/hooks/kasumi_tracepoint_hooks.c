@@ -70,7 +70,7 @@ static struct kasumi_redirect_guard *kasumi_redirect_guard_alloc(void)
 	struct kasumi_redirect_guard *guard;
 	struct llist_node *node;
 
-	node = llist_del_first(&kasumi_redirect_guard_freelist);
+	node = kasumi_llist_del_first(&kasumi_redirect_guard_freelist);
 	if (node) {
 		guard = container_of(node, struct kasumi_redirect_guard,
 				     free_node);

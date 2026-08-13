@@ -320,7 +320,7 @@ static struct kasumi_marker_task_work *kasumi_marker_work_alloc(void)
 	struct kasumi_marker_task_work *work;
 	struct llist_node *node;
 
-	node = llist_del_first(&kasumi_marker_work_freelist);
+	node = kasumi_llist_del_first(&kasumi_marker_work_freelist);
 	if (node) {
 		work = container_of(node, struct kasumi_marker_task_work,
 				    free_node);

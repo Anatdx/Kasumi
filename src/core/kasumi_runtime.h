@@ -17,6 +17,7 @@
 #include <linux/fcntl.h>
 #include <linux/kprobes.h>
 #include <linux/limits.h>
+#include <linux/llist.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/seq_file.h>
@@ -140,6 +141,9 @@ extern long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, si
 extern int (*kasumi_task_work_add_ptr)(struct task_struct *task,
 				       struct callback_head *work,
 				       enum task_work_notify_mode notify);
+extern struct llist_node *(*kasumi_llist_del_first_ptr)(
+	struct llist_head *head);
+struct llist_node *kasumi_llist_del_first(struct llist_head *head);
 extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 				    rcu_callback_t func);
 extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);

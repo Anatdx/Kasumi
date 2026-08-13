@@ -126,6 +126,12 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_err("Kasumi: FATAL - task_work_add not found\n");
 		return -ENOENT;
 	}
+	kasumi_llist_del_first_ptr =
+		(void *)kasumi_lookup_callable("llist_del_first");
+	if (!kasumi_llist_del_first_ptr) {
+		pr_err("Kasumi: FATAL - llist_del_first not found\n");
+		return -ENOENT;
+	}
 	kasumi_call_srcu_ptr = (void *)kasumi_lookup_callable("call_srcu");
 	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_callable("srcu_barrier");
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
