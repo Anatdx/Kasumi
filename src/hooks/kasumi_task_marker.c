@@ -21,7 +21,6 @@
 #include <linux/version.h>
 #include <linux/xarray.h>
 
-#include "kasumi_fake_mountinfo.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_runtime.h"
@@ -355,8 +354,6 @@ static void kasumi_marker_task_work_func(struct callback_head *cb)
 	if (smp_load_acquire(&kasumi_marker_active_state)) {
 		if (kasumi_policy_uid_is_spoof_target(uid)) {
 			kasumi_task_marker_reconcile_current();
-			if (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE)
-				(void)kasumi_fake_mi_prepare(false);
 		} else if (kasumi_marker_uid_selected(uid)) {
 			kasumi_mark_task_tracepoint_owned(current);
 		} else {
