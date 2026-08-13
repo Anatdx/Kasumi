@@ -138,6 +138,8 @@ struct kasumi_filldir_wrapper {
 	const char *dir_path;
 	bool dir_has_inject;
 	bool inject_done;
+	bool view_allowed;
+	bool spoof_allowed;
 	int merge_target_count;
 	struct dentry *merge_target_dentries[KASUMI_MAX_MERGE_TARGETS];
 	char dir_path_buf[KASUMI_ITERATE_PATH_BUF];

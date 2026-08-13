@@ -97,7 +97,9 @@ struct kasumi_uid_list_arg {
 #define KSM_POLICY_ROOT_MULTI             (1U << 4)
 #define KSM_POLICY_ROOT_NO_PROVIDER       (1U << 5)
 
-/* DENY wins over ALLOW. INCLUDE_ISOLATED_UIDS affects non-strict app views. */
+/* DENY wins over ALLOW for ordinary app UIDs. Isolated UIDs always receive
+ * the concealment scope; INCLUDE_ISOLATED_UIDS is retained for ABI stability.
+ */
 #define KSM_POLICY_FLAG_USE_ALLOW_UIDS        (1U << 0)
 #define KSM_POLICY_FLAG_USE_DENY_UIDS         (1U << 1)
 #define KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS (1U << 2)
@@ -185,20 +187,6 @@ struct kasumi_spoof_kstat {
 };
 
 /*
- * uname spoofing structure - spoof kernel version info
- */
-#define KSM_UNAME_LEN 65
-struct kasumi_spoof_uname {
-    char sysname[KSM_UNAME_LEN];
-    char nodename[KSM_UNAME_LEN];
-    char release[KSM_UNAME_LEN];                       /* e.g., "5.15.0-generic" */
-    char version[KSM_UNAME_LEN];                       /* e.g., "#1 SMP PREEMPT ..." */
-    char machine[KSM_UNAME_LEN];
-    char domainname[KSM_UNAME_LEN];
-    int err;
-};
-
-/*
  * cmdline spoofing structure - spoof /proc/cmdline
  */
 struct kasumi_spoof_cmdline {
@@ -210,7 +198,7 @@ struct kasumi_spoof_cmdline {
  * Feature flags for KSM_CMD_GET_FEATURES
  */
 #define KSM_FEATURE_KSTAT_SPOOF    (1 << 0)
-#define KSM_FEATURE_UNAME_SPOOF    (1 << 1)
+/* Bit 1 remains reserved for the removed uname feature. */
 #define KSM_FEATURE_CMDLINE_SPOOF  (1 << 2)
 #define KSM_FEATURE_SELINUX_BYPASS (1 << 4)
 #define KSM_FEATURE_MERGE_DIR      (1 << 5)
@@ -218,7 +206,7 @@ struct kasumi_spoof_cmdline {
 #define KSM_FEATURE_MAPS_SPOOF    (1 << 7)  /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
 #define KSM_FEATURE_STATFS_SPOOF  (1 << 8)  /* spoof statfs f_type so direct matches resolved (INCONSISTENT_MOUNT) */
 #define KSM_FEATURE_FAKE_MOUNTINFO (1 << 9) /* serve per-marked-app fake mountinfo (no KSU mounts, renumbered ids) */
-#define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide app-zygote SELinux policy/status oracles from marked apps */
+#define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
 
 /*
@@ -277,7 +265,6 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_SET_MIRROR_PATH    _IOW(KSM_IOC_MAGIC, 14, struct kasumi_syscall_arg)
 #define KSM_IOC_ADD_SPOOF_KSTAT    _IOW(KSM_IOC_MAGIC, 15, struct kasumi_spoof_kstat)
 #define KSM_IOC_UPDATE_SPOOF_KSTAT _IOW(KSM_IOC_MAGIC, 16, struct kasumi_spoof_kstat)
-#define KSM_IOC_SET_UNAME          _IOW(KSM_IOC_MAGIC, 17, struct kasumi_spoof_uname)
 #define KSM_IOC_SET_CMDLINE        _IOW(KSM_IOC_MAGIC, 18, struct kasumi_spoof_cmdline)
 #define KSM_IOC_GET_FEATURES       _IOR(KSM_IOC_MAGIC, 19, int)
 #define KSM_IOC_SET_ENABLED        _IOW(KSM_IOC_MAGIC, 20, int)
@@ -288,13 +275,7 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_SET_MOUNT_HIDE     _IOW(KSM_IOC_MAGIC, 25, struct kasumi_mount_hide_arg)
 #define KSM_IOC_SET_MAPS_SPOOF    _IOW(KSM_IOC_MAGIC, 26, struct kasumi_maps_spoof_arg)
 #define KSM_IOC_SET_STATFS_SPOOF  _IOW(KSM_IOC_MAGIC, 27, struct kasumi_statfs_spoof_arg)
-/*
- * Global uname spoof: rewrite init_uts_ns in place. Affects ALL tasks that
- * share init_uts_ns (i.e. all of Android userspace by default). Blunt but
- * covers every kernel path that reads utsname(). Pass all-empty struct to
- * restore originals.
- */
-#define KSM_IOC_SET_UNAME_GLOBAL  _IOW(KSM_IOC_MAGIC, 28, struct kasumi_spoof_uname)
+/* Commands 17 and 28 remain reserved for removed uname operations. */
 #define KSM_IOC_SELINUX_FIX       _IOW(KSM_IOC_MAGIC, 29, int)
 /* Policy mutations require SET_ENABLED(0) first and return -EBUSY otherwise. */
 #define KSM_IOC_SET_POLICY        _IOWR(KSM_IOC_MAGIC, 30, struct kasumi_policy_config_arg)

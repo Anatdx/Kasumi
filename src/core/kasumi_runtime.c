@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -48,13 +47,13 @@
 #include "kasumi_file_view.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_task_marker.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
+#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_fop_override.h"
 
 bool kasumi_enabled;
 atomic_t kasumi_rule_count = ATOMIC_INIT(0);
 atomic_t kasumi_hide_count = ATOMIC_INIT(0);
+atomic_t kasumi_tsr_path_count = ATOMIC_INIT(0);
 struct kasumi_hook_stats kasumi_hook_stats;
 
 struct kasumi_percpu *kasumi_percpu_base;
@@ -131,6 +130,9 @@ void (*kasumi_ihold)(struct inode *);
 long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
 long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);
 long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t size);
+int (*kasumi_task_work_add_ptr)(struct task_struct *task,
+				struct callback_head *work,
+				enum task_work_notify_mode notify);
 void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 			     rcu_callback_t func);
 void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
@@ -146,46 +148,6 @@ bool kasumi_valid_kernel_addr(unsigned long addr)
 #else
 	return addr >= PAGE_OFFSET;
 #endif
-}
-
-int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *source_inode)
-{
-	umode_t mode;
-
-	if (!target_inode || !source_inode)
-		return -EINVAL;
-
-	mode = (READ_ONCE(target_inode->i_mode) & S_IFMT) |
-	       (READ_ONCE(source_inode->i_mode) & 07777);
-	inode_lock(target_inode);
-	WRITE_ONCE(target_inode->i_mode, mode);
-	target_inode->i_uid = source_inode->i_uid;
-	target_inode->i_gid = source_inode->i_gid;
-	inode_unlock(target_inode);
-	return 0;
-}
-
-KASUMI_NOCFI int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path)
-{
-	struct path source = {};
-	int ret;
-
-	if (!target_inode || !source_path || !kasumi_kern_path)
-		return -EINVAL;
-
-	atomic_long_set(&kasumi_xattr_source_tgid, (long)task_tgid_vnr(current));
-	ret = kasumi_kern_path(source_path, LOOKUP_FOLLOW, &source);
-	atomic_long_set(&kasumi_xattr_source_tgid, 0);
-	if (ret)
-		return ret;
-	if (!source.dentry || !d_inode(source.dentry)) {
-		kasumi_path_put(&source);
-		return -ENOENT;
-	}
-
-	ret = kasumi_clone_source_inode_attrs(target_inode, d_inode(source.dentry));
-	kasumi_path_put(&source);
-	return ret;
 }
 
 KASUMI_NOCFI unsigned long kasumi_lookup_name(const char *name)
@@ -454,6 +416,7 @@ void kasumi_cleanup_locked(void)
 	/* Pair with policy readers before cleanup withdraws provider state. */
 	smp_store_release(&kasumi_enabled, false);
 	kasumi_task_marker_set_enabled(false);
+	(void)kasumi_tracepoint_hooks_set_enabled(false);
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
 	kasumi_file_view_clear();
@@ -463,8 +426,6 @@ void kasumi_cleanup_locked(void)
 	hash_for_each_safe(kasumi_paths, bkt, tmp, entry, node) {
 		kasumi_clear_inode_flags_for_path(entry->src, AS_FLAGS_KASUMI_HIDE);
 		kasumi_clear_inode_flags_for_path(entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
-		(void)kasumi_dop_uninstall_path(entry->target);
-		(void)kasumi_xattr_sid_uninstall_path_ancestors(entry->target);
 		hlist_del_rcu(&entry->node);
 		hlist_del_rcu(&entry->target_node);
 		call_rcu(&entry->rcu, kasumi_entry_free_rcu);
@@ -509,4 +470,5 @@ void kasumi_cleanup_locked(void)
 	bitmap_zero(kasumi_hide_bloom, KASUMI_BLOOM_SIZE);
 	atomic_set(&kasumi_rule_count, 0);
 	atomic_set(&kasumi_hide_count, 0);
+	atomic_set(&kasumi_tsr_path_count, 0);
 }

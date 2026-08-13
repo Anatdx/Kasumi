@@ -23,6 +23,7 @@
 #include <linux/smp.h>
 #include <linux/srcu.h>
 #include <linux/stat.h>
+#include <linux/task_work.h>
 #include <linux/vmalloc.h>
 
 #include "kasumi_base.h"
@@ -31,6 +32,7 @@
 extern bool kasumi_enabled;
 extern atomic_t kasumi_rule_count;
 extern atomic_t kasumi_hide_count;
+extern atomic_t kasumi_tsr_path_count;
 extern atomic_t kasumi_spoof_kstat_count;
 
 struct kasumi_hook_stats {
@@ -85,8 +87,6 @@ unsigned long kasumi_lookup_name_quiet(const char *name);
 unsigned long kasumi_lookup_callable(const char *name);
 unsigned long kasumi_lookup_callable_quiet(const char *name);
 void kasumi_resolve_kallsyms_lookup(void);
-int kasumi_clone_source_inode_attrs(struct inode *target_inode, struct inode *source_inode);
-int kasumi_clone_source_attrs_from_path(struct inode *target_inode, const char *source_path);
 
 typedef bool (*kasumi_ksu_uid_should_umount_fn)(uid_t uid);
 
@@ -137,6 +137,9 @@ extern void (*kasumi_ihold)(struct inode *);
 extern long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
 extern long (*kasumi_copy_from_user_nofault)(void *dst, const void __user *src, size_t size);
 extern long (*kasumi_copy_to_user_nofault)(void __user *dst, const void *src, size_t size);
+extern int (*kasumi_task_work_add_ptr)(struct task_struct *task,
+				       struct callback_head *work,
+				       enum task_work_notify_mode notify);
 extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 				    rcu_callback_t func);
 extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);

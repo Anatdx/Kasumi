@@ -21,10 +21,7 @@ kasumi_lkm-objs := \
 	hooks/kasumi_tracepoint_hooks.o \
 	hooks/kasumi_syscall_redirect.o \
 	hooks/kasumi_ftrace_hooks.o \
-	features/kasumi_uname.o \
 	features/kasumi_sop_override.o \
-	features/kasumi_dop_override.o \
-	features/kasumi_xattr_sid_override.o \
 	features/kasumi_iop_override.o \
 	features/kasumi_fop_override.o \
 	features/kasumi_fake_mountinfo.o \

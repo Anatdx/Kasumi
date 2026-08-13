@@ -32,6 +32,12 @@
 #define FAKE_MI_SCRATCH    (512 * 1024)
 #define FAKE_MI_TTL_MS     500
 #define FAKE_MI_BUF_SLOTS  2
+#define MAX_MOUNTS         4096
+
+struct fake_mi_id_entry {
+	int real_id;
+	int fake_id;
+};
 
 /* Per-file cursor table for stateful chunked reads. Size chosen to cover
  * concurrent marked-app open()s; simple linear scan with LRU eviction.
@@ -45,6 +51,8 @@ struct fake_mi_cache {
         size_t len;
         struct nsproxy *nsproxy;
         struct mnt_namespace *mnt_ns;
+		struct fake_mi_id_entry *id_map;
+		int id_count;
     } slots[FAKE_MI_BUF_SLOTS];
     int active_slot;
     unsigned long last_jiffies;
@@ -364,7 +372,6 @@ static bool parse_line_target(const char *line, size_t len,
 /* Cache regeneration                                                  */
 /* ------------------------------------------------------------------ */
 
-#define MAX_MOUNTS 4096
 #define MAX_PROP_IDS (MAX_MOUNTS * FAKE_MI_MAX_PROP_FIELDS)
 
 struct id_map_entry {
@@ -563,7 +570,9 @@ static size_t decimal_len(int value)
  * lines as a conservative kernel-side fallback and compact mount ids.
  */
 static int build_fake_buffer(const char *raw, size_t raw_len,
-                             char *out, size_t out_cap, size_t *out_len)
+			     char *out, size_t out_cap, size_t *out_len,
+			     struct fake_mi_id_entry *id_map,
+			     int *id_count)
 {
     struct mount_map_entry *mount_map;
     struct id_map_entry *prop_map;
@@ -750,6 +759,28 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         }
     }
 
+	if (!id_map || !id_count) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*id_count = 0;
+	for (i = 0; i < n_mount_map; i++) {
+		int fake_id = mount_map[i].new_id;
+
+		if (fake_id <= 0) {
+			parent_walk_cookie++;
+			ret = mount_map_resolve_parent(mount_map, n_mount_map,
+						       external_map, n_external,
+						       mount_map[i].parent_id,
+						       parent_walk_cookie, &fake_id);
+			if (ret)
+				goto out;
+		}
+		id_map[*id_count].real_id = mount_map[i].old_id;
+		id_map[*id_count].fake_id = fake_id;
+		(*id_count)++;
+	}
+
     *out_len = o;
 out:
     kvfree(external_map);
@@ -776,6 +807,7 @@ static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
     char *new_buf;
     size_t total = 0;
     size_t new_len = 0;
+	int id_count = 0;
     loff_t pos = 0;
     ssize_t r;
     int new_slot;
@@ -843,7 +875,9 @@ static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
         }
     }
 
-    ret = build_fake_buffer(scratch, total, new_buf, FAKE_MI_BUF_MAX, &new_len);
+	ret = build_fake_buffer(scratch, total, new_buf, FAKE_MI_BUF_MAX,
+			    &new_len, g_cache.slots[new_slot].id_map,
+			    &id_count);
     if (ret != 0) {
         kasumi_log("fake_mi: rebuild failed pid=%d comm=%s ret=%d raw_len=%zu\n",
                  task_pid_nr(current), current->comm, ret, total);
@@ -851,6 +885,7 @@ static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
     }
 
     g_cache.slots[new_slot].len = new_len;
+	WRITE_ONCE(g_cache.slots[new_slot].id_count, id_count);
     g_cache.slots[new_slot].nsproxy = owner_nsproxy;
     g_cache.slots[new_slot].mnt_ns = owner_nsproxy->mnt_ns;
     smp_store_release(&g_cache.active_slot, new_slot);
@@ -1250,6 +1285,44 @@ out_unlock:
     return ret;
 }
 
+int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
+{
+	struct fake_mi_id_entry *id_map;
+	struct mnt_namespace *mnt_ns;
+	int id_count;
+	int slot;
+	int ret = -ENOENT;
+	int i;
+
+	rcu_read_lock();
+	if (!smp_load_acquire(&g_cache.valid)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	slot = smp_load_acquire(&g_cache.active_slot);
+	if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	mnt_ns = fake_mi_current_mnt_ns();
+	if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	id_map = READ_ONCE(g_cache.slots[slot].id_map);
+	id_count = READ_ONCE(g_cache.slots[slot].id_count);
+	for (i = 0; id_map && i < id_count; i++) {
+		if ((u64)id_map[i].real_id == real_id) {
+			ret = id_map[i].fake_id;
+			break;
+		}
+	}
+
+out_unlock:
+	rcu_read_unlock();
+	return ret;
+}
+
 /* ------------------------------------------------------------------ */
 /* Init / exit                                                         */
 /* ------------------------------------------------------------------ */
@@ -1278,7 +1351,15 @@ int kasumi_fake_mi_init(void)
         g_cache.slots[i].buf = vmalloc(FAKE_MI_BUF_MAX);
         if (!g_cache.slots[i].buf)
             goto out_free_slots;
+		g_cache.slots[i].id_map = kvmalloc_array(
+			MAX_MOUNTS, sizeof(*g_cache.slots[i].id_map), GFP_KERNEL);
+		if (!g_cache.slots[i].id_map) {
+			vfree(g_cache.slots[i].buf);
+			g_cache.slots[i].buf = NULL;
+			goto out_free_slots;
+		}
         g_cache.slots[i].len = 0;
+		g_cache.slots[i].id_count = 0;
         g_cache.slots[i].nsproxy = NULL;
         g_cache.slots[i].mnt_ns = NULL;
     }
@@ -1295,6 +1376,9 @@ out_free_slots:
     while (--i >= 0) {
         vfree(g_cache.slots[i].buf);
         g_cache.slots[i].buf = NULL;
+		kvfree(g_cache.slots[i].id_map);
+		g_cache.slots[i].id_map = NULL;
+		g_cache.slots[i].id_count = 0;
         g_cache.slots[i].len = 0;
     }
     return -ENOMEM;
@@ -1316,6 +1400,9 @@ void kasumi_fake_mi_exit(void)
         fake_mi_release_slot_owner_locked(i);
         vfree(g_cache.slots[i].buf);
         g_cache.slots[i].buf = NULL;
+		kvfree(g_cache.slots[i].id_map);
+		g_cache.slots[i].id_map = NULL;
+		g_cache.slots[i].id_count = 0;
         g_cache.slots[i].len = 0;
     }
     g_cache.valid = false;

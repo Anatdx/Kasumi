@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -54,9 +53,6 @@
 #include "kasumi_syscall_redirect.h"
 #include "kasumi_task_marker.h"
 #include "kasumi_tracepoint_hooks.h"
-#include "kasumi_uname.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -419,13 +415,21 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (copy_from_user(&val, arg, sizeof(val)))
 			return -EFAULT;
 		if (val) {
-			if (kasumi_tracepoint_hooks_active() &&
-			    !kasumi_task_marker_ready())
+			if (kasumi_policy_view_tsr_demand() &&
+			    (!kasumi_tracepoint_hooks_available() ||
+			     !kasumi_task_marker_ready()))
 				return -ENODEV;
 			mutex_lock(&kasumi_config_mutex);
 			if (READ_ONCE(kasumi_enabled)) {
-				if (kasumi_task_marker_active())
-					kasumi_task_marker_refresh();
+				if (kasumi_policy_view_tsr_demand()) {
+					if (kasumi_tracepoint_hooks_set_enabled(true)) {
+						mutex_unlock(&kasumi_config_mutex);
+						return -ENODEV;
+					}
+					kasumi_task_marker_refresh_scopes();
+				} else {
+					(void)kasumi_tracepoint_hooks_set_enabled(false);
+				}
 				mutex_unlock(&kasumi_config_mutex);
 				return 0;
 			}
@@ -433,13 +437,14 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				mutex_unlock(&kasumi_config_mutex);
 				return -ENODEV;
 			}
-			/*
-			 * Arm lifecycle probes and mark existing targets before exposing
-			 * the enabled state. UID transitions during the scan queue their
-			 * own post-syscall reconciliation before returning to userspace.
-			 */
-			if (kasumi_tracepoint_hooks_active())
-				kasumi_task_marker_set_enabled(true);
+			if (kasumi_policy_view_tsr_demand() &&
+			    kasumi_tracepoint_hooks_set_enabled(true)) {
+				kasumi_policy_disable_provider_locked();
+				mutex_unlock(&kasumi_config_mutex);
+				return -ENODEV;
+			}
+			/* The lifecycle marker also applies non-TSR scoped spoof state. */
+			kasumi_task_marker_set_enabled(true);
 			/* Publish provider state and completed task scan together. */
 			smp_store_release(&kasumi_enabled, true);
 			mutex_unlock(&kasumi_config_mutex);
@@ -453,6 +458,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			/* Stop policy readers before provider pointers are withdrawn. */
 			smp_store_release(&kasumi_enabled, false);
 			kasumi_task_marker_set_enabled(false);
+			(void)kasumi_tracepoint_hooks_set_enabled(false);
 			kasumi_policy_disable_provider_locked();
 			mutex_unlock(&kasumi_config_mutex);
 		}
@@ -592,30 +598,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		kfree(new_path);
 		kfree(new_name);
 		return 0;
-	}
-
-	if (cmd == KSM_IOC_SET_UNAME) {
-		/* Scoped mode: stored config is applied per-task on first syscall
-		 * from a hidden-uid process by unsharing CLONE_NEWUTS and writing
-		 * the fake fields into the task's private uts_ns. */
-		struct kasumi_spoof_uname u;
-
-		if (copy_from_user(&u, arg, sizeof(u)))
-			return -EFAULT;
-		return kasumi_uname_set_scoped_config(&u);
-	}
-
-	if (cmd == KSM_IOC_SET_UNAME_GLOBAL) {
-		/* Global mode: rewrite init_uts_ns in place. All-empty struct
-		 * restores originals. */
-		struct kasumi_spoof_uname u;
-
-		if (copy_from_user(&u, arg, sizeof(u)))
-			return -EFAULT;
-		if (u.sysname[0] || u.nodename[0] || u.release[0] ||
-		    u.version[0] || u.machine[0] || u.domainname[0])
-			return kasumi_uname_apply_global(&u);
-		return kasumi_uname_restore_global();
 	}
 
 	if (cmd == KSM_IOC_SET_CMDLINE) {
@@ -910,8 +892,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 	if (cmd == KSM_IOC_GET_FEATURES) {
 		int features = 0;
-		if (kasumi_uname_capable())
-			features |= KSM_FEATURE_UNAME_SPOOF;
 		if (kasumi_cmdline_kprobe_registered)
 			features |= KSM_FEATURE_CMDLINE_SPOOF;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
@@ -922,9 +902,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    kasumi_mount_hide_vfsmnt_registered ||
 		    kasumi_mount_hide_mountinfo_registered)
 			features |= KSM_FEATURE_MOUNT_HIDE;
-		if (kasumi_proc_proxy_registered && kasumi_fake_mi_active() &&
-		    kasumi_tracepoint_hooks_active() &&
-		    kasumi_task_marker_ready())
+		if (kasumi_proc_proxy_registered && kasumi_fake_mi_active())
 			features |= KSM_FEATURE_FAKE_MOUNTINFO;
 		if (kasumi_proc_proxy_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
@@ -1018,19 +996,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				      "proc op kprobe" : "none");
 		written += n;
 
-		/* uname */
-		{
-			const char *mode = "none";
-			bool g = kasumi_uname_global_active();
-			bool s = kasumi_uname_scoped_active();
-			if (g && s)       mode = "utsname (global+scoped)";
-			else if (g)        mode = "utsname (global)";
-			else if (s)        mode = "utsname (scoped/uts_ns)";
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "uname: %s\n", mode);
-			written += n;
-		}
-
 		/* cmdline */
 		if (kasumi_cmdline_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kprobe (cmdline_proc_show)\n");
@@ -1041,7 +1006,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		/* mountinfo/mounts hide */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: proxy (open fd read filter)\n");
+				     "mountinfo/mounts: fd_install fop proxy\n");
 		else if (kasumi_mount_hide_vfsmnt_registered && kasumi_mount_hide_mountinfo_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "mountinfo/mounts: kprobe (show_mountinfo, show_vfsmnt)\n");
@@ -1057,16 +1022,14 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		n = scnprintf(kbuf + written, buf_size - written,
 			      "fake mountinfo: %s\n",
 			      kasumi_proc_proxy_registered &&
-			      kasumi_fake_mi_active() &&
-			      kasumi_tracepoint_hooks_active() &&
-			      kasumi_task_marker_ready() ?
+			      kasumi_fake_mi_active() ?
 				      "compact ids" : "none");
 		written += n;
 
 		/* maps spoof */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: proxy (open fd read filter)\n");
+				     "maps: fd_install fop proxy\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;
@@ -1197,8 +1160,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		char *resolved_src = NULL;
 		struct kasumi_entry *new_entry = NULL;
 		struct path path;
-		struct inode *src_inode = NULL;
-		struct inode *parent_inode = NULL;
 		struct inode *target_inode = NULL;
 		bool install_side_effects = true;
 		char *tmp_buf;
@@ -1228,14 +1189,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 						}
 					}
 				}
-			}
-			if (d_inode(path.dentry)) {
-				src_inode = d_inode(path.dentry);
-				kasumi_ihold(src_inode);
-			}
-			if (path.dentry->d_parent && d_inode(path.dentry->d_parent)) {
-				parent_inode = d_inode(path.dentry->d_parent);
-				kasumi_ihold(parent_inode);
 			}
 			kasumi_path_put(&path);
 		} else {
@@ -1305,9 +1258,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				if (install_side_effects) {
 					kasumi_clear_inode_flags_for_path(
 						entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
-					(void)kasumi_dop_uninstall_path(entry->target);
-					(void)kasumi_xattr_sid_uninstall_path_ancestors(
-						entry->target);
 				}
 				call_rcu(&entry->rcu, kasumi_entry_free_rcu);
 				new_entry = NULL;
@@ -1332,6 +1282,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			set_bit(h1, kasumi_path_bloom);
 			set_bit(h2, kasumi_path_bloom);
 			atomic_inc(&kasumi_rule_count);
+			atomic_inc(&kasumi_tsr_path_count);
 			new_entry = NULL;
 			kasumi_log("add rule: src=%s, target=%s, type=%d\n",
 				   src, target, req.type);
@@ -1348,11 +1299,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			if (path.dentry && d_inode(path.dentry)) {
 				target_inode = d_inode(path.dentry);
 				kasumi_ihold(target_inode);
-				if (src_inode)
-					(void)kasumi_clone_source_inode_attrs(target_inode,
-									       src_inode);
-				(void)kasumi_dop_install(path.dentry, src);
-				(void)kasumi_xattr_sid_install_path_ancestors(target, src);
 			}
 			kasumi_path_put(&path);
 		}
@@ -1371,10 +1317,6 @@ add_rule_done:
 			kfree(new_entry);
 		}
 		kfree(parent_dir);
-		if (src_inode)
-			iput(src_inode);
-		if (parent_inode)
-			iput(parent_inode);
 		break;
 	}
 
@@ -1558,11 +1500,10 @@ add_rule_done:
 			if (entry->src_hash == hash && strcmp(entry->src, src) == 0) {
 				kasumi_clear_inode_flags_for_path(entry->target,
 								AS_FLAGS_KASUMI_SPOOF_KSTAT);
-				(void)kasumi_dop_uninstall_path(entry->target);
-				(void)kasumi_xattr_sid_uninstall_path_ancestors(entry->target);
 				hlist_del_rcu(&entry->node);
 				hlist_del_rcu(&entry->target_node);
 				atomic_dec(&kasumi_rule_count);
+				atomic_dec(&kasumi_tsr_path_count);
 				kasumi_log("del rule: src=%s\n", src);
 				call_rcu(&entry->rcu, kasumi_entry_free_rcu);
 				goto del_done;
@@ -1625,6 +1566,45 @@ del_done:
  */
 static DEFINE_MUTEX(kasumi_ioctl_mutex);
 
+static bool kasumi_cmd_changes_view_scope(unsigned int cmd)
+{
+	switch (cmd) {
+	case KSM_IOC_ADD_RULE:
+	case KSM_IOC_DEL_RULE:
+	case KSM_IOC_HIDE_RULE:
+	case KSM_IOC_CLEAR_ALL:
+	case KSM_IOC_ADD_MERGE_RULE:
+	case KSM_IOC_SET_POLICY_OWNER:
+	case KSM_IOC_SET_POLICY_UIDS:
+	case KSM_IOC_CLEAR_POLICY_UIDS:
+	case KSM_IOC_REPLACE_POLICY:
+	case KSM_IOC_RESET_POLICY:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool kasumi_cmd_changes_spoof_state(unsigned int cmd)
+{
+	return cmd == KSM_IOC_SET_MOUNT_HIDE;
+}
+
+static void kasumi_reconcile_view_tsr(void)
+{
+	if (!READ_ONCE(kasumi_enabled))
+		return;
+	if (!kasumi_policy_view_tsr_demand()) {
+		(void)kasumi_tracepoint_hooks_set_enabled(false);
+		return;
+	}
+	if (kasumi_tracepoint_hooks_set_enabled(true)) {
+		pr_warn("Kasumi: VIEW rules active without TSR transport\n");
+		return;
+	}
+	kasumi_task_marker_refresh_scopes();
+}
+
 static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 					unsigned long arg)
 {
@@ -1647,8 +1627,6 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_ADD_MERGE_RULE:
 	case KSM_IOC_SET_MIRROR_PATH:
 	case KSM_IOC_GET_HOOKS:
-	case KSM_IOC_SET_UNAME:
-	case KSM_IOC_SET_UNAME_GLOBAL:
 	case KSM_IOC_ADD_MAPS_RULE:
 	case KSM_IOC_CLEAR_MAPS_RULES:
 	case KSM_IOC_GET_FEATURES:
@@ -1671,6 +1649,11 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 		ret = -EINVAL;
 		break;
 	}
+	if (!ret && kasumi_cmd_changes_view_scope(cmd))
+		kasumi_reconcile_view_tsr();
+	else if (!ret && kasumi_cmd_changes_spoof_state(cmd) &&
+		 READ_ONCE(kasumi_enabled))
+		kasumi_task_marker_refresh_scopes();
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
 	mutex_unlock(&kasumi_ioctl_mutex);
 	return ret;

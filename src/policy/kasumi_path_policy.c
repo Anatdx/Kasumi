@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -77,7 +76,7 @@ bool kasumi_is_privileged_process(void)
 #define KASUMI_ANDROID_PER_USER_RANGE      100000
 #define KASUMI_ANDROID_FIRST_APP_UID        10000
 #define KASUMI_ANDROID_LAST_APP_UID         19999
-#define KASUMI_ANDROID_FIRST_ISOLATED_UID   99000
+#define KASUMI_ANDROID_FIRST_ISOLATED_UID   90000
 #define KASUMI_ANDROID_LAST_ISOLATED_UID    99999
 
 static inline bool kasumi_uid_is_app(uid_t uid)
@@ -671,15 +670,14 @@ static bool kasumi_current_is_app_zygote(void)
 		      suffix, suffix_len) == 0;
 }
 
-static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
-						     bool require_enabled)
+static KASUMI_NOCFI enum kasumi_policy_scope
+kasumi_policy_scope_for_uid(uid_t uid, bool require_enabled)
 {
 	struct kasumi_policy_snapshot *policy;
 	u32 configured_owner;
 	u32 owner;
 	u32 flags;
-	bool isolated;
-	bool provider_candidate = false;
+	enum kasumi_policy_scope scope = KASUMI_POLICY_SCOPE_NONE;
 	bool allow_gate = true;
 	bool denied = false;
 
@@ -687,7 +685,12 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 	if (unlikely((!kasumi_uid_is_app(uid) &&
 		       !kasumi_uid_is_isolated(uid)) ||
 	    (require_enabled && !smp_load_acquire(&kasumi_enabled))))
-		return false;
+		return KASUMI_POLICY_SCOPE_NONE;
+	/* Isolated app processes always receive concealment, independently of
+	 * their transient UID and of any host-app allow/deny list.
+	 */
+	if (kasumi_uid_is_isolated(uid))
+		return KASUMI_POLICY_SCOPE_SPOOF;
 
 	rcu_read_lock();
 	policy = rcu_dereference(kasumi_policy_current);
@@ -695,7 +698,6 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 	flags = policy ? policy->flags : 0;
 	owner = configured_owner == KSM_POLICY_OWNER_AUTO ?
 		READ_ONCE(kasumi_root_policy_owner) : configured_owner;
-	isolated = kasumi_uid_is_isolated(uid);
 
 	/* AUTO is valid only when root detection selected one supported provider. */
 	if (configured_owner == KSM_POLICY_OWNER_AUTO &&
@@ -709,8 +711,10 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 		if (!(READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU))
 			break;
 		provider = READ_ONCE(kasumi_ksu_uid_should_umount_ptr);
-		if (provider)
-			provider_candidate = isolated ? !strict : provider(uid);
+		if (!provider)
+			break;
+		scope = provider(uid) ? KASUMI_POLICY_SCOPE_SPOOF :
+			KASUMI_POLICY_SCOPE_VIEW;
 		break;
 	}
 	case KSM_POLICY_OWNER_APATCH: {
@@ -718,12 +722,17 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 
 		if ((READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_APATCH) &&
 		    provider)
-			provider_candidate = (!strict && isolated) ||
-				provider(uid) != 0;
+			scope = provider(uid) != 0 ?
+				KASUMI_POLICY_SCOPE_SPOOF : KASUMI_POLICY_SCOPE_VIEW;
 		break;
 	}
 	case KSM_POLICY_OWNER_MANUAL:
-		provider_candidate = true;
+		/* Manual policy has no inverse provider set. Its explicit allow
+		 * list therefore names spoof targets and never implicitly grants a
+		 * virtual view to every other application.
+		 */
+		if (flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS)
+			scope = KASUMI_POLICY_SCOPE_SPOOF;
 		break;
 	case KSM_POLICY_OWNER_DISABLED:
 	case KSM_POLICY_OWNER_MAGISK:
@@ -737,10 +746,7 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 	    !(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS))
 		allow_gate = false;
 	else if (flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS)
-		allow_gate = policy &&
-			(xa_load(&policy->allow_uids, uid) != NULL ||
-			 (!strict && isolated &&
-			  (flags & KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS)));
+		allow_gate = policy && xa_load(&policy->allow_uids, uid) != NULL;
 
 	/* A deny entry is the final decision and wins over every other source. */
 	if ((flags & KSM_POLICY_FLAG_USE_DENY_UIDS) && policy)
@@ -748,41 +754,58 @@ static KASUMI_NOCFI bool kasumi_policy_uid_selected(uid_t uid, bool strict,
 
 out:
 	rcu_read_unlock();
-	return provider_candidate && allow_gate && !denied;
+	return allow_gate && !denied ? scope : KASUMI_POLICY_SCOPE_NONE;
 }
 
-KASUMI_NOCFI bool kasumi_should_apply_hide_rules(void)
+KASUMI_NOCFI enum kasumi_policy_scope kasumi_policy_current_scope(void)
 {
-	return kasumi_policy_uid_selected(__kuid_val(current_uid()), false, true);
+	return kasumi_policy_scope_for_uid(__kuid_val(task_uid(current)), true);
 }
 
-KASUMI_NOCFI bool kasumi_policy_should_trace_uid(uid_t uid)
+bool kasumi_policy_current_is_view_target(void)
 {
-	/*
-	 * Task markers are armed before kasumi_enabled is published.  Keep this
-	 * selector independent of that final gate while preserving the exact
-	 * provider, allow-list, isolated-UID, and deny-veto policy.
-	 */
-	return kasumi_policy_uid_selected(uid, false, false);
+	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_VIEW;
 }
 
-static KASUMI_NOCFI bool kasumi_uid_should_umount_strict(uid_t uid)
+bool kasumi_policy_current_is_spoof_target(void)
 {
-	return kasumi_policy_uid_selected(uid, true, true);
+	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_SPOOF;
+}
+
+KASUMI_NOCFI bool kasumi_policy_uid_is_view_target(uid_t uid)
+{
+	return kasumi_policy_scope_for_uid(uid, false) ==
+		KASUMI_POLICY_SCOPE_VIEW;
+}
+
+KASUMI_NOCFI bool kasumi_policy_uid_is_spoof_target(uid_t uid)
+{
+	return kasumi_policy_scope_for_uid(uid, false) ==
+		KASUMI_POLICY_SCOPE_SPOOF;
+}
+
+bool kasumi_policy_view_tsr_demand(void)
+{
+	return atomic_read(&kasumi_tsr_path_count) > 0 ||
+	       atomic_read(&kasumi_hide_count) > 0;
+}
+
+bool kasumi_policy_uid_needs_view_tsr(uid_t uid)
+{
+	return kasumi_policy_view_tsr_demand() &&
+	       kasumi_policy_uid_is_view_target(uid);
 }
 
 bool kasumi_current_is_selinux_guard_target(void)
 {
-	uid_t uid = __kuid_val(current_uid());
+	uid_t uid = __kuid_val(task_uid(current));
 
 	/*
-	 * SELinux Guard is narrower than normal hide/spoof policy. Only the
-	 * hidden app's app-zygote process receives fake SELinux answers; su/ksu,
-	 * root managers, shells, and daemons must observe the real policy even if
-	 * other hide rules would apply to their UID bucket.
+	 * Ordinary hidden apps retain the narrow app-zygote oracle guard. Android
+	 * isolated UIDs follow the all-isolated SPOOF boundary.
 	 */
-	return kasumi_current_is_app_zygote() &&
-	       kasumi_uid_should_umount_strict(uid);
+	return kasumi_policy_current_is_spoof_target() &&
+	       (kasumi_uid_is_isolated(uid) || kasumi_current_is_app_zygote());
 }
 
 static void kasumi_policy_mark_ksu_available(void)
@@ -997,19 +1020,13 @@ char *kasumi_resolve_target(const char *pathname)
 	size_t path_len;
 	pid_t pid;
 
-	if (unlikely(!kasumi_enabled || !pathname))
+	if (unlikely(!kasumi_enabled || !pathname ||
+		     !kasumi_policy_current_is_view_target()))
 		return NULL;
 
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
 		return NULL;
-	/*
-	 * ADD_RULE is an explicit path translation contract, not an app hide
-	 * policy decision. Keep it independent from kasumi_should_apply_hide_rules()
-	 * so root/manual tests and userspace-controlled redirects still work when
-	 * the hide allowlist has not selected the current UID.
-	 */
-
 	path_len = strlen(pathname);
 	hash = full_name_hash(NULL, pathname, path_len);
 
@@ -1064,7 +1081,8 @@ KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 	if (target)
 		return target;
 
-	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
+	if (unlikely(!kasumi_enabled || !pathname || !*pathname ||
+		     !kasumi_policy_current_is_view_target()))
 		return NULL;
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
@@ -1170,7 +1188,6 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 
 bool kasumi_should_hide(const char *pathname)
 {
-	size_t len;
 	pid_t pid;
 
 	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
@@ -1178,26 +1195,11 @@ bool kasumi_should_hide(const char *pathname)
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
 		return false;
-	if (kasumi_hide_rule_matches(pathname))
-		return true;
 	if (unlikely(kasumi_is_privileged_process()))
 		return false;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_view_target())
 		return false;
-
-	len = strlen(pathname);
-
-	/* Stealth: always hide the mirror device */
-	if (likely(kasumi_stealth_enabled)) {
-		size_t name_len = strlen(kasumi_current_mirror_name);
-		size_t path_len = strlen(kasumi_current_mirror_path);
-
-		if ((len == name_len && strcmp(pathname, kasumi_current_mirror_name) == 0) ||
-		    (len == path_len && strcmp(pathname, kasumi_current_mirror_path) == 0))
-			return true;
-	}
-
-	return false;
+	return kasumi_hide_rule_matches(pathname);
 }
 
 static bool __maybe_unused kasumi_should_replace(const char *pathname)

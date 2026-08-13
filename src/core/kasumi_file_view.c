@@ -27,6 +27,7 @@
 
 #include "kasumi_base.h"
 #include "kasumi_file_view.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
 
 #define KASUMI_FILE_VIEW_HASH_BITS 10
@@ -168,6 +169,8 @@ int kasumi_file_view_bind_fd(int fd, const char *src_path, const char *target_pa
 
 	if (atomic_read(&kasumi_file_view_shutdown_state))
 		return -ESHUTDOWN;
+	if (!kasumi_policy_current_is_view_target())
+		return -EACCES;
 	if (!src_path || !target_path)
 		return -EINVAL;
 
@@ -275,6 +278,8 @@ bool kasumi_file_view_lookup_maps(unsigned long target_ino, unsigned long target
 
 	if (!target_ino || !spoofed_ino || !spoofed_dev ||
 	    !spoofed_pathname || spoofed_pathname_size == 0)
+		return false;
+	if (!kasumi_policy_current_is_view_target())
 		return false;
 
 	key = kasumi_file_view_ino_key(target_ino, target_dev);

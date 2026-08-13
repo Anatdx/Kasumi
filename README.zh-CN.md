@@ -34,7 +34,6 @@ English version： [README.md](./README.md)
 - 目录合并/注入
 - `kstat` 伪装（ino/dev/size/time 等）
 - overlay/xattr 相关过滤，以及注入文件的 SELinux label 展示
-- `uname` 伪装
 - `/proc/cmdline` 伪装
 - `/proc/<pid>/maps` 规则伪装（ino/dev/pathname）
 - mount hide、statfs spoof
@@ -111,7 +110,7 @@ ksud insmod kasumi_lkm.ko
 - `KSM_IOC_ADD_MERGE_RULE`、`KSM_IOC_CLEAR_ALL`、`KSM_IOC_SET_ENABLED`
 - `KSM_IOC_GET_FEATURES`、`KSM_IOC_GET_HOOKS`、`KSM_IOC_LIST_RULES`
 - `KSM_IOC_ADD_SPOOF_KSTAT`、`KSM_IOC_UPDATE_SPOOF_KSTAT`
-- `KSM_IOC_SET_UNAME`、`KSM_IOC_SET_CMDLINE`
+- `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`、`KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`、`KSM_IOC_SET_MAPS_SPOOF`、`KSM_IOC_SET_STATFS_SPOOF`
 - `KSM_IOC_REPLACE_POLICY`、`KSM_IOC_GET_POLICY`、`KSM_IOC_GET_POLICY_UIDS`

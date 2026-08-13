@@ -32,12 +32,9 @@
 #include "kasumi_file_view.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
-#include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_fake_mountinfo.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_syscall_redirect.h"
-#include "kasumi_uname.h"
 #include "kasumi_patch_memory.h"
 
 /* ---- Syscall table & redirect ------------------------------------------ */
@@ -96,14 +93,39 @@ static KASUMI_NOCFI long kasumi_call_original(int nr,
 					       const struct pt_regs *regs)
 {
 	kasumi_syscall_hook_fn fn;
+	int next_nr = nr;
 
 	if (!kasumi_syscall_table || nr < 0 || nr >= __NR_syscalls)
 		return -ENOSYS;
 
-	fn = READ_ONCE(((kasumi_syscall_hook_fn *)kasumi_syscall_table)[nr]);
+	/* KernelSU owns the same two routes upstream. Kasumi runs after its
+	 * sys_enter callback, projects the VIEW pathname, then invokes the whole
+	 * KernelSU dispatcher so sucompat and the real syscall still execute once.
+	 * This uses the upstream dispatcher ABI instead of private helper symbols.
+	 */
+	if ((READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU_RDR) &&
+	    READ_ONCE(kasumi_ksu_dispatcher_nr) >= 0) {
+#ifdef __NR_newfstatat
+		if (nr == __NR_newfstatat)
+			next_nr = READ_ONCE(kasumi_ksu_dispatcher_nr);
+#endif
+#ifdef __NR_faccessat
+		if (nr == __NR_faccessat)
+			next_nr = READ_ONCE(kasumi_ksu_dispatcher_nr);
+#endif
+	}
+	if (next_nr < 0 || next_nr >= __NR_syscalls ||
+	    next_nr == READ_ONCE(kasumi_syscall_dispatcher_nr))
+		return -ENOSYS;
+
+	fn = READ_ONCE(((kasumi_syscall_hook_fn *)kasumi_syscall_table)[next_nr]);
 	if (!fn)
 		return -ENOSYS;
-	/* Preserve direct hooks temporarily installed by KernelSU or a peer. */
+	if (next_nr != nr) {
+		((struct pt_regs *)regs)->syscallno = next_nr;
+		PT_REGS_ORIG_SYSCALL((struct pt_regs *)regs) = nr;
+	}
+	/* Preserve direct hooks and the upstream KernelSU dispatcher. */
 	return fn(regs);
 }
 
@@ -124,9 +146,6 @@ static KASUMI_NOCFI long kasumi_syscall_dispatcher(const struct pt_regs *regs)
 
 	((struct pt_regs *)regs)->syscallno = orig_nr;
 	PT_REGS_ORIG_SYSCALL((struct pt_regs *)regs) = orig_nr;
-
-	if (kasumi_uname_scoped_active() && kasumi_should_apply_hide_rules())
-		kasumi_uname_apply_scoped_current();
 
 	idx = srcu_read_lock(&kasumi_redirect_srcu);
 	fn = READ_ONCE(hooks[orig_nr]);
@@ -154,6 +173,24 @@ void kasumi_unregister_syscall_hook(int nr)
 bool kasumi_has_syscall_hook(int nr)
 {
 	return nr >= 0 && nr < __NR_syscalls && READ_ONCE(hooks[nr]);
+}
+
+bool kasumi_syscall_redirect_claimable(int nr, int current_nr)
+{
+	if (current_nr == nr)
+		return true;
+	if (!(READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU_RDR) ||
+	    current_nr != READ_ONCE(kasumi_ksu_dispatcher_nr))
+		return false;
+#ifdef __NR_newfstatat
+	if (nr == __NR_newfstatat)
+		return true;
+#endif
+#ifdef __NR_faccessat
+	if (nr == __NR_faccessat)
+		return true;
+#endif
+	return false;
 }
 
 static void kasumi_add_syscall_hook_counted(int nr, kasumi_syscall_hook_fn fn,
@@ -262,7 +299,6 @@ static long do_openat(const struct pt_regs *regs, int nr)
 	char *target_path = NULL;
 	long ret;
 	int dirfd = (int)regs->regs[0];
-	bool raw_proc_proxy = false;
 	long tgid = (long)task_tgid_vnr(current);
 
 	if (atomic_long_read(&kasumi_ioctl_tgid) == tgid ||
@@ -270,13 +306,6 @@ static long do_openat(const struct pt_regs *regs, int nr)
 		return kasumi_call_original(nr, regs);
 	if (kasumi_copy_user_path_at(dirfd, u, path, sizeof(path)) <= 0)
 		return kasumi_call_original(nr, regs);
-
-	if (path[0] == '/' && kasumi_path_needs_proc_proxy(path)) {
-		raw_proc_proxy = true;
-		if (kasumi_path_is_proc_mountinfo(path) &&
-		    kasumi_should_apply_hide_rules())
-			kasumi_fake_mi_prepare(false);
-	}
 
 	if (path[0] == '/' && atomic_read(&kasumi_rule_count) > 0) {
 		t = kasumi_resolve_target_slow(path);
@@ -300,10 +329,8 @@ static long do_openat(const struct pt_regs *regs, int nr)
 	}
 
 	ret = kasumi_call_original(nr, regs);
-	if (!raw_proc_proxy && ret >= 0 && target_path)
+	if (ret >= 0 && target_path)
 		(void)kasumi_file_view_bind_fd((int)ret, path, target_path);
-	if (raw_proc_proxy && ret >= 0 && kasumi_proc_proxy_should_try())
-		kasumi_mount_proxy_install_fd((int)ret);
 	kfree(target_path);
 	return ret;
 }
@@ -363,23 +390,17 @@ static long h_statx(const struct pt_regs *regs)
 {
 	char path[KSM_MAX_LEN_PATHNAME];
 	const char __user *filename_user;
-	struct statx __user *buf;
-	struct statx stx;
-	int fake_mnt_id;
 	long path_len;
-	long ret;
 	int dirfd;
 
 #if defined(__aarch64__)
 	dirfd = (int)regs->regs[0];
 	filename_user = (const char __user *)(uintptr_t)regs->regs[1];
-	buf = (struct statx __user *)(uintptr_t)regs->regs[4];
 #else
 	dirfd = (int)regs->di;
 	filename_user = (const char __user *)(uintptr_t)regs->si;
-	buf = (struct statx __user *)(uintptr_t)regs->r8;
 #endif
-	if (!filename_user || !buf)
+	if (!filename_user)
 		return kasumi_call_original(__NR_statx, regs);
 
 	path_len = kasumi_copy_user_path_at(dirfd, filename_user, path, sizeof(path));
@@ -405,27 +426,7 @@ static long h_statx(const struct pt_regs *regs)
 		}
 	}
 
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) ||
-	    !kasumi_should_apply_hide_rules())
-		return kasumi_call_original(__NR_statx, regs);
-
-	ret = kasumi_call_original(__NR_statx, regs);
-	if (ret != 0)
-		return ret;
-
-	fake_mnt_id = kasumi_fake_mi_lookup_mount_id(path);
-	if (fake_mnt_id <= 0)
-		return ret;
-	if (copy_from_user(&stx, buf, sizeof(stx)) != 0)
-		return ret;
-
-	stx.stx_mnt_id = (u64)fake_mnt_id;
-	if (copy_to_user(buf, &stx, sizeof(stx)) != 0)
-		return ret;
-
-	kasumi_log("statx spoof: path=%s fake_mnt_id=%d pid=%d comm=%s\n",
-		   path, fake_mnt_id, task_pid_nr(current), current->comm);
-	return ret;
+	return kasumi_call_original(__NR_statx, regs);
 }
 #endif
 
@@ -444,6 +445,13 @@ static long do_path1_hide(const struct pt_regs *regs, int nr)
 	u = (const char __user *)(uintptr_t)regs->si;
 #endif
 	if (kasumi_copy_user_path_at(dirfd, u, path, sizeof(path)) <= 0)
+		return kasumi_call_original(nr, regs);
+	/* KernelSU reserves this exact path for sucompat on faccessat and
+	 * newfstatat. Preserve the sentinel until its dispatcher has handled it;
+	 * otherwise a Kasumi redirect/hide rule would silently disable `su`.
+	 */
+	if ((READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU_RDR) &&
+	    !strcmp(path, "/system/bin/su"))
 		return kasumi_call_original(nr, regs);
 	if (path[0] == '/' && kasumi_should_hide(path))
 		return -ENOENT;
@@ -560,7 +568,6 @@ int kasumi_syscall_redirect_init(void)
 		kasumi_syscall_table = NULL;
 		return -EBUSY;
 	}
-
 	saved_ni_syscall = READ_ONCE(
 		((kasumi_syscall_hook_fn *)kasumi_syscall_table)[slot]);
 	WRITE_ONCE(kasumi_syscall_dispatcher_nr, slot);

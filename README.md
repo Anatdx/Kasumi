@@ -34,7 +34,6 @@ Kasumi was previously developed as HymoFS. The project name, module name, usersp
 - Directory merge/injection behavior
 - `kstat` spoofing (ino/dev/size/time, etc.)
 - Overlay/xattr related filtering and SELinux label presentation for injected files
-- `uname` spoofing
 - `/proc/cmdline` spoofing
 - `/proc/<pid>/maps` spoofing rules (ino/dev/pathname)
 - Mount-hide and statfs spoof features
@@ -113,7 +112,7 @@ Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
 - `KSM_IOC_ADD_MERGE_RULE`, `KSM_IOC_CLEAR_ALL`, `KSM_IOC_SET_ENABLED`
 - `KSM_IOC_GET_FEATURES`, `KSM_IOC_GET_HOOKS`, `KSM_IOC_LIST_RULES`
 - `KSM_IOC_ADD_SPOOF_KSTAT`, `KSM_IOC_UPDATE_SPOOF_KSTAT`
-- `KSM_IOC_SET_UNAME`, `KSM_IOC_SET_CMDLINE`
+- `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
 - `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
 - `KSM_IOC_REPLACE_POLICY`, `KSM_IOC_GET_POLICY`, `KSM_IOC_GET_POLICY_UIDS`

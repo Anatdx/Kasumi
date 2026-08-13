@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -75,11 +74,11 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	struct kasumi_filldir_wrapper *w =
 		container_of(ctx, struct kasumi_filldir_wrapper, wrap_ctx);
 	KASUMI_FILLDIR_RET_TYPE ret;
-	bool apply_hide = kasumi_should_apply_hide_rules();
 
 	/* Inject phase: before first real entry, emit entries from merge targets
 	 * and kasumi_paths into the directory listing. */
-	if (w->dir_has_inject && !w->inject_done && w->dir_path && w->parent_dentry) {
+	if (w->view_allowed && w->dir_has_inject && !w->inject_done &&
+	    w->dir_path && w->parent_dentry) {
 		struct list_head head;
 		struct kasumi_name_list *item, *tmp;
 		loff_t inj_pos = KASUMI_MAGIC_POS;
@@ -115,7 +114,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 			goto passthrough;
 	}
 
-	if (apply_hide && kasumi_stealth_enabled && w->dir_path_len == 4) {
+	if (w->spoof_allowed && kasumi_stealth_enabled && w->dir_path_len == 4) {
 		size_t mlen = strlen(kasumi_current_mirror_name);
 		if ((unsigned int)namlen == mlen &&
 		    memcmp(name, kasumi_current_mirror_name, namlen) == 0)
@@ -129,7 +128,8 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	 * resolved to same inode via symlink) - otherwise we'd hide everything.
 	 * This is independent of app-hide policy because explicit merge rules
 	 * must not emit duplicate names even during root/manual validation. */
-	if (kasumi_d_hash_and_lookup && w->merge_target_count > 0 && w->parent_dentry) {
+	if (w->view_allowed && kasumi_d_hash_and_lookup &&
+	    w->merge_target_count > 0 && w->parent_dentry) {
 		int i;
 		for (i = 0; i < w->merge_target_count; i++) {
 			struct dentry *tgt = w->merge_target_dentries[i];
@@ -149,7 +149,8 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 		}
 	}
 
-	if (kasumi_d_hash_and_lookup && w->dir_has_hidden && w->parent_dentry) {
+	if (w->view_allowed && kasumi_d_hash_and_lookup && w->dir_has_hidden &&
+	    w->parent_dentry) {
 		struct dentry *child;
 
 		child = kasumi_d_hash_and_lookup(w->parent_dentry,
@@ -271,7 +272,7 @@ KASUMI_NOCFI int kasumi_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
 
 	if (!READ_ONCE(kasumi_enabled))
 		return 0;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_view_target())
 		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
@@ -342,7 +343,7 @@ void kasumi_apply_kstat_spoof(struct inode *inode, struct kstat *stat)
 
 	if (!stat)
 		return;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_view_target())
 		return;
 
 	/* Explicit per-inode spoof rule (api15) takes precedence. */
@@ -481,7 +482,7 @@ KASUMI_NOCFI int kasumi_krp_vfs_getxattr_entry(struct kretprobe_instance *ri,
 
 	if (!READ_ONCE(kasumi_enabled))
 		return 0;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_view_target())
 		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
@@ -685,6 +686,8 @@ KASUMI_NOCFI int kasumi_krp_d_path_entry(struct kretprobe_instance *ri,
 
 	if (!READ_ONCE(kasumi_enabled))
 		return 0;
+	if (!kasumi_policy_current_is_view_target())
+		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
 	if (atomic_read(&kasumi_rule_count) == 0)
@@ -795,6 +798,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	struct kasumi_filldir_wrapper *w;
 	struct inode *dir_inode;
 	const char *dname;
+	enum kasumi_policy_scope scope;
 
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return NULL;
@@ -808,6 +812,9 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 		return NULL;
 	if (orig_ctx->actor == kasumi_filldir_filter)
 		return NULL;
+	scope = kasumi_policy_current_scope();
+	if (scope == KASUMI_POLICY_SCOPE_NONE)
+		return NULL;
 
 	w = kmem_cache_zalloc(kasumi_filldir_cache, GFP_ATOMIC);
 	if (!w)
@@ -816,16 +823,20 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	w->orig_ctx = orig_ctx;
 	w->wrap_ctx.actor = kasumi_filldir_filter;
 	w->wrap_ctx.pos = orig_ctx->pos;
+	w->view_allowed = scope == KASUMI_POLICY_SCOPE_VIEW;
+	w->spoof_allowed = scope == KASUMI_POLICY_SCOPE_SPOOF;
 	w->parent_dentry = file && file->f_path.dentry ? file->f_path.dentry : NULL;
 	w->inject_done = orig_ctx->pos != 0;
 
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
 		if (dir_inode && dir_inode->i_mapping) {
-			w->dir_has_hidden = test_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
+			w->dir_has_hidden = w->view_allowed &&
+				test_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
 						     &dir_inode->i_mapping->flags);
 			/* Fast path: if dir has no inject flag, skip rcu_read_lock + hash traversal */
-			w->dir_has_inject = test_bit(AS_FLAGS_KASUMI_DIR_HAS_INJECT,
+			w->dir_has_inject = w->view_allowed &&
+				test_bit(AS_FLAGS_KASUMI_DIR_HAS_INJECT,
 						    &dir_inode->i_mapping->flags);
 		}
 		dname = w->parent_dentry->d_name.name;
@@ -836,7 +847,8 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 		 * Only when dir_has_inject (from flag) is true: build full path and
 		 * traverse hash to get merge_target_dentries. Most dirs skip this.
 		 */
-		if (atomic_read(&kasumi_rule_count) > 0 && w->dir_has_inject) {
+		if (w->view_allowed && atomic_read(&kasumi_rule_count) > 0 &&
+		    w->dir_has_inject) {
 			char *buf = kasumi_iterate_buf_base + (smp_processor_id() * KASUMI_ITERATE_PATH_BUF);
 			char *dp = ERR_PTR(-ENOENT);
 
@@ -887,14 +899,9 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 		}
 	}
 
-	if (uid_eq(current_uid(), GLOBAL_ROOT_UID) &&
-	    !w->dir_has_hidden && !w->dir_has_inject) {
-		kmem_cache_free(kasumi_filldir_cache, w);
-		return NULL;
-	}
-
 	if (!w->dir_has_hidden && !w->dir_has_inject &&
-	    (!kasumi_stealth_enabled || w->dir_path_len != 4)) {
+	    (!w->spoof_allowed || !kasumi_stealth_enabled ||
+	     w->dir_path_len != 4)) {
 		kmem_cache_free(kasumi_filldir_cache, w);
 		return NULL;
 	}

@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -48,9 +47,8 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
 #include "kasumi_iop_override.h"
 /* ======================================================================
  * Part 10: Inject Rule Helper
@@ -176,7 +174,8 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 	size_t dpath_dir_len = 0;
 	u32 dpath_hash = 0;
 
-	if (unlikely(!kasumi_enabled || !dir_path))
+	if (unlikely(!kasumi_enabled || !dir_path ||
+		     !kasumi_policy_current_is_view_target()))
 		return;
 	if (atomic_read(&kasumi_rule_count) == 0)
 		return;
@@ -378,16 +377,13 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 				set_bit(h1, kasumi_path_bloom);
 				set_bit(h2, kasumi_path_bloom);
 				atomic_inc(&kasumi_rule_count);
+				atomic_inc(&kasumi_tsr_path_count);
 				if (kasumi_kern_path) {
 					struct path p;
 
 					if (kasumi_kern_path(tgt, LOOKUP_FOLLOW, &p) == 0) {
 						if (p.dentry && d_inode(p.dentry)) {
-							(void)kasumi_clone_source_attrs_from_path(d_inode(p.dentry),
-												    src);
 							(void)kasumi_iop_mark_spoof(d_inode(p.dentry));
-							(void)kasumi_dop_install(p.dentry, src);
-							(void)kasumi_xattr_sid_install_path_ancestors(tgt, src);
 						}
 						kasumi_path_put(&p);
 					}

@@ -39,7 +39,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -54,7 +53,6 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_syscall_redirect.h"
-#include "kasumi_uname.h"
 #include "kasumi_fake_mountinfo.h"
 
 /*
@@ -109,7 +107,8 @@ static int kasumi_queue_getfd_task_work(int __user *outp)
 
 	tw->outp = outp;
 	tw->cb.func = kasumi_getfd_task_work_func;
-	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
+	if (!kasumi_task_work_add_ptr ||
+	    kasumi_task_work_add_ptr(current, &tw->cb, TWA_RESUME)) {
 		call_rcu(&tw->rcu, kasumi_getfd_task_work_release_rcu);
 		return -ESRCH;
 	}
@@ -175,7 +174,7 @@ static int kasumi_cmdline_pre(struct kprobe *p, struct pt_regs *regs)
 
 	if (!READ_ONCE(kasumi_cmdline_spoof_active))
 		return 0;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_spoof_target())
 		return 0;
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
@@ -256,9 +255,6 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 	} else {
 		pr_alert("Kasumi: skipping GET_FD reboot kprobe\n");
 	}
-
-	if (kasumi_uname_init() != 0)
-		pr_warn("Kasumi: uname spoofing unavailable (init_uts_ns/uts_sem not resolvable)\n");
 
 	if (!skip_extra_kprobes) {
 		int ret;

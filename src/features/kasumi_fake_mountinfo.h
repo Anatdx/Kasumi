@@ -71,6 +71,9 @@ int kasumi_fake_mi_lookup_mount_id(const char *path);
  */
 int kasumi_fake_mi_lookup_mount_id_cached(const char *path);
 
+/* Translate a real kstat mount ID using the current namespace cache. */
+int kasumi_fake_mi_translate_mount_id_cached(u64 real_id);
+
 /* Drop per-file cursor state when the file is closed or refreshed. Called
  * lazily from serve() based on LRU; no explicit close hook needed.
  */

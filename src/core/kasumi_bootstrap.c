@@ -23,10 +23,7 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_uname.h"
 #include "kasumi_sop_override.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -124,6 +121,11 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_copy_to_user_nofault = (void *)kasumi_lookup_callable("copy_to_user_nofault");
 	if (!kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault)
 		pr_warn("Kasumi: user nofault copy helpers not found, statx mount-id spoof disabled\n");
+	kasumi_task_work_add_ptr = (void *)kasumi_lookup_callable_quiet("task_work_add");
+	if (!kasumi_task_work_add_ptr) {
+		pr_err("Kasumi: FATAL - task_work_add not found\n");
+		return -ENOENT;
+	}
 	kasumi_call_srcu_ptr = (void *)kasumi_lookup_callable("call_srcu");
 	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_callable("srcu_barrier");
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
@@ -202,26 +204,24 @@ int kasumi_bootstrap_init(void)
 
 	kasumi_resolve_system_dev();
 
+	ret = kasumi_task_marker_init(kasumi_policy_uid_needs_view_tsr);
+	if (ret)
+		pr_warn("Kasumi: task scope lifecycle unavailable: %d\n", ret);
+
 	if (!kasumi_no_tracepoint_param) {
 		ret = kasumi_syscall_redirect_init();
 		if (ret) {
 			pr_warn("Kasumi: TSR dispatcher unavailable: %d; virtual path redirect disabled\n",
 				ret);
+		} else if (!kasumi_task_marker_available()) {
+			pr_warn("Kasumi: task marker unavailable; virtual path redirect disabled\n");
+			kasumi_syscall_redirect_exit();
 		} else {
-			ret = kasumi_task_marker_init(
-				kasumi_policy_should_trace_uid);
+			ret = kasumi_tracepoint_hooks_init();
 			if (ret) {
-				pr_warn("Kasumi: task marker unavailable: %d; virtual path redirect disabled\n",
+				pr_warn("Kasumi: TSR tracepoint unavailable: %d; virtual path redirect disabled\n",
 					ret);
 				kasumi_syscall_redirect_exit();
-			} else {
-				ret = kasumi_tracepoint_hooks_init();
-				if (ret) {
-					pr_warn("Kasumi: TSR tracepoint unavailable: %d; virtual path redirect disabled\n",
-						ret);
-					kasumi_task_marker_exit();
-					kasumi_syscall_redirect_exit();
-				}
 			}
 		}
 	} else {
@@ -241,8 +241,6 @@ int kasumi_bootstrap_init(void)
 		goto err_active;
 
 	(void)kasumi_sop_override_init();
-	(void)kasumi_dop_override_init();
-	(void)kasumi_xattr_sid_override_init();
 	(void)kasumi_iop_override_init();
 	(void)kasumi_fop_override_init();
 
@@ -306,12 +304,8 @@ void kasumi_bootstrap_exit(void)
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
 	kasumi_iop_override_exit();
-	kasumi_xattr_sid_override_exit();
-	kasumi_dop_override_exit();
 	kasumi_sop_override_exit();
 	kasumi_fake_mi_exit();
-	kasumi_uname_exit();
-
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();
 	kasumi_policy_shutdown_locked();
