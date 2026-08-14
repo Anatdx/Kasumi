@@ -101,7 +101,9 @@ int kasumi_getxattr_kprobe_registered;
 int kasumi_mount_hide_vfsmnt_registered;
 int kasumi_mount_hide_mountinfo_registered;
 int kasumi_proc_proxy_registered;
+int kasumi_proc_ns_readlink_registered;
 int kasumi_feature_enabled_mask;
+int kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;
 int kasumi_statfs_kretprobe_registered;
 int kasumi_reboot_kprobe_registered;
 bool kasumi_vfs_use_ftrace;
@@ -449,6 +451,7 @@ void kasumi_cleanup_locked(void)
 	(void)kasumi_tracepoint_hooks_set_enabled(false);
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
+	kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;
 	kasumi_file_view_clear();
 	/* Stop provider calls and release any external module reference. */
 	kasumi_policy_disable_provider_locked();

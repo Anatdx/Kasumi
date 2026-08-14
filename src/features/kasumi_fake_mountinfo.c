@@ -9,6 +9,7 @@
  */
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_entrypoints.h"
+#include "kasumi_runtime.h"
 
 #include <linux/fs.h>
 #include <linux/file.h>
@@ -156,10 +157,17 @@ static inline bool is_digit(char c)
 
 #define FAKE_MI_MAX_PROP_FIELDS 8
 
+enum fake_mi_prop_kind {
+    FAKE_MI_PROP_SHARED = 0,
+    FAKE_MI_PROP_MASTER,
+    FAKE_MI_PROP_PROPAGATE_FROM,
+};
+
 struct fake_mi_prop_ref {
     size_t value_start;
     size_t value_end;
     int old_id;
+    enum fake_mi_prop_kind kind;
 };
 
 static bool parse_decimal_token(const char *line, size_t start, size_t end, int *out)
@@ -207,10 +215,27 @@ static bool token_has_prefix(const char *line, size_t start, size_t end,
            memcmp(line + start, prefix, plen) == 0;
 }
 
+static bool token_is_path_under(const char *line, size_t start, size_t end,
+                                const char *prefix)
+{
+    size_t plen = strlen(prefix);
+
+    if (end < start + plen || memcmp(line + start, prefix, plen) != 0)
+        return false;
+    return end == start + plen || line[start + plen] == '/';
+}
+
+static bool token_is_root_owned_mount_path(const char *line, size_t start,
+                                           size_t end)
+{
+    return token_is_path_under(line, start, end, "/adb") ||
+           token_is_path_under(line, start, end, "/data/adb");
+}
+
 /*
  * Parse one mountinfo line and extract:
  *   - mnt_id / parent_id
- *   - source == KSU
+ *   - root-owned mounts identified by source, mount root, or mountpoint
  *   - propagation-group numeric suffixes inside optional fields
  *
  * The returned byte ranges let us rewrite only the numeric pieces while
@@ -224,12 +249,14 @@ static bool parse_line(const char *line, size_t len,
                        size_t *mi_start, size_t *mi_end,
                        size_t *pi_start, size_t *pi_end,
                        struct fake_mi_prop_ref *prop_refs, size_t *prop_count,
-                       bool *is_ksu, bool *is_namespace_root)
+                       bool *is_hidden, bool *is_namespace_root)
 {
     size_t i = 0, token_start, token_end;
+    size_t mount_root_start = 0, mount_root_end = 0;
+    size_t mountpoint_start = 0, mountpoint_end = 0;
     size_t j;
 
-    *is_ksu = false;
+    *is_hidden = false;
     *is_namespace_root = false;
     if (prop_count)
         *prop_count = 0;
@@ -256,16 +283,34 @@ static bool parse_line(const char *line, size_t len,
         return false;
     i++;
 
-    /* Skip major:minor, root, mountpoint, mount opts. A self-parent entry is
+    /* Parse major:minor, root, mountpoint, mount opts. A self-parent entry is
      * only a legitimate graph terminator when it is mounted at namespace /.
      */
     for (j = 0; j < 4; j++) {
         token_start = i;
-        if (!skip_token(line, len, &i))
+        while (i < len && line[i] != ' ')
+            i++;
+        token_end = i;
+        if (token_start == token_end || i >= len || line[i] != ' ')
             return false;
-        if (j == 2 && i == token_start + 2 && line[token_start] == '/')
+        i++;
+        if (j == 1) {
+            mount_root_start = token_start;
+            mount_root_end = token_end;
+        } else if (j == 2) {
+            mountpoint_start = token_start;
+            mountpoint_end = token_end;
+        }
+        if (j == 2 && token_end == token_start + 1 &&
+            line[token_start] == '/')
             *is_namespace_root = true;
     }
+
+    if (token_is_root_owned_mount_path(line, mount_root_start,
+                                       mount_root_end) ||
+        token_is_root_owned_mount_path(line, mountpoint_start,
+                                       mountpoint_end))
+        *is_hidden = true;
 
     while (i < len) {
         int value;
@@ -286,14 +331,17 @@ static bool parse_line(const char *line, size_t len,
         if (prop_refs && prop_count && *prop_count < FAKE_MI_MAX_PROP_FIELDS) {
             size_t value_start = 0;
             const char *prefix = NULL;
+            enum fake_mi_prop_kind kind = FAKE_MI_PROP_SHARED;
 
             if (token_has_prefix(line, token_start, token_end, "shared:")) {
                 prefix = "shared:";
             } else if (token_has_prefix(line, token_start, token_end, "master:")) {
                 prefix = "master:";
+                kind = FAKE_MI_PROP_MASTER;
             } else if (token_has_prefix(line, token_start, token_end,
                                         "propagate_from:")) {
                 prefix = "propagate_from:";
+                kind = FAKE_MI_PROP_PROPAGATE_FROM;
             }
 
             if (prefix) {
@@ -303,6 +351,7 @@ static bool parse_line(const char *line, size_t len,
                     prop_refs[*prop_count].value_start = value_start;
                     prop_refs[*prop_count].value_end = token_end;
                     prop_refs[*prop_count].old_id = value;
+                    prop_refs[*prop_count].kind = kind;
                     (*prop_count)++;
                 }
             }
@@ -327,7 +376,9 @@ static bool parse_line(const char *line, size_t len,
         line[token_start] == 'K' &&
         line[token_start + 1] == 'S' &&
         line[token_start + 2] == 'U')
-        *is_ksu = true;
+        *is_hidden = true;
+    if (token_is_root_owned_mount_path(line, token_start, token_end))
+        *is_hidden = true;
 
     return true;
 }
@@ -566,8 +617,9 @@ static size_t decimal_len(int value)
 
 /* Build the new mountinfo buffer from the current hidden task's real
  * /proc/self/mountinfo view. If userspace namespace hiding has already removed
- * module mounts, use that view as the base; then drop any remaining KSU-source
- * lines as a conservative kernel-side fallback and compact mount ids.
+ * module mounts, use that view as the base; then drop remaining root-owned
+ * lines and compact mount ids. Normal mode preserves propagation semantics;
+ * aggressive mode additionally projects a global shared root as private.
  */
 static int build_fake_buffer(const char *raw, size_t raw_len,
 			     char *out, size_t out_cap, size_t *out_len,
@@ -583,6 +635,8 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
     int next_mount_id = 1;
     int next_prop_id = 1;
     unsigned int parent_walk_cookie = 1;
+    bool aggressive = READ_ONCE(kasumi_mount_hide_mode) ==
+                      KSM_MOUNT_HIDE_MODE_AGGRESSIVE;
     int i;
     int ret = 0;
     size_t in = 0, o = 0;
@@ -605,7 +659,7 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
     }
 
     /* Pass 1: retain the complete parent graph and assign compact ids only
-     * to non-KSU lines in original order.
+     * to visible lines in original order.
      */
     in = 0;
     while (in < raw_len) {
@@ -614,22 +668,22 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         size_t ms, me, ps, pe;
         struct fake_mi_prop_ref prop_refs[FAKE_MI_MAX_PROP_FIELDS];
         size_t prop_count = 0;
-        bool ksu;
+        bool hidden;
         bool namespace_root;
         size_t j;
 
         while (in < raw_len && raw[in] != '\n') in++;
         if (!parse_line(raw + ls, in - ls, &mi, &pi,
                         &ms, &me, &ps, &pe,
-                        prop_refs, &prop_count, &ksu, &namespace_root)) {
+                        prop_refs, &prop_count, &hidden, &namespace_root)) {
             ret = -EINVAL;
             goto out;
         }
-        ret = mount_map_add(mount_map, &n_mount_map, mi, pi, !ksu,
+        ret = mount_map_add(mount_map, &n_mount_map, mi, pi, !hidden,
                             namespace_root, &next_mount_id);
         if (ret)
             goto out;
-        if (!ksu) {
+        if (!hidden) {
             for (j = 0; j < prop_count; j++) {
                 ret = map_add_if_missing(prop_map, &n_prop_map,
                                          MAX_PROP_IDS,
@@ -668,8 +722,9 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         size_t ms, me, ps, pe;
         struct fake_mi_prop_ref prop_refs[FAKE_MI_MAX_PROP_FIELDS];
         size_t prop_count = 0;
-        bool ksu;
+        bool hidden;
         bool namespace_root;
+        bool project_root_shared = false;
         size_t line_len;
         int new_mi, new_pi;
         size_t cursor;
@@ -681,11 +736,11 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
 
         if (!parse_line(raw + ls, line_len, &mi, &pi,
                         &ms, &me, &ps, &pe,
-                        prop_refs, &prop_count, &ksu, &namespace_root)) {
+                        prop_refs, &prop_count, &hidden, &namespace_root)) {
             ret = -EINVAL;
             goto out;
         }
-        if (ksu) {
+        if (hidden) {
             if (in < raw_len) in++;
             continue;
         }
@@ -727,6 +782,19 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
             }
         }
 
+        if (aggressive && namespace_root) {
+            bool has_shared = false;
+            bool has_master = false;
+
+            for (j = 0; j < prop_count; j++) {
+                if (prop_refs[j].kind == FAKE_MI_PROP_SHARED)
+                    has_shared = true;
+                else if (prop_refs[j].kind == FAKE_MI_PROP_MASTER)
+                    has_master = true;
+            }
+            project_root_shared = has_shared && !has_master;
+        }
+
         n = scnprintf(out + o, out_cap - o, "%d", new_mi);
         o += n;
         memcpy(out + o, raw + ls + me, ps - me);
@@ -737,14 +805,20 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
 
         for (j = 0; j < prop_count; j++) {
             int new_prop = map_lookup(prop_map, n_prop_map, prop_refs[j].old_id);
+            size_t segment_len;
 
             if (new_prop < 0) {
                 ret = -ENOENT;
                 goto out;
             }
-            memcpy(out + o, raw + ls + cursor,
-                   prop_refs[j].value_start - cursor);
-            o += prop_refs[j].value_start - cursor;
+            segment_len = prop_refs[j].value_start - cursor;
+            memcpy(out + o, raw + ls + cursor, segment_len);
+            if (project_root_shared &&
+                prop_refs[j].kind == FAKE_MI_PROP_SHARED &&
+                segment_len >= sizeof("shared:") - 1)
+                memcpy(out + o + segment_len - (sizeof("shared:") - 1),
+                       "master:", sizeof("master:") - 1);
+            o += segment_len;
             n = scnprintf(out + o, out_cap - o, "%d", new_prop);
             o += n;
             cursor = prop_refs[j].value_end;

@@ -209,6 +209,10 @@ struct kasumi_spoof_cmdline {
 #define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
 #define KSM_FEATURE_QUIESCE     (1 << 11) /* terminal pre-unload quiesce handshake */
+#define KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE (1 << 12) /* shared-root and mount-ns link projection */
+
+#define KSM_MOUNT_HIDE_MODE_NORMAL     0
+#define KSM_MOUNT_HIDE_MODE_AGGRESSIVE 1
 
 #define KSM_QUIESCE_API_VERSION 1
 
@@ -327,5 +331,6 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_RESET_POLICY      _IOWR(KSM_IOC_MAGIC, 36, struct kasumi_policy_config_arg)
 /* Idempotent terminal transition; repeat to poll until state is READY. */
 #define KSM_IOC_PREPARE_UNLOAD    _IOWR(KSM_IOC_MAGIC, 37, struct kasumi_quiesce_arg)
+#define KSM_IOC_SET_MOUNT_HIDE_MODE _IOW(KSM_IOC_MAGIC, 38, int)
 
 #endif /* _KASUMI_UAPI_H */

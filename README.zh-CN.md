@@ -112,7 +112,7 @@ ksud insmod kasumi_lkm.ko
 - `KSM_IOC_ADD_SPOOF_KSTAT`、`KSM_IOC_UPDATE_SPOOF_KSTAT`
 - `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`、`KSM_IOC_CLEAR_MAPS_RULES`
-- `KSM_IOC_SET_MOUNT_HIDE`、`KSM_IOC_SET_MAPS_SPOOF`、`KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_SET_MOUNT_HIDE`、`KSM_IOC_SET_MOUNT_HIDE_MODE`、`KSM_IOC_SET_MAPS_SPOOF`、`KSM_IOC_SET_STATFS_SPOOF`
 - `KSM_IOC_REPLACE_POLICY`、`KSM_IOC_GET_POLICY`、`KSM_IOC_GET_POLICY_UIDS`
 - `KSM_IOC_RESET_POLICY`（policy 必须显式重置；`KSM_IOC_CLEAR_ALL` 保留 policy）
 
@@ -123,6 +123,11 @@ API 17 将 owner、flags 与两张 UID 表作为一个 RCU snapshot 一次发布
 owner、flags 与列表；provider 检测及 `effective_owner` 是实时状态。
 policy 只能在 Kasumi disabled 状态修改。用户态必须先调用
 `KSM_IOC_SET_ENABLED(0)`，完成 SET/REPLACE/CLEAR/RESET 后再显式启用完整配置。
+
+mount hide 默认为普通模式：只从 proc 挂载视图移除 root 所有的挂载，不改变真实传播
+属性与挂载命名空间链接。激进模式还会将 zygote_next 的 shared 根投影为 private slave，
+并向选中进程返回合成的 `/proc/*/ns/mnt` 链接。用户态只能在
+`KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE` 可用时请求激进模式。
 
 Anatdx 本人维护的 [YukiSU](https://github.com/Anatdx/YukiSU) 提供与 KernelSU 集成的实现（C++），
 以及 Anatdx 参与开发的 [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) 元模块也加入了 Kasumi 支持与用户态实现（Rust）。

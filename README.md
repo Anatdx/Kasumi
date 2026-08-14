@@ -114,7 +114,7 @@ Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
 - `KSM_IOC_ADD_SPOOF_KSTAT`, `KSM_IOC_UPDATE_SPOOF_KSTAT`
 - `KSM_IOC_SET_CMDLINE`
 - `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
-- `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
+- `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MOUNT_HIDE_MODE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
 - `KSM_IOC_REPLACE_POLICY`, `KSM_IOC_GET_POLICY`, `KSM_IOC_GET_POLICY_UIDS`
 - `KSM_IOC_RESET_POLICY` (policy reset is explicit; `KSM_IOC_CLEAR_ALL` preserves policy)
 
@@ -128,6 +128,12 @@ provider detection and `effective_owner` are live status fields.
 Policy mutations are accepted only while Kasumi is disabled. Userspace must
 issue `KSM_IOC_SET_ENABLED(0)` before SET/REPLACE/CLEAR/RESET, then explicitly
 enable the completed configuration.
+
+Mount hide defaults to normal mode: root-owned mounts are removed from proc
+mount views without changing the real propagation state or mount namespace
+link. Aggressive mode additionally projects a zygote_next shared root as a
+private slave and returns a synthetic `/proc/*/ns/mnt` link to selected tasks.
+Userspace can request it only when `KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE` is set.
 
 You can use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
 In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) meta-module includes Kasumi support with a Rust userspace implementation.
