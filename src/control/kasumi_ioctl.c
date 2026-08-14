@@ -1795,6 +1795,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_HIDE_OVERLAY_XATTRS:
 	case KSM_IOC_ADD_MERGE_RULE:
 	case KSM_IOC_SET_MIRROR_PATH:
+	case KSM_IOC_SET_CMDLINE:
 	case KSM_IOC_GET_HOOKS:
 	case KSM_IOC_ADD_MAPS_RULE:
 	case KSM_IOC_CLEAR_MAPS_RULES:
