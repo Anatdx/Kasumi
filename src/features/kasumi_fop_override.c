@@ -8,6 +8,7 @@
  * Author: Anatdx
  */
 #include "kasumi_entrypoints.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_runtime.h"
 #include "kasumi_vfs_hooks.h"
@@ -24,7 +25,9 @@
 struct kasumi_fop_meta {
 	struct inode *inode;
 	const struct file_operations *orig_fop;
+	struct file_operations ingress_fop;
 	struct file_operations shadow_fop;
+	struct kasumi_fop_bridge_entry bridge;
 	struct hlist_node node;
 	struct list_head retire_node;
 };
@@ -58,6 +61,12 @@ static void kasumi_fop_meta_free(struct kasumi_fop_meta *m)
 		iput(m->inode);
 	kasumi_fop_put_orig(m->orig_fop);
 	kfree(m);
+}
+
+static const struct file_operations *
+kasumi_fop_installed_table(const struct kasumi_fop_meta *m)
+{
+	return m->bridge.registered ? &m->ingress_fop : &m->shadow_fop;
 }
 
 KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
@@ -143,6 +152,7 @@ int kasumi_fop_install(struct inode *inode)
 	memcpy(&m->shadow_fop, orig, sizeof(struct file_operations));
 	m->shadow_fop.owner = THIS_MODULE;
 	m->shadow_fop.iterate_shared = kasumi_shadow_iterate_shared;
+	memcpy(&m->ingress_fop, orig, sizeof(struct file_operations));
 	kasumi_ihold(inode);
 
 	spin_lock(&kasumi_fop_lock);
@@ -164,9 +174,11 @@ int kasumi_fop_install(struct inode *inode)
 	}
 
 	hash_add_rcu(kasumi_fop_table, &m->node, (unsigned long)inode);
+	(void)kasumi_fop_bridge_register(&m->bridge, &m->ingress_fop,
+					 &m->shadow_fop, m->orig_fop);
 	set_bit(AS_FLAGS_KASUMI_FOP_INSTALLED, &inode->i_mapping->flags);
 	smp_wmb();
-	WRITE_ONCE(inode->i_fop, &m->shadow_fop);
+	WRITE_ONCE(inode->i_fop, kasumi_fop_installed_table(m));
 	spin_unlock(&kasumi_fop_lock);
 
 	kasumi_log("fop_override: installed on inode %p (orig=%p)\n", inode, orig);
@@ -182,7 +194,7 @@ kasumi_fop_uninstall_locked(struct inode *inode)
 	if (!m)
 		return NULL;
 
-	if (inode->i_fop == &m->shadow_fop)
+	if (inode->i_fop == kasumi_fop_installed_table(m))
 		WRITE_ONCE(inode->i_fop, m->orig_fop);
 
 	hash_del_rcu(&m->node);
@@ -204,6 +216,9 @@ void kasumi_fop_cleanup_inode(struct inode *inode)
 	if (!m)
 		return;
 
+	if (m->bridge.registered)
+		kasumi_synchronize_rcu_tasks();
+	kasumi_fop_bridge_unregister(&m->bridge);
 	synchronize_rcu();
 	kasumi_fop_meta_free(m);
 }
@@ -227,7 +242,8 @@ void kasumi_fop_override_stop_new(void)
 	spin_lock(&kasumi_fop_lock);
 	hash_for_each(kasumi_fop_table, bkt, m, node) {
 		had_meta = true;
-		if (m->inode && m->inode->i_fop == &m->shadow_fop)
+		if (m->inode && m->inode->i_fop ==
+					kasumi_fop_installed_table(m))
 			WRITE_ONCE(m->inode->i_fop, m->orig_fop);
 		if (m->inode && m->inode->i_mapping)
 			clear_bit(AS_FLAGS_KASUMI_FOP_INSTALLED,
@@ -254,6 +270,7 @@ void kasumi_fop_override_exit(void)
 	spin_lock(&kasumi_fop_lock);
 	hash_for_each_safe(kasumi_fop_table, bkt, tmp, m, node) {
 		hash_del_rcu(&m->node);
+		kasumi_fop_bridge_unregister(&m->bridge);
 		list_add_tail(&m->retire_node, &retired);
 	}
 	spin_unlock(&kasumi_fop_lock);

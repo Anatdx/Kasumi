@@ -9,6 +9,7 @@
  */
 #include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_entrypoints.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
 
@@ -75,7 +76,9 @@ struct kasumi_selinuxfs_txn_meta {
 	struct inode *inode;
 	enum kasumi_selinuxfs_txn_kind kind;
 	const struct file_operations *orig_fop;
+	struct file_operations ingress_fop;
 	struct file_operations shadow_fop;
+	struct kasumi_fop_bridge_entry bridge;
 };
 
 static struct kasumi_selinuxfs_txn_meta __rcu *kasumi_selinuxfs_access_meta;
@@ -327,6 +330,12 @@ static void kasumi_selinuxfs_lookup(struct inode *inode,
 	rcu_read_unlock();
 }
 
+static const struct file_operations *kasumi_selinuxfs_installed_table(
+	const struct kasumi_selinuxfs_txn_meta *m)
+{
+	return m->bridge.registered ? &m->ingress_fop : &m->shadow_fop;
+}
+
 static ssize_t kasumi_selinuxfs_sanitize_access_read(char __user *buf,
 						      size_t count,
 						      ssize_t ret)
@@ -499,20 +508,6 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_read(struct file *file,
 	return kasumi_selinuxfs_sanitize_access_read(buf, count, ret);
 }
 
-KASUMI_NOCFI static int kasumi_selinuxfs_status_open(struct inode *inode,
-						      struct file *file)
-{
-	const struct file_operations *orig;
-	int ret;
-
-	kasumi_selinuxfs_lookup(inode, &orig, NULL);
-	if (!orig || !orig->open)
-		return -EIO;
-
-	ret = orig->open(inode, file);
-	return ret;
-}
-
 static bool kasumi_selinuxfs_status_should_fake(void)
 {
 	return (READ_ONCE(kasumi_feature_enabled_mask) &
@@ -667,10 +662,10 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 	kasumi_ihold(inode);
 	m->kind = kind;
 	m->orig_fop = orig;
+	memcpy(&m->ingress_fop, orig, sizeof(m->ingress_fop));
 	memcpy(&m->shadow_fop, orig, sizeof(m->shadow_fop));
 	m->shadow_fop.owner = THIS_MODULE;
 	if (kind == KASUMI_SELINUXFS_STATUS) {
-		m->shadow_fop.open = kasumi_selinuxfs_status_open;
 		if (orig->read)
 			m->shadow_fop.read = kasumi_selinuxfs_status_read;
 		if (orig->mmap)
@@ -703,8 +698,10 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 	}
 
 	rcu_assign_pointer(*slot, m);
+	(void)kasumi_fop_bridge_register(&m->bridge, &m->ingress_fop,
+					 &m->shadow_fop, m->orig_fop);
 	smp_wmb();
-	WRITE_ONCE(inode->i_fop, &m->shadow_fop);
+	WRITE_ONCE(inode->i_fop, kasumi_selinuxfs_installed_table(m));
 	WRITE_ONCE(kasumi_selinuxfs_ready, true);
 	spin_unlock(&kasumi_selinuxfs_lock);
 
@@ -786,7 +783,8 @@ static void kasumi_fake_selinuxfs_restore_slot(
 	if (!m)
 		return;
 
-	if (m->inode && READ_ONCE(m->inode->i_fop) == &m->shadow_fop)
+	if (m->inode && READ_ONCE(m->inode->i_fop) ==
+					kasumi_selinuxfs_installed_table(m))
 		WRITE_ONCE(m->inode->i_fop, m->orig_fop);
 }
 
@@ -845,6 +843,10 @@ void kasumi_fake_selinuxfs_access_exit(void)
 		&kasumi_selinuxfs_status_meta);
 	spin_unlock(&kasumi_selinuxfs_lock);
 
+	for (i = 0; i < ARRAY_SIZE(retired); i++) {
+		if (retired[i])
+			kasumi_fop_bridge_unregister(&retired[i]->bridge);
+	}
 	synchronize_rcu();
 	for (i = 0; i < ARRAY_SIZE(retired); i++)
 		kasumi_selinuxfs_meta_free(retired[i]);

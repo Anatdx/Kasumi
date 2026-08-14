@@ -86,7 +86,7 @@ static void kasumi_getfd_task_work_func(struct callback_head *cb)
 {
 	struct kasumi_getfd_task_work *tw =
 		container_of(cb, struct kasumi_getfd_task_work, cb);
-	int fd = atomic_read(&kasumi_getfd_accepting) ?
+	int fd = atomic_read_acquire(&kasumi_getfd_accepting) ?
 		kasumi_install_anon_fd(tw->outp) : -ESHUTDOWN;
 
 	if (fd < 0)
@@ -101,7 +101,7 @@ static int kasumi_queue_getfd_task_work(int __user *outp)
 
 	if (!outp || !access_ok(outp, sizeof(*outp)))
 		return -EFAULT;
-	if (!atomic_read(&kasumi_getfd_accepting))
+	if (!atomic_read_acquire(&kasumi_getfd_accepting))
 		return -ESHUTDOWN;
 
 	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
@@ -230,7 +230,7 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 {
 	(void)no_tracepoint;
 	atomic_set(&kasumi_getfd_pending, 0);
-	atomic_set(&kasumi_getfd_accepting, !skip_getfd);
+	atomic_set(&kasumi_getfd_accepting, 0);
 	if (!skip_getfd) {
 		static const char *reboot_symbols[] = {
 #if defined(__aarch64__)
@@ -288,6 +288,12 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 	kasumi_proc_read_hooks_init();
 
 	return 0;
+}
+
+void kasumi_proc_hooks_start(void)
+{
+	if (kasumi_reboot_kprobe_registered)
+		atomic_set_release(&kasumi_getfd_accepting, 1);
 }
 
 unsigned int kasumi_proc_getfd_pending(void)

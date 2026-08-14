@@ -57,6 +57,7 @@
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_file_view.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -1603,6 +1604,7 @@ static void kasumi_quiesce_stop_new(void)
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
 	kasumi_fop_override_stop_new();
+	kasumi_fop_bridge_stop_new();
 	kasumi_iop_override_stop_new();
 
 	mutex_lock(&kasumi_config_mutex);

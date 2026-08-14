@@ -11,6 +11,7 @@ kasumi_lkm-objs := \
 	kasumi_main.o \
 	core/kasumi_bootstrap.o \
 	core/kasumi_runtime.o \
+	core/kasumi_fop_bridge.o \
 	core/kasumi_file_view.o \
 	core/kasumi_root_detection.o \
 	control/kasumi_ioctl.o \

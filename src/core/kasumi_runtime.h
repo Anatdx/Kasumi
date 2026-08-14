@@ -145,6 +145,9 @@ extern int (*kasumi_task_work_add_ptr)(struct task_struct *task,
 extern struct llist_node *(*kasumi_llist_del_first_ptr)(
 	struct llist_head *head);
 struct llist_node *kasumi_llist_del_first(struct llist_head *head);
+extern ssize_t (*kasumi_seq_read_iter_ptr)(struct kiocb *iocb,
+					   struct iov_iter *iter);
+ssize_t kasumi_seq_read_iter(struct kiocb *iocb, struct iov_iter *iter);
 extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 				    rcu_callback_t func);
 extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);

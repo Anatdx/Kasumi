@@ -21,6 +21,7 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_store.h"
 #include "kasumi_file_view.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
@@ -61,14 +62,12 @@ static bool kasumi_unload_pin_held;
 
 bool kasumi_bootstrap_quiesce_supported(void)
 {
-	/* Before 6.12, fops_get(inode->i_fop) evaluates inode->i_fop multiple
-	 * times. Concurrent replacement can return one table while pinning another
-	 * table's owner, so cooperative unload cannot be proven safe there.
-	 */
+	if (!kasumi_module_refcount_ptr)
+		return false;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	return true;
 #else
-	return false;
+	return kasumi_fop_bridge_capable();
 #endif
 }
 
@@ -164,6 +163,10 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_err("Kasumi: FATAL - llist_del_first not found\n");
 		return -ENOENT;
 	}
+	kasumi_seq_read_iter_ptr =
+		(void *)kasumi_lookup_callable_quiet("seq_read_iter");
+	if (!kasumi_seq_read_iter_ptr)
+		pr_warn("Kasumi: seq_read_iter not found, legacy proc stream fallback disabled\n");
 	kasumi_call_srcu_ptr = (void *)kasumi_lookup_callable("call_srcu");
 	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_callable("srcu_barrier");
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
@@ -176,13 +179,11 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_err("Kasumi: FATAL - synchronize_rcu_tasks not found\n");
 		return -ENOENT;
 	}
-	if (kasumi_bootstrap_quiesce_supported()) {
-		kasumi_module_refcount_ptr =
-			(void *)kasumi_lookup_callable("module_refcount");
-		if (!kasumi_module_refcount_ptr) {
-			pr_err("Kasumi: FATAL - module_refcount not found\n");
-			return -ENOENT;
-		}
+	kasumi_module_refcount_ptr =
+		(void *)kasumi_lookup_callable_quiet("module_refcount");
+	if (!kasumi_module_refcount_ptr) {
+		pr_err("Kasumi: FATAL - module_refcount not found\n");
+		return -ENOENT;
 	}
 	kasumi_d_path = (void *)kasumi_lookup_callable("d_path");
 	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_callable("d_hash_and_lookup");
@@ -293,17 +294,32 @@ int kasumi_bootstrap_init(void)
 		goto err_active;
 
 	(void)kasumi_iop_override_init();
+	ret = kasumi_fop_bridge_init();
+	if (ret) {
+		pr_err("Kasumi: FATAL - old-KMI fops bridge unavailable: %d\n",
+		       ret);
+		goto err_fop_bridge;
+	}
 	(void)kasumi_fop_override_init();
 
+	/* On old KMI, the first ingress table published below is the module-init
+	 * commit point: bridge-open files may already pin THIS_MODULE. Keep every
+	 * later initialization step non-fatal.
+	 */
 	(void)kasumi_fake_selinuxfs_access_init();
 	kasumi_task_marker_start();
 	if (kasumi_bootstrap_quiesce_supported()) {
 		__module_get(THIS_MODULE);
 		WRITE_ONCE(kasumi_unload_pin_held, true);
 	}
+	kasumi_proc_hooks_start();
 	pr_alert("Kasumi: Chikyuu ga buttobu kurai tanoshinjaoo!!\n");
 	return 0;
 
+err_fop_bridge:
+	kasumi_fop_bridge_exit();
+	kasumi_iop_override_exit();
+	kasumi_vfs_hooks_exit(0);
 err_active:
 	kasumi_tracepoint_hooks_exit();
 	kasumi_task_marker_exit();
@@ -357,8 +373,12 @@ void kasumi_bootstrap_exit(void)
 	kasumi_file_view_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);
+	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_fop_override_stop_new();
+	kasumi_fop_bridge_stop_new();
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
+	kasumi_fop_bridge_exit();
 	kasumi_iop_override_exit();
 	kasumi_fake_mi_exit();
 	mutex_lock(&kasumi_config_mutex);

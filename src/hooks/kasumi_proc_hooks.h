@@ -13,6 +13,7 @@
 #include <linux/types.h>
 
 int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes);
+void kasumi_proc_hooks_start(void);
 void kasumi_proc_hooks_exit(void);
 void kasumi_proc_hooks_stop_new(void);
 unsigned int kasumi_proc_getfd_pending(void);

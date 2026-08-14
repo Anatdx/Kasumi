@@ -299,7 +299,7 @@ static KASUMI_NOCFI ssize_t kasumi_mount_proxy_orig_read_iter(
 	 * proxied here are seq_files, so seq_read_iter is the safe kernel-buffer
 	 * equivalent and avoids ever placing unfiltered bytes in userspace.
 	 */
-	return seq_read_iter(iocb, to);
+	return kasumi_seq_read_iter(iocb, to);
 }
 
 static bool kasumi_mount_proxy_stream_reserve(void)

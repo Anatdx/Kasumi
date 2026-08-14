@@ -134,6 +134,8 @@ int (*kasumi_task_work_add_ptr)(struct task_struct *task,
 				struct callback_head *work,
 				enum task_work_notify_mode notify);
 struct llist_node *(*kasumi_llist_del_first_ptr)(struct llist_head *head);
+ssize_t (*kasumi_seq_read_iter_ptr)(struct kiocb *iocb,
+				    struct iov_iter *iter);
 void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 			     rcu_callback_t func);
 void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
@@ -145,6 +147,14 @@ noinline KASUMI_NOCFI struct llist_node *
 kasumi_llist_del_first(struct llist_head *head)
 {
 	return kasumi_llist_del_first_ptr(head);
+}
+
+noinline KASUMI_NOCFI ssize_t kasumi_seq_read_iter(
+	struct kiocb *iocb, struct iov_iter *iter)
+{
+	if (!kasumi_seq_read_iter_ptr)
+		return -EOPNOTSUPP;
+	return kasumi_seq_read_iter_ptr(iocb, iter);
 }
 
 noinline KASUMI_NOCFI void kasumi_synchronize_rcu_tasks(void)
