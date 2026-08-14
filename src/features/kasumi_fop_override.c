@@ -10,10 +10,10 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_runtime.h"
-#include "kasumi_sop_override.h"
 #include "kasumi_vfs_hooks.h"
 
 #include <linux/hashtable.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -26,7 +26,7 @@ struct kasumi_fop_meta {
 	const struct file_operations *orig_fop;
 	struct file_operations shadow_fop;
 	struct hlist_node node;
-	struct rcu_head rcu;
+	struct list_head retire_node;
 };
 
 static DEFINE_HASHTABLE(kasumi_fop_table, KASUMI_FOP_HASH_BITS);
@@ -44,17 +44,20 @@ static struct kasumi_fop_meta *kasumi_fop_lookup_rcu(struct inode *inode)
 	return NULL;
 }
 
-static void kasumi_fop_meta_free_rcu(struct rcu_head *rcu)
-{
-	struct kasumi_fop_meta *m = container_of(rcu, struct kasumi_fop_meta, rcu);
-
-	kfree(m);
-}
-
 static void kasumi_fop_put_orig(const struct file_operations *fop)
 {
 	if (fop && fop->owner)
 		module_put(fop->owner);
+}
+
+static void kasumi_fop_meta_free(struct kasumi_fop_meta *m)
+{
+	if (!m)
+		return;
+	if (m->inode)
+		iput(m->inode);
+	kasumi_fop_put_orig(m->orig_fop);
+	kfree(m);
 }
 
 KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
@@ -117,10 +120,10 @@ int kasumi_fop_install(struct inode *inode)
 		return -EINVAL;
 	if (!inode->i_sb)
 		return -EINVAL;
+	if (!kasumi_ihold)
+		return -EOPNOTSUPP;
 	if (test_bit(AS_FLAGS_KASUMI_FOP_INSTALLED, &inode->i_mapping->flags))
 		return 0;
-	if (kasumi_sop_install(inode->i_sb))
-		return -EOPNOTSUPP;
 
 	orig = READ_ONCE(inode->i_fop);
 	if (!orig || !orig->iterate_shared)
@@ -136,22 +139,27 @@ int kasumi_fop_install(struct inode *inode)
 
 	m->inode = inode;
 	m->orig_fop = orig;
+	INIT_LIST_HEAD(&m->retire_node);
 	memcpy(&m->shadow_fop, orig, sizeof(struct file_operations));
 	m->shadow_fop.owner = THIS_MODULE;
 	m->shadow_fop.iterate_shared = kasumi_shadow_iterate_shared;
+	kasumi_ihold(inode);
 
 	spin_lock(&kasumi_fop_lock);
+	if (!READ_ONCE(kasumi_fop_override_ready)) {
+		spin_unlock(&kasumi_fop_lock);
+		kasumi_fop_meta_free(m);
+		return -EOPNOTSUPP;
+	}
 	existing = kasumi_fop_lookup_rcu(inode);
 	if (existing) {
 		spin_unlock(&kasumi_fop_lock);
-		kasumi_fop_put_orig(orig);
-		kfree(m);
+		kasumi_fop_meta_free(m);
 		return 0;
 	}
 	if (READ_ONCE(inode->i_fop) != orig) {
 		spin_unlock(&kasumi_fop_lock);
-		kasumi_fop_put_orig(orig);
-		kfree(m);
+		kasumi_fop_meta_free(m);
 		return -EAGAIN;
 	}
 
@@ -165,13 +173,14 @@ int kasumi_fop_install(struct inode *inode)
 	return 0;
 }
 
-static void kasumi_fop_uninstall_locked(struct inode *inode)
+static struct kasumi_fop_meta *
+kasumi_fop_uninstall_locked(struct inode *inode)
 {
 	struct kasumi_fop_meta *m;
 
 	m = kasumi_fop_lookup_rcu(inode);
 	if (!m)
-		return;
+		return NULL;
 
 	if (inode->i_fop == &m->shadow_fop)
 		WRITE_ONCE(inode->i_fop, m->orig_fop);
@@ -179,49 +188,80 @@ static void kasumi_fop_uninstall_locked(struct inode *inode)
 	hash_del_rcu(&m->node);
 	if (inode->i_mapping)
 		clear_bit(AS_FLAGS_KASUMI_FOP_INSTALLED, &inode->i_mapping->flags);
-	kasumi_fop_put_orig(m->orig_fop);
-	call_rcu(&m->rcu, kasumi_fop_meta_free_rcu);
+	return m;
 }
 
 void kasumi_fop_cleanup_inode(struct inode *inode)
 {
+	struct kasumi_fop_meta *m;
+
 	if (!inode)
 		return;
 
 	spin_lock(&kasumi_fop_lock);
-	kasumi_fop_uninstall_locked(inode);
+	m = kasumi_fop_uninstall_locked(inode);
 	spin_unlock(&kasumi_fop_lock);
+	if (!m)
+		return;
+
+	synchronize_rcu();
+	kasumi_fop_meta_free(m);
 }
 
 int kasumi_fop_override_init(void)
 {
 	hash_init(kasumi_fop_table);
 	WRITE_ONCE(kasumi_fop_override_ready, true);
-	pr_info("Kasumi: fop_override initialized (cleanup via sop_override)\n");
+	pr_info("Kasumi: fop_override initialized\n");
 	return 0;
 }
 
-void kasumi_fop_override_exit(void)
+void kasumi_fop_override_stop_new(void)
 {
 	struct kasumi_fop_meta *m;
-	struct hlist_node *tmp;
+	bool had_meta = false;
 	int bkt;
 
 	WRITE_ONCE(kasumi_fop_override_ready, false);
 
 	spin_lock(&kasumi_fop_lock);
-	hash_for_each_safe(kasumi_fop_table, bkt, tmp, m, node) {
+	hash_for_each(kasumi_fop_table, bkt, m, node) {
+		had_meta = true;
 		if (m->inode && m->inode->i_fop == &m->shadow_fop)
 			WRITE_ONCE(m->inode->i_fop, m->orig_fop);
 		if (m->inode && m->inode->i_mapping)
 			clear_bit(AS_FLAGS_KASUMI_FOP_INSTALLED,
 				  &m->inode->i_mapping->flags);
+	}
+	spin_unlock(&kasumi_fop_lock);
+	/* do_dentry_open() can fetch inode->i_fop before fops_get() pins its
+	 * owner.  Tasks-RCU forces every such stale fetch through fops_get (and
+	 * therefore into module_refcount) before PREPARE may report READY.
+	 */
+	if (had_meta)
+		kasumi_synchronize_rcu_tasks();
+}
+
+void kasumi_fop_override_exit(void)
+{
+	LIST_HEAD(retired);
+	struct kasumi_fop_meta *m, *next;
+	struct hlist_node *tmp;
+	int bkt;
+
+	kasumi_fop_override_stop_new();
+
+	spin_lock(&kasumi_fop_lock);
+	hash_for_each_safe(kasumi_fop_table, bkt, tmp, m, node) {
 		hash_del_rcu(&m->node);
-		kasumi_fop_put_orig(m->orig_fop);
-		call_rcu(&m->rcu, kasumi_fop_meta_free_rcu);
+		list_add_tail(&m->retire_node, &retired);
 	}
 	spin_unlock(&kasumi_fop_lock);
 
-	rcu_barrier();
+	synchronize_rcu();
+	list_for_each_entry_safe(m, next, &retired, retire_node) {
+		list_del(&m->retire_node);
+		kasumi_fop_meta_free(m);
+	}
 	pr_info("Kasumi: fop_override exited\n");
 }

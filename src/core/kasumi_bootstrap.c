@@ -12,6 +12,7 @@
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 
 #include "kasumi_bootstrap.h"
@@ -23,7 +24,6 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_sop_override.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -52,6 +52,38 @@ static char kasumi_owner_nonce[33];
 module_param_string(kasumi_owner_nonce, kasumi_owner_nonce,
 		    sizeof(kasumi_owner_nonce), 0400);
 MODULE_PARM_DESC(kasumi_owner_nonce, "Per-load userspace ownership token.");
+
+/* Keep ordinary delete_module() out of module_exit until PREPARE_UNLOAD has
+ * severed every external callback entry point.  The loader drops its initial
+ * reference only after ->init returns, leaving this one lifecycle reference.
+ */
+static bool kasumi_unload_pin_held;
+
+bool kasumi_bootstrap_quiesce_supported(void)
+{
+	/* Before 6.12, fops_get(inode->i_fop) evaluates inode->i_fop multiple
+	 * times. Concurrent replacement can return one table while pinning another
+	 * table's owner, so cooperative unload cannot be proven safe there.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool kasumi_bootstrap_unload_pin_held(void)
+{
+	return READ_ONCE(kasumi_unload_pin_held);
+}
+
+void kasumi_bootstrap_release_unload_pin(void)
+{
+	if (WARN_ON_ONCE(!READ_ONCE(kasumi_unload_pin_held)))
+		return;
+	WRITE_ONCE(kasumi_unload_pin_held, false);
+	module_put(THIS_MODULE);
+}
 
 static noinline KASUMI_NOCFI void kasumi_resolve_system_dev(void)
 {
@@ -137,6 +169,20 @@ static int kasumi_resolve_runtime_symbols(void)
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
 		pr_err("Kasumi: FATAL - call_srcu/srcu_barrier not found\n");
 		return -ENOENT;
+	}
+	kasumi_synchronize_rcu_tasks_ptr =
+		(void *)kasumi_lookup_callable("synchronize_rcu_tasks");
+	if (!kasumi_synchronize_rcu_tasks_ptr) {
+		pr_err("Kasumi: FATAL - synchronize_rcu_tasks not found\n");
+		return -ENOENT;
+	}
+	if (kasumi_bootstrap_quiesce_supported()) {
+		kasumi_module_refcount_ptr =
+			(void *)kasumi_lookup_callable("module_refcount");
+		if (!kasumi_module_refcount_ptr) {
+			pr_err("Kasumi: FATAL - module_refcount not found\n");
+			return -ENOENT;
+		}
 	}
 	kasumi_d_path = (void *)kasumi_lookup_callable("d_path");
 	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_callable("d_hash_and_lookup");
@@ -246,12 +292,15 @@ int kasumi_bootstrap_init(void)
 	if (ret)
 		goto err_active;
 
-	(void)kasumi_sop_override_init();
 	(void)kasumi_iop_override_init();
 	(void)kasumi_fop_override_init();
 
 	(void)kasumi_fake_selinuxfs_access_init();
 	kasumi_task_marker_start();
+	if (kasumi_bootstrap_quiesce_supported()) {
+		__module_get(THIS_MODULE);
+		WRITE_ONCE(kasumi_unload_pin_held, true);
+	}
 	pr_alert("Kasumi: Chikyuu ga buttobu kurai tanoshinjaoo!!\n");
 	return 0;
 
@@ -285,6 +334,7 @@ void kasumi_bootstrap_exit(void)
 	struct kasumi_cmdline_rcu *old_cmdline;
 
 	pr_info("Kasumi: shutting down\n");
+	WARN_ON_ONCE(READ_ONCE(kasumi_unload_pin_held));
 
 	/*
 	 * PHASE 1: Sever every entry point that can drive a syscall hook.
@@ -310,7 +360,6 @@ void kasumi_bootstrap_exit(void)
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
 	kasumi_iop_override_exit();
-	kasumi_sop_override_exit();
 	kasumi_fake_mi_exit();
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();

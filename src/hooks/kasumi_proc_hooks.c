@@ -66,12 +66,16 @@ struct kasumi_getfd_task_work {
 	int __user *outp;
 };
 
+static atomic_t kasumi_getfd_pending = ATOMIC_INIT(0);
+static atomic_t kasumi_getfd_accepting = ATOMIC_INIT(0);
+
 static void kasumi_getfd_task_work_release_rcu(struct rcu_head *rcu)
 {
 	struct kasumi_getfd_task_work *tw =
 		container_of(rcu, struct kasumi_getfd_task_work, rcu);
 
 	kfree(tw);
+	atomic_dec(&kasumi_getfd_pending);
 	/* kasumi_bootstrap_exit() ends with rcu_barrier(), which covers this
 	 * callback's epilogue if this is the last module reference.
 	 */
@@ -82,7 +86,8 @@ static void kasumi_getfd_task_work_func(struct callback_head *cb)
 {
 	struct kasumi_getfd_task_work *tw =
 		container_of(cb, struct kasumi_getfd_task_work, cb);
-	int fd = kasumi_install_anon_fd(tw->outp);
+	int fd = atomic_read(&kasumi_getfd_accepting) ?
+		kasumi_install_anon_fd(tw->outp) : -ESHUTDOWN;
 
 	if (fd < 0)
 		(void)put_user(fd, tw->outp);
@@ -96,6 +101,8 @@ static int kasumi_queue_getfd_task_work(int __user *outp)
 
 	if (!outp || !access_ok(outp, sizeof(*outp)))
 		return -EFAULT;
+	if (!atomic_read(&kasumi_getfd_accepting))
+		return -ESHUTDOWN;
 
 	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
 	if (!tw)
@@ -104,6 +111,7 @@ static int kasumi_queue_getfd_task_work(int __user *outp)
 		kfree(tw);
 		return -ENODEV;
 	}
+	atomic_inc(&kasumi_getfd_pending);
 
 	tw->outp = outp;
 	tw->cb.func = kasumi_getfd_task_work_func;
@@ -221,6 +229,8 @@ static struct kprobe kasumi_kp_cmdline = {
 int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes)
 {
 	(void)no_tracepoint;
+	atomic_set(&kasumi_getfd_pending, 0);
+	atomic_set(&kasumi_getfd_accepting, !skip_getfd);
 	if (!skip_getfd) {
 		static const char *reboot_symbols[] = {
 #if defined(__aarch64__)
@@ -280,7 +290,12 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 	return 0;
 }
 
-void kasumi_proc_hooks_exit(void)
+unsigned int kasumi_proc_getfd_pending(void)
+{
+	return (unsigned int)atomic_read(&kasumi_getfd_pending);
+}
+
+void kasumi_proc_hooks_stop_new(void)
 {
 	/*
 	 * Note: TSR teardown is intentionally NOT performed here.
@@ -291,9 +306,20 @@ void kasumi_proc_hooks_exit(void)
 	 * by openat still being dispatched into
 	 * our redirect.
 	 */
-	kasumi_proc_read_hooks_exit();
-	if (kasumi_cmdline_kprobe_registered)
+	atomic_set(&kasumi_getfd_accepting, 0);
+	kasumi_proc_read_hooks_stop_new();
+	if (kasumi_cmdline_kprobe_registered) {
 		unregister_kprobe(&kasumi_kp_cmdline);
-	if (kasumi_reboot_kprobe_registered)
+		kasumi_cmdline_kprobe_registered = 0;
+	}
+	if (kasumi_reboot_kprobe_registered) {
 		unregister_kprobe(&kasumi_kp_reboot);
+		kasumi_reboot_kprobe_registered = 0;
+	}
+}
+
+void kasumi_proc_hooks_exit(void)
+{
+	kasumi_proc_hooks_stop_new();
+	kasumi_proc_read_hooks_exit();
 }

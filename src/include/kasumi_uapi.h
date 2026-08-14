@@ -208,6 +208,44 @@ struct kasumi_spoof_cmdline {
 #define KSM_FEATURE_FAKE_MOUNTINFO (1 << 9) /* serve per-marked-app fake mountinfo (no KSU mounts, renumbered ids) */
 #define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
+#define KSM_FEATURE_QUIESCE     (1 << 11) /* terminal pre-unload quiesce handshake */
+
+#define KSM_QUIESCE_API_VERSION 1
+
+#define KSM_QUIESCE_STATE_ACTIVE    0
+#define KSM_QUIESCE_STATE_DRAINING  1
+#define KSM_QUIESCE_STATE_READY     2
+#define KSM_QUIESCE_STATE_FAILED    3
+
+#define KSM_QUIESCE_BUSY_GETFD       (1U << 0)
+#define KSM_QUIESCE_BUSY_MARKER      (1U << 1)
+#define KSM_QUIESCE_BUSY_REDIRECT    (1U << 2)
+#define KSM_QUIESCE_BUSY_PROC_PROXY  (1U << 3)
+#define KSM_QUIESCE_BUSY_FILE_VIEW   (1U << 4)
+#define KSM_QUIESCE_BUSY_CONTROL_FD  (1U << 5)
+#define KSM_QUIESCE_BUSY_OTHER       (1U << 6)
+
+/* Fixed-size API so an API 17 userspace can probe and poll quiesce safely.
+ * READY is a callback-safety barrier; delete_module remains the final liveness
+ * oracle because dup/SCM_RIGHTS aliases can share the one reported control
+ * file without creating another module reference.
+ */
+struct kasumi_quiesce_arg {
+	__u32 version;
+	__u32 size;
+	__u32 flags;
+	__u32 state;
+	__u32 busy_mask;
+	__u32 pending_getfd;
+	__u32 pending_marker;
+	__u32 pending_redirect;
+	__u32 live_proc_proxy;
+	__u32 live_file_view;
+	__u32 control_files;
+	__u32 module_refs;
+	__u32 reserved[3];
+	__s32 err;
+};
 
 /*
  * Maps spoof rule: when a /proc/pid/maps line has (target_ino[, target_dev]),
@@ -287,5 +325,7 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_REPLACE_POLICY    _IOWR(KSM_IOC_MAGIC, 35, struct kasumi_policy_replace_arg)
 /* Unlike CLEAR_ALL, RESET_POLICY discards the configured policy. */
 #define KSM_IOC_RESET_POLICY      _IOWR(KSM_IOC_MAGIC, 36, struct kasumi_policy_config_arg)
+/* Idempotent terminal transition; repeat to poll until state is READY. */
+#define KSM_IOC_PREPARE_UNLOAD    _IOWR(KSM_IOC_MAGIC, 37, struct kasumi_quiesce_arg)
 
 #endif /* _KASUMI_UAPI_H */

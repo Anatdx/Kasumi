@@ -13,6 +13,7 @@
 #include <linux/types.h>
 
 int kasumi_fake_selinuxfs_access_init(void);
+void kasumi_fake_selinuxfs_access_stop_new(void);
 void kasumi_fake_selinuxfs_access_exit(void);
 bool kasumi_fake_selinuxfs_access_active(void);
 bool kasumi_fake_selinuxfs_status_active(void);

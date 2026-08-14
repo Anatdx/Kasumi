@@ -9,6 +9,7 @@ int kasumi_tracepoint_hooks_set_enabled(bool enabled);
 void kasumi_tracepoint_hooks_exit(void);
 bool kasumi_tracepoint_hooks_active(void);
 bool kasumi_tracepoint_hooks_available(void);
+unsigned int kasumi_tracepoint_hooks_pending_guard_count(void);
 bool kasumi_tracepoint_hooks_owned_mark_clear_safe(void);
 bool kasumi_tracepoint_hooks_exclusive_owner(void);
 bool kasumi_tracepoint_hooks_ksu_shared(void);

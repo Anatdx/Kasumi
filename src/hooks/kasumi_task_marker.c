@@ -6,10 +6,12 @@
  * pre-handlers queue TWA_RESUME work which runs after the syscall and every
  * root-framework specialization hook, but before the task returns to userspace.
  */
+#include <linux/atomic.h>
 #include <linux/cred.h>
 #include <linux/kprobes.h>
 #include <linux/llist.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
@@ -82,10 +84,13 @@ static struct tracepoint *kasumi_sched_process_exit_tp;
 static struct llist_head kasumi_marker_work_freelist;
 static struct kasumi_marker_task_work
 	kasumi_marker_work_reserve[KASUMI_MARKER_WORK_RESERVE];
+static atomic_t kasumi_marker_work_pending = ATOMIC_INIT(0);
 static kasumi_task_marker_uid_predicate_fn kasumi_marker_uid_predicate;
 static bool kasumi_marker_ready_state;
 static bool kasumi_marker_operational_state;
 static bool kasumi_marker_active_state;
+static bool kasumi_marker_exited;
+static DEFINE_MUTEX(kasumi_marker_exit_lock);
 static DEFINE_XARRAY(kasumi_marker_owned_marks);
 static bool (*kasumi_ksu_is_allow_uid)(uid_t uid);
 
@@ -338,6 +343,7 @@ static void kasumi_marker_work_release_rcu(struct rcu_head *rcu)
 		container_of(rcu, struct kasumi_marker_task_work, rcu);
 
 	kasumi_marker_work_free(work);
+	atomic_dec(&kasumi_marker_work_pending);
 	/* kasumi_bootstrap_exit() ends with rcu_barrier(), which covers this
 	 * callback's epilogue if this is the last module reference.
 	 */
@@ -350,6 +356,7 @@ static void kasumi_marker_task_work_func(struct callback_head *cb)
 		container_of(cb, struct kasumi_marker_task_work, cb);
 	uid_t uid = __kuid_val(task_uid(current));
 
+	rcu_read_lock();
 	/* Pairs with marker activation after the provider has been pinned. */
 	if (smp_load_acquire(&kasumi_marker_active_state)) {
 		if (kasumi_policy_uid_is_spoof_target(uid)) {
@@ -360,14 +367,16 @@ static void kasumi_marker_task_work_func(struct callback_head *cb)
 			kasumi_task_marker_reconcile_current();
 		}
 	}
+	rcu_read_unlock();
 
 	/* Do not drop the last module reference from module text directly. */
 	call_rcu(&work->rcu, kasumi_marker_work_release_rcu);
 }
 
-static void kasumi_marker_queue_task(struct task_struct *task)
+static void kasumi_marker_queue_current(void)
 {
 	struct kasumi_marker_task_work *work;
+	struct task_struct *task = current;
 
 	/*
 	 * Queue while the lifecycle hook is ready, even if policy arming has not
@@ -377,8 +386,7 @@ static void kasumi_marker_queue_task(struct task_struct *task)
 	 */
 	if (!smp_load_acquire(&kasumi_marker_operational_state))
 		return;
-	if (!task || unlikely((task->flags & PF_KTHREAD) ||
-			    !READ_ONCE(task->mm)))
+	if (unlikely((task->flags & PF_KTHREAD) || !READ_ONCE(task->mm)))
 		return;
 
 	work = kasumi_marker_work_alloc();
@@ -390,6 +398,7 @@ static void kasumi_marker_queue_task(struct task_struct *task)
 		kasumi_marker_work_free(work);
 		return;
 	}
+	atomic_inc(&kasumi_marker_work_pending);
 
 	work->cb.func = kasumi_marker_task_work_func;
 	if (unlikely(kasumi_task_work_add_ptr(task, &work->cb, TWA_RESUME))) {
@@ -399,11 +408,6 @@ static void kasumi_marker_queue_task(struct task_struct *task)
 		call_rcu(&work->rcu, kasumi_marker_work_release_rcu);
 		pr_warn_ratelimited("Kasumi: task marker task_work rejected\n");
 	}
-}
-
-static void kasumi_marker_queue_current(void)
-{
-	kasumi_marker_queue_task(current);
 }
 
 static int kasumi_marker_uid_syscall_pre(struct kprobe *probe,
@@ -450,7 +454,6 @@ static void kasumi_marker_process_fork(void *data, struct task_struct *parent,
 	if (kasumi_policy_uid_is_spoof_target(uid)) {
 		if (inherited || kasumi_tracepoint_hooks_exclusive_owner())
 			kasumi_reconcile_task_owned(child);
-		kasumi_marker_queue_task(child);
 	} else if (kasumi_marker_uid_selected(uid)) {
 		kasumi_mark_task_tracepoint_owned(child);
 	} else if (inherited || kasumi_tracepoint_hooks_exclusive_owner()) {
@@ -470,7 +473,7 @@ static void kasumi_marker_process_exit(void *data, struct task_struct *task)
 		put_task_struct(task);
 }
 
-static unsigned int kasumi_marker_scan_targets(bool apply_spoof)
+static unsigned int kasumi_marker_scan_targets(void)
 {
 	struct task_struct *group;
 	struct task_struct *task;
@@ -486,14 +489,7 @@ static unsigned int kasumi_marker_scan_targets(bool apply_spoof)
 			continue;
 
 		uid = __kuid_val(task_uid(task));
-		if (apply_spoof && kasumi_policy_uid_is_spoof_target(uid)) {
-			/* A KernelSU umount target or isolated task has no VIEW routes.
-			 * When the only consumers are KernelSU and Kasumi, neither needs
-			 * a delivery mark for this task; clearing also heals marks left by
-			 * an older Kasumi activation.
-			 */
-			kasumi_marker_queue_task(task);
-		} else if (kasumi_marker_uid_selected(uid)) {
+		if (kasumi_marker_uid_selected(uid)) {
 			kasumi_mark_task_tracepoint_owned(task);
 			marked++;
 		}
@@ -511,7 +507,7 @@ void kasumi_task_marker_refresh(void)
 	    !READ_ONCE(kasumi_marker_active_state))
 		return;
 
-	marked = kasumi_marker_scan_targets(false);
+	marked = kasumi_marker_scan_targets();
 	pr_info("Kasumi: task marker refreshed (selected=%u)\n", marked);
 }
 
@@ -526,7 +522,7 @@ void kasumi_task_marker_refresh_scopes(void)
 	kasumi_task_marker_reconcile_owned(false);
 	if (kasumi_tracepoint_hooks_exclusive_owner())
 		kasumi_task_marker_restrict_exclusive();
-	marked = kasumi_marker_scan_targets(true);
+	marked = kasumi_marker_scan_targets();
 	pr_info("Kasumi: task scopes refreshed (view=%u)\n", marked);
 }
 
@@ -588,6 +584,11 @@ bool kasumi_task_marker_ready(void)
 bool kasumi_task_marker_active(void)
 {
 	return READ_ONCE(kasumi_marker_active_state);
+}
+
+unsigned int kasumi_task_marker_pending_work_count(void)
+{
+	return (unsigned int)atomic_read(&kasumi_marker_work_pending);
 }
 
 static void kasumi_marker_unregister_probes(void)
@@ -700,6 +701,11 @@ void kasumi_task_marker_exit(void)
 	unsigned long index;
 	struct task_struct *task;
 
+	mutex_lock(&kasumi_marker_exit_lock);
+	if (kasumi_marker_exited)
+		goto out_unlock;
+	kasumi_marker_exited = true;
+
 	smp_store_release(&kasumi_marker_operational_state, false);
 	WRITE_ONCE(kasumi_marker_active_state, false);
 	WRITE_ONCE(kasumi_marker_ready_state, false);
@@ -716,6 +722,11 @@ void kasumi_task_marker_exit(void)
 		tracepoint_synchronize_unregister();
 		kasumi_sched_process_exit_tp = NULL;
 	}
+	/* A task-work callback which observed active=true may still be using the
+	 * marker predicate or owned-mark table. Later callbacks observe false and
+	 * skip directly to their deferred release.
+	 */
+	synchronize_rcu();
 	/* Any marks that could not be cleared safely belong to a still-active
 	 * unknown consumer now. Drop only Kasumi's bookkeeping references.
 	 */
@@ -741,4 +752,7 @@ void kasumi_task_marker_exit(void)
 	 */
 	WRITE_ONCE(kasumi_marker_uid_predicate, NULL);
 	pr_info("Kasumi: task marker lifecycle stopped\n");
+
+out_unlock:
+	mutex_unlock(&kasumi_marker_exit_lock);
 }

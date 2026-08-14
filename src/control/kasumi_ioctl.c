@@ -46,6 +46,7 @@
 #endif
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
+#include "kasumi_bootstrap.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
@@ -53,6 +54,9 @@
 #include "kasumi_syscall_redirect.h"
 #include "kasumi_task_marker.h"
 #include "kasumi_tracepoint_hooks.h"
+#include "kasumi_proc_hooks.h"
+#include "kasumi_vfs_hooks.h"
+#include "kasumi_file_view.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -891,7 +895,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == KSM_IOC_GET_FEATURES) {
-		int features = 0;
+		int features = kasumi_bootstrap_quiesce_supported() ?
+			KSM_FEATURE_QUIESCE : 0;
 		if (kasumi_cmdline_kprobe_registered)
 			features |= KSM_FEATURE_CMDLINE_SPOOF;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
@@ -1565,6 +1570,163 @@ del_done:
  * those side effects or re-enable the module afterwards.
  */
 static DEFINE_MUTEX(kasumi_ioctl_mutex);
+static atomic_t kasumi_control_files = ATOMIC_INIT(0);
+static u32 kasumi_quiesce_state = KSM_QUIESCE_STATE_ACTIVE;
+static int kasumi_quiesce_error;
+
+static bool kasumi_control_accepting(void)
+{
+	return READ_ONCE(kasumi_quiesce_state) == KSM_QUIESCE_STATE_ACTIVE;
+}
+
+static void kasumi_quiesce_stop_new(void)
+{
+	if (READ_ONCE(kasumi_quiesce_state) != KSM_QUIESCE_STATE_ACTIVE)
+		return;
+	WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_DRAINING);
+
+	/* Stop routed execution before withdrawing any handler-owned state. */
+	smp_store_release(&kasumi_enabled, false);
+	kasumi_task_marker_set_enabled(false);
+	(void)kasumi_tracepoint_hooks_set_enabled(false);
+	kasumi_tracepoint_hooks_exit();
+	kasumi_task_marker_exit();
+
+	/* The dispatcher slot remains installed until every guard created before
+	 * sys_enter unregister has released.  A guard covers both the pre-dispatch
+	 * window and the complete redirected syscall.
+	 */
+
+	/* No new object may acquire module-owned callbacks after this point. */
+	kasumi_file_view_stop_new();
+	kasumi_proc_hooks_stop_new();
+	kasumi_vfs_hooks_exit(0);
+	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_fop_override_stop_new();
+	kasumi_iop_override_stop_new();
+
+	mutex_lock(&kasumi_config_mutex);
+	kasumi_cleanup_locked();
+	mutex_unlock(&kasumi_config_mutex);
+	kasumi_fake_mi_invalidate_all();
+}
+
+static int kasumi_ioctl_prepare_unload(void __user *arg)
+{
+	struct kasumi_quiesce_arg a;
+	unsigned int control_files;
+	unsigned int getfd;
+	unsigned int marker;
+	unsigned int redirect;
+	unsigned int proxies;
+	unsigned int file_views;
+	unsigned int iop_active;
+	bool iop_quiesced;
+	unsigned int known_refs;
+	unsigned int module_refs;
+	bool dispatcher_detached;
+	bool unload_pin_held;
+	bool ready;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (a.version != KSM_QUIESCE_API_VERSION || a.size < sizeof(a) ||
+	    a.flags || !kasumi_u32_reserved_zero(a.reserved,
+						 ARRAY_SIZE(a.reserved))) {
+		a.err = -EINVAL;
+		if (copy_to_user(arg, &a, sizeof(a)))
+			return -EFAULT;
+		return -EINVAL;
+	}
+	if (!kasumi_bootstrap_quiesce_supported()) {
+		a.state = KSM_QUIESCE_STATE_ACTIVE;
+		a.busy_mask = 0;
+		a.err = -EOPNOTSUPP;
+		if (copy_to_user(arg, &a, sizeof(a)))
+			return -EFAULT;
+		return -EOPNOTSUPP;
+	}
+
+	kasumi_quiesce_stop_new();
+	control_files = (unsigned int)atomic_read(&kasumi_control_files);
+	getfd = kasumi_proc_getfd_pending();
+	marker = kasumi_task_marker_pending_work_count();
+	redirect = kasumi_tracepoint_hooks_pending_guard_count();
+	if (!redirect && !kasumi_quiesce_error) {
+		ret = kasumi_syscall_redirect_stop_new();
+		if (ret)
+			kasumi_quiesce_error = ret;
+	}
+	/* The pending count only decreases after producers have stopped.  If it
+	 * reached zero just after the first sample, this poll remains DRAINING and
+	 * the next one performs the detach.
+	 */
+	redirect = kasumi_tracepoint_hooks_pending_guard_count();
+	dispatcher_detached = kasumi_syscall_redirect_detached();
+	proxies = kasumi_proc_proxy_live();
+	file_views = kasumi_file_view_live();
+	iop_active = kasumi_iop_override_active();
+	iop_quiesced = kasumi_iop_override_quiesced();
+	unload_pin_held = kasumi_bootstrap_unload_pin_held();
+	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
+	known_refs = control_files + getfd + marker + redirect + proxies +
+		file_views + (unload_pin_held ? 1U : 0U);
+
+	a.state = KSM_QUIESCE_STATE_DRAINING;
+	a.busy_mask = 0;
+	if (getfd)
+		a.busy_mask |= KSM_QUIESCE_BUSY_GETFD;
+	if (marker)
+		a.busy_mask |= KSM_QUIESCE_BUSY_MARKER;
+	if (redirect)
+		a.busy_mask |= KSM_QUIESCE_BUSY_REDIRECT;
+	if (proxies)
+		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
+	if (file_views)
+		a.busy_mask |= KSM_QUIESCE_BUSY_FILE_VIEW;
+	if (control_files != 1)
+		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
+	if (module_refs > known_refs || iop_active || !iop_quiesced ||
+	    !dispatcher_detached)
+		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
+
+	ready = !getfd && !marker && !redirect && !proxies && !file_views &&
+		dispatcher_detached && iop_quiesced && control_files == 1 &&
+		module_refs == control_files + (unload_pin_held ? 1U : 0U);
+
+	if (kasumi_quiesce_error) {
+		a.state = KSM_QUIESCE_STATE_FAILED;
+		a.err = kasumi_quiesce_error;
+	} else if (ready) {
+		/* Publish READY before releasing the lifecycle pin.  This ioctl is
+		 * serialized with all control operations, and its own anon file keeps
+		 * module text alive through copy_to_user and return to VFS.
+		 */
+		WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_READY);
+		if (unload_pin_held) {
+			kasumi_bootstrap_release_unload_pin();
+			module_refs--;
+		}
+		a.state = KSM_QUIESCE_STATE_READY;
+		a.busy_mask = 0;
+		a.err = 0;
+	} else {
+		a.err = 0;
+	}
+	if (a.state != KSM_QUIESCE_STATE_READY)
+		WRITE_ONCE(kasumi_quiesce_state, a.state);
+	a.pending_getfd = getfd;
+	a.pending_marker = marker;
+	a.pending_redirect = redirect;
+	a.live_proc_proxy = proxies;
+	a.live_file_view = file_views;
+	a.control_files = control_files;
+	a.module_refs = module_refs;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return 0;
+}
 
 static bool kasumi_cmd_changes_view_scope(unsigned int cmd)
 {
@@ -1612,6 +1774,11 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 
 	mutex_lock(&kasumi_ioctl_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
+	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
+	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	switch (cmd) {
 	case KSM_IOC_GET_VERSION:
 	case KSM_IOC_SET_ENABLED:
@@ -1645,6 +1812,9 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_UPDATE_SPOOF_KSTAT:
 		ret = kasumi_dispatch_cmd(cmd, (void __user *)arg);
 		break;
+	case KSM_IOC_PREPARE_UNLOAD:
+		ret = kasumi_ioctl_prepare_unload((void __user *)arg);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -1654,6 +1824,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	else if (!ret && kasumi_cmd_changes_spoof_state(cmd) &&
 		 READ_ONCE(kasumi_enabled))
 		kasumi_task_marker_refresh_scopes();
+out:
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
 	mutex_unlock(&kasumi_ioctl_mutex);
 	return ret;
@@ -1663,10 +1834,20 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
  * Part 17: Anonymous fd (no device node; reboot task_work installs it)
  * ====================================================================== */
 
+static int kasumi_anon_release(struct inode *inode, struct file *file)
+{
+	(void)inode;
+	(void)file;
+	if (atomic_dec_and_test(&kasumi_control_files))
+		WRITE_ONCE(kasumi_daemon_pid, 0);
+	return 0;
+}
+
 static const struct file_operations kasumi_anon_fops = {
 	.owner          = THIS_MODULE,
 	.unlocked_ioctl = kasumi_dev_ioctl,
 	.compat_ioctl   = kasumi_dev_ioctl,
+	.release        = kasumi_anon_release,
 	.llseek         = noop_llseek,
 };
 
@@ -1686,12 +1867,15 @@ int kasumi_install_anon_fd(int __user *outp)
 
 	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
 		return -EPERM;
+	if (!kasumi_control_accepting())
+		return -ESHUTDOWN;
 	if (!outp)
 		return -EINVAL;
 
 	file = anon_inode_getfile("kasumi", &kasumi_anon_fops, NULL, O_RDWR);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
+	atomic_inc(&kasumi_control_files);
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)

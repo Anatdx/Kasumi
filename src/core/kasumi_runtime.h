@@ -18,6 +18,7 @@
 #include <linux/kprobes.h>
 #include <linux/limits.h>
 #include <linux/llist.h>
+#include <linux/module.h>
 #include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/seq_file.h>
@@ -147,6 +148,10 @@ struct llist_node *kasumi_llist_del_first(struct llist_head *head);
 extern void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 				    rcu_callback_t func);
 extern void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
+extern void (*kasumi_synchronize_rcu_tasks_ptr)(void);
+void kasumi_synchronize_rcu_tasks(void);
+extern int (*kasumi_module_refcount_ptr)(struct module *module);
+int kasumi_module_refcount(struct module *module);
 
 /* KASUMI_NOCFI: these call kallsyms-resolved pointers (path_get/path_put).
  * Whether a kernel build emits a .cfi_jt thunk for those symbols varies per

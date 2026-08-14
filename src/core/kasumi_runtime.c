@@ -137,12 +137,24 @@ struct llist_node *(*kasumi_llist_del_first_ptr)(struct llist_head *head);
 void (*kasumi_call_srcu_ptr)(struct srcu_struct *ssp, struct rcu_head *rhp,
 			     rcu_callback_t func);
 void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
+void (*kasumi_synchronize_rcu_tasks_ptr)(void);
+int (*kasumi_module_refcount_ptr)(struct module *module);
 
 /* Avoid a load-time dependency on a GKI-trimmed export. */
 noinline KASUMI_NOCFI struct llist_node *
 kasumi_llist_del_first(struct llist_head *head)
 {
 	return kasumi_llist_del_first_ptr(head);
+}
+
+noinline KASUMI_NOCFI void kasumi_synchronize_rcu_tasks(void)
+{
+	kasumi_synchronize_rcu_tasks_ptr();
+}
+
+noinline KASUMI_NOCFI int kasumi_module_refcount(struct module *module)
+{
+	return kasumi_module_refcount_ptr(module);
 }
 
 bool kasumi_valid_kernel_addr(unsigned long addr)

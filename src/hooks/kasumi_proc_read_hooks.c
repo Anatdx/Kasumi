@@ -172,6 +172,7 @@ static LIST_HEAD(kasumi_proxy_list);
 static DEFINE_SPINLOCK(kasumi_proxy_list_lock);
 DEFINE_STATIC_SRCU(kasumi_proxy_srcu);
 static atomic_t kasumi_proxy_shutdown = ATOMIC_INIT(0);
+static atomic_t kasumi_proxy_live = ATOMIC_INIT(0);
 static atomic_long_t kasumi_stream_memory_used = ATOMIC_LONG_INIT(0);
 
 static struct kprobe kasumi_kp_fd_install;
@@ -695,6 +696,7 @@ static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode, struct f
 	spin_lock(&kasumi_proxy_list_lock);
 	list_del_init(&proxy->node);
 	spin_unlock(&kasumi_proxy_list_lock);
+	atomic_dec(&kasumi_proxy_live);
 
 	WRITE_ONCE(file->f_mode, proxy->orig_f_mode);
 	if (orig_fops->release)
@@ -788,6 +790,7 @@ static int kasumi_mount_proxy_install_file(
 		return -ENOENT;
 	}
 	list_add(&proxy->node, &kasumi_proxy_list);
+	atomic_inc(&kasumi_proxy_live);
 	WRITE_ONCE(file->f_mode,
 		   proxy->orig_f_mode & ~(FMODE_LSEEK | FMODE_PREAD));
 	WRITE_ONCE(file->f_op, new_fops);
@@ -1177,6 +1180,9 @@ void kasumi_proc_read_hooks_init(void)
 	unsigned long cp_statx_addr = kasumi_lookup_name("cp_statx");
 	bool use_proxy_filter = false;
 
+	atomic_set(&kasumi_proxy_shutdown, 0);
+	atomic_set(&kasumi_proxy_live, 0);
+
 	if (statfs_addr) {
 		kasumi_krp_vfs_statfs.kp.addr = (kprobe_opcode_t *)statfs_addr;
 		if (register_kretprobe(&kasumi_krp_vfs_statfs) == 0) {
@@ -1246,8 +1252,9 @@ void kasumi_proc_read_hooks_init(void)
 	}
 }
 
-void kasumi_proc_read_hooks_exit(void)
+void kasumi_proc_read_hooks_stop_new(void)
 {
+	atomic_set(&kasumi_proxy_shutdown, 1);
 	if (kasumi_fd_install_registered) {
 		unregister_kprobe(&kasumi_kp_fd_install);
 		kasumi_fd_install_registered = false;
@@ -1256,15 +1263,34 @@ void kasumi_proc_read_hooks_exit(void)
 		unregister_kprobe(&kasumi_kp_cp_statx);
 		kasumi_cp_statx_registered = false;
 	}
-	/* Proxy fops pin THIS_MODULE, so exit begins only after all installed proc
-	 * fds have run ->release and dropped their fops references. Drain is a
-	 * defensive empty-list cleanup after in-flight SRCU readers have left.
-	 */
-	kasumi_mount_proxy_drain();
 	if (kasumi_statfs_kretprobe_registered) {
 		unregister_kretprobe(&kasumi_krp_vfs_statfs);
 		kasumi_statfs_kretprobe_registered = 0;
 	}
+	if (kasumi_mount_hide_mountinfo_registered) {
+		unregister_kprobe(&kasumi_kp_show_mountinfo);
+		kasumi_mount_hide_mountinfo_registered = 0;
+	}
+	if (kasumi_mount_hide_vfsmnt_registered) {
+		unregister_kprobe(&kasumi_kp_show_vfsmnt);
+		kasumi_mount_hide_vfsmnt_registered = 0;
+	}
+	kasumi_proc_proxy_registered = 0;
+}
+
+unsigned int kasumi_proc_proxy_live(void)
+{
+	return (unsigned int)atomic_read(&kasumi_proxy_live);
+}
+
+void kasumi_proc_read_hooks_exit(void)
+{
+	kasumi_proc_read_hooks_stop_new();
+	/* Proxy fops pin THIS_MODULE, so final destruction starts only after all
+	 * installed proc files have naturally reached ->release.
+	 */
+	kasumi_mount_proxy_drain();
+	WARN_ON_ONCE(atomic_read(&kasumi_proxy_live));
 
 	{
 		struct kasumi_maps_rule_entry *e, *tmp;
@@ -1276,9 +1302,4 @@ void kasumi_proc_read_hooks_exit(void)
 		}
 		mutex_unlock(&kasumi_maps_mutex);
 	}
-	kasumi_proc_proxy_registered = 0;
-	if (kasumi_mount_hide_mountinfo_registered)
-		unregister_kprobe(&kasumi_kp_show_mountinfo);
-	if (kasumi_mount_hide_vfsmnt_registered)
-		unregister_kprobe(&kasumi_kp_show_vfsmnt);
 }

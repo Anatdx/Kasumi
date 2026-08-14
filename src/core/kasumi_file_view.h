@@ -15,6 +15,8 @@ bool kasumi_file_view_lookup_maps(unsigned long target_ino, unsigned long target
 				  char *spoofed_pathname,
 				  size_t spoofed_pathname_size);
 void kasumi_file_view_clear(void);
+void kasumi_file_view_stop_new(void);
+unsigned int kasumi_file_view_live(void);
 void kasumi_file_view_shutdown(void);
 
 #endif /* _KASUMI_FILE_VIEW_H */

@@ -17,6 +17,7 @@
 #include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/list.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/task.h>
@@ -33,7 +34,7 @@
 #define KASUMI_FILE_VIEW_HASH_BITS 10
 
 #define KASUMI_FILE_VIEW_STATE_OPEN      0
-#define KASUMI_FILE_VIEW_STATE_DRAINED   1
+#define KASUMI_FILE_VIEW_STATE_RETIRED   1
 #define KASUMI_FILE_VIEW_STATE_RELEASING 2
 
 struct kasumi_file_view {
@@ -60,6 +61,16 @@ static DEFINE_SPINLOCK(kasumi_file_view_lock);
 static LIST_HEAD(kasumi_file_view_list);
 DEFINE_STATIC_SRCU(kasumi_file_view_srcu);
 static atomic_t kasumi_file_view_shutdown_state = ATOMIC_INIT(0);
+static atomic_t kasumi_file_view_live_count = ATOMIC_INIT(0);
+
+/*
+ * Natural release transfers the live shadow fops reference here before the
+ * per-file allocation is reclaimed.  __fput() can then drop the same module
+ * reference without dereferencing freed shadow storage.
+ */
+static const struct file_operations kasumi_closed_file_view_fops = {
+	.owner = THIS_MODULE,
+};
 
 static unsigned long kasumi_file_view_ino_key(unsigned long ino, unsigned long dev)
 {
@@ -78,14 +89,26 @@ static struct kasumi_file_view *kasumi_file_view_lookup_file_locked(struct file 
 	return NULL;
 }
 
-static void kasumi_file_view_remove_locked(struct kasumi_file_view *view)
+static void kasumi_file_view_retire_locked(struct kasumi_file_view *view)
 {
 	if (!hlist_unhashed(&view->file_node))
 		hlist_del_init_rcu(&view->file_node);
 	if (!hlist_unhashed(&view->ino_node))
 		hlist_del_init_rcu(&view->ino_node);
+}
+
+static void kasumi_file_view_remove_locked(struct kasumi_file_view *view)
+{
+	kasumi_file_view_retire_locked(view);
 	if (!list_empty(&view->list))
 		list_del_init(&view->list);
+}
+
+static void kasumi_file_view_free(struct kasumi_file_view *view)
+{
+	kfree(view->src_path);
+	kfree(view->target_path);
+	kfree(view);
 }
 
 static void kasumi_file_view_free_rcu(struct rcu_head *rcu)
@@ -93,9 +116,11 @@ static void kasumi_file_view_free_rcu(struct rcu_head *rcu)
 	struct kasumi_file_view *view =
 		container_of(rcu, struct kasumi_file_view, rcu);
 
-	kfree(view->src_path);
-	kfree(view->target_path);
-	kfree(view);
+	kasumi_file_view_free(view);
+	/* kasumi_file_view_shutdown() ends with rcu_barrier(), which covers this
+	 * callback's epilogue if this is the last module reference.
+	 */
+	module_put(THIS_MODULE);
 }
 
 static void kasumi_file_view_fill_source_stat(struct kasumi_file_view *view,
@@ -130,6 +155,7 @@ static int kasumi_file_view_release(struct inode *inode, struct file *file)
 {
 	struct kasumi_file_view *view =
 		container_of(file->f_op, struct kasumi_file_view, shadow_fops);
+	const struct file_operations *orig_fops = view->orig_fops;
 	int prev;
 	bool owned;
 	int ret = 0;
@@ -137,22 +163,36 @@ static int kasumi_file_view_release(struct inode *inode, struct file *file)
 
 	srcu_idx = srcu_read_lock(&kasumi_file_view_srcu);
 
-	prev = atomic_cmpxchg(&view->state, KASUMI_FILE_VIEW_STATE_OPEN,
-			      KASUMI_FILE_VIEW_STATE_RELEASING);
-	owned = prev == KASUMI_FILE_VIEW_STATE_OPEN;
+	prev = atomic_xchg(&view->state, KASUMI_FILE_VIEW_STATE_RELEASING);
+	owned = prev == KASUMI_FILE_VIEW_STATE_OPEN ||
+		prev == KASUMI_FILE_VIEW_STATE_RETIRED;
 	if (owned) {
 		spin_lock(&kasumi_file_view_lock);
 		kasumi_file_view_remove_locked(view);
-		WRITE_ONCE(file->f_op, view->orig_fops);
+		WRITE_ONCE(file->f_op, orig_fops);
 		spin_unlock(&kasumi_file_view_lock);
+		atomic_dec(&kasumi_file_view_live_count);
 	}
 
-	if (view->orig_fops->release)
-		ret = view->orig_fops->release(inode, file);
+	if (orig_fops->release)
+		ret = orig_fops->release(inode, file);
+
+	/* Keep the shadow's THIS_MODULE reference for __fput(), but stop it from
+	 * touching per-file storage after this callback returns.
+	 */
+	WRITE_ONCE(file->f_op, &kasumi_closed_file_view_fops);
+	fops_put(orig_fops);
 
 	srcu_read_unlock(&kasumi_file_view_srcu, srcu_idx);
 
-	if (owned)
+	if (owned && WARN_ON_ONCE(!try_module_get(THIS_MODULE))) {
+		/* The live fops reference makes failure unreachable while the module
+		 * is LIVE.  Avoid scheduling an unpinned callback if that invariant is
+		 * ever broken.
+		 */
+		synchronize_rcu();
+		kasumi_file_view_free(view);
+	} else if (owned)
 		call_rcu(&view->rcu, kasumi_file_view_free_rcu);
 
 	return ret;
@@ -181,6 +221,15 @@ int kasumi_file_view_bind_fd(int fd, const char *src_path, const char *target_pa
 		ret = -EINVAL;
 		goto out;
 	}
+	/* Per-file Kasumi fops (notably the proc proxy) can hand their live
+	 * reference to a static closed-fops object and free the original storage
+	 * from ->release.  Stacking another dynamic wrapper around that contract
+	 * would leave orig_fops dangling after the inner release returns.
+	 */
+	if (file->f_op->owner == THIS_MODULE) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	if (file->f_op->release == kasumi_file_view_release)
 		goto out;
 
@@ -206,7 +255,7 @@ int kasumi_file_view_bind_fd(int fd, const char *src_path, const char *target_pa
 	view->file = file;
 	view->orig_fops = file->f_op;
 	view->shadow_fops = *file->f_op;
-	view->shadow_fops.owner = NULL;
+	view->shadow_fops.owner = THIS_MODULE;
 	view->shadow_fops.release = kasumi_file_view_release;
 	view->target_ino = inode->i_ino;
 	view->target_dev = inode->i_sb->s_dev;
@@ -245,6 +294,7 @@ int kasumi_file_view_bind_fd(int fd, const char *src_path, const char *target_pa
 		     (unsigned long)file);
 	hash_add_rcu(kasumi_file_view_by_ino, &view->ino_node, ino_key);
 	list_add(&view->list, &kasumi_file_view_list);
+	atomic_inc(&kasumi_file_view_live_count);
 	WRITE_ONCE(file->f_op, new_fops);
 	spin_unlock(&kasumi_file_view_lock);
 
@@ -286,6 +336,8 @@ bool kasumi_file_view_lookup_maps(unsigned long target_ino, unsigned long target
 
 	rcu_read_lock();
 	hash_for_each_possible_rcu(kasumi_file_view_by_ino, view, ino_node, key) {
+		if (atomic_read(&view->state) != KASUMI_FILE_VIEW_STATE_OPEN)
+			continue;
 		if (view->target_ino != target_ino)
 			continue;
 		if (target_dev && view->target_dev != target_dev)
@@ -303,42 +355,53 @@ bool kasumi_file_view_lookup_maps(unsigned long target_ino, unsigned long target
 	return found;
 }
 
-static void kasumi_file_view_drain(bool shutdown)
+void kasumi_file_view_clear(void)
 {
-	struct kasumi_file_view *view, *tmp;
-	LIST_HEAD(victims);
-
-	if (shutdown)
-		atomic_set(&kasumi_file_view_shutdown_state, 1);
+	struct kasumi_file_view *view;
 
 	spin_lock(&kasumi_file_view_lock);
-	list_for_each_entry_safe(view, tmp, &kasumi_file_view_list, list) {
-		if (atomic_cmpxchg(&view->state, KASUMI_FILE_VIEW_STATE_OPEN,
-				    KASUMI_FILE_VIEW_STATE_DRAINED) !=
-		    KASUMI_FILE_VIEW_STATE_OPEN)
-			continue;
-		kasumi_file_view_remove_locked(view);
-		WRITE_ONCE(view->file->f_op, view->orig_fops);
-		list_add(&view->list, &victims);
+	list_for_each_entry(view, &kasumi_file_view_list, list) {
+		(void)atomic_cmpxchg(&view->state, KASUMI_FILE_VIEW_STATE_OPEN,
+				      KASUMI_FILE_VIEW_STATE_RETIRED);
+		kasumi_file_view_retire_locked(view);
 	}
 	spin_unlock(&kasumi_file_view_lock);
 
-	synchronize_srcu(&kasumi_file_view_srcu);
-
-	list_for_each_entry_safe(view, tmp, &victims, list) {
-		list_del_init(&view->list);
-		call_rcu(&view->rcu, kasumi_file_view_free_rcu);
-	}
+	/* A completed clear must not leave an old identity visible to a lookup
+	 * that began before hash_del_rcu().  The per-file object remains alive
+	 * until its natural ->release.
+	 */
+	synchronize_rcu();
 }
 
-void kasumi_file_view_clear(void)
+void kasumi_file_view_stop_new(void)
 {
-	kasumi_file_view_drain(false);
+	atomic_set(&kasumi_file_view_shutdown_state, 1);
+	kasumi_file_view_clear();
+}
+
+unsigned int kasumi_file_view_live(void)
+{
+	return (unsigned int)atomic_read(&kasumi_file_view_live_count);
 }
 
 void kasumi_file_view_shutdown(void)
 {
-	kasumi_file_view_drain(true);
+	kasumi_file_view_stop_new();
+	synchronize_srcu(&kasumi_file_view_srcu);
+
+	/* Every installed shadow fops owns THIS_MODULE, so module exit can only
+	 * reach this point after every live file has completed ->release.
+	 * A non-empty list is not recoverable here: freeing it would leave a live
+	 * file->f_op pointing at reclaimed shadow storage.
+	 */
+	spin_lock(&kasumi_file_view_lock);
+	WARN_ON_ONCE(atomic_read(&kasumi_file_view_live_count) ||
+		     !list_empty(&kasumi_file_view_list) ||
+		     !hash_empty(kasumi_file_view_by_file) ||
+		     !hash_empty(kasumi_file_view_by_ino));
+	spin_unlock(&kasumi_file_view_lock);
+
 	synchronize_rcu();
 	rcu_barrier();
 }

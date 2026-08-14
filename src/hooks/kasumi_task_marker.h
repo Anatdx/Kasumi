@@ -19,5 +19,6 @@ void kasumi_task_marker_reconcile_current(void);
 bool kasumi_task_marker_available(void);
 bool kasumi_task_marker_ready(void);
 bool kasumi_task_marker_active(void);
+unsigned int kasumi_task_marker_pending_work_count(void);
 
 #endif /* _KASUMI_TASK_MARKER_H */

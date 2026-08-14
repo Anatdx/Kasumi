@@ -17,6 +17,8 @@ extern int  kasumi_syscall_dispatcher_nr;
 typedef long (*kasumi_syscall_hook_fn)(const struct pt_regs *regs);
 
 int  kasumi_syscall_redirect_init(void);
+int  kasumi_syscall_redirect_stop_new(void);
+bool kasumi_syscall_redirect_detached(void);
 void kasumi_syscall_redirect_exit(void);
 int  kasumi_register_syscall_hook(int nr, kasumi_syscall_hook_fn fn);
 void kasumi_unregister_syscall_hook(int nr);

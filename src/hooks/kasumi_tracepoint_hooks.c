@@ -6,6 +6,7 @@
  * Hook handlers run later in normal syscall context.
  */
 #include <asm/syscall.h>
+#include <linux/atomic.h>
 #include <linux/compat.h>
 #include <linux/llist.h>
 #include <linux/limits.h>
@@ -56,6 +57,7 @@ struct kasumi_redirect_guard {
 static struct llist_head kasumi_redirect_guard_freelist;
 static struct kasumi_redirect_guard
 	kasumi_redirect_guard_reserve[KASUMI_REDIRECT_GUARD_RESERVE];
+static atomic_t kasumi_redirect_guard_pending = ATOMIC_INIT(0);
 
 static void kasumi_redirect_guard_free(struct kasumi_redirect_guard *guard)
 {
@@ -88,6 +90,7 @@ static void kasumi_redirect_guard_release_rcu(struct rcu_head *rcu)
 		container_of(rcu, struct kasumi_redirect_guard, rcu);
 
 	kasumi_redirect_guard_free(guard);
+	atomic_dec(&kasumi_redirect_guard_pending);
 	/* kasumi_bootstrap_exit() ends with rcu_barrier(), which covers this
 	 * callback's epilogue if this is the last module reference.
 	 */
@@ -117,6 +120,7 @@ static bool kasumi_redirect_guard_current(void)
 		kasumi_redirect_guard_free(guard);
 		return false;
 	}
+	atomic_inc(&kasumi_redirect_guard_pending);
 
 	init_task_work(&guard->work, kasumi_redirect_guard_task_work);
 	ret = kasumi_task_work_add_ptr(current, &guard->work, TWA_RESUME);
@@ -383,4 +387,9 @@ bool kasumi_tracepoint_hooks_active(void)
 bool kasumi_tracepoint_hooks_available(void)
 {
 	return READ_ONCE(kasumi_sys_enter_ready);
+}
+
+unsigned int kasumi_tracepoint_hooks_pending_guard_count(void)
+{
+	return (unsigned int)atomic_read(&kasumi_redirect_guard_pending);
 }

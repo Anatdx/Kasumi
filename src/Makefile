@@ -5,6 +5,8 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 obj-m += kasumi_lkm.o
+# Do not add kasumi_sop_override.o: super_operations has no owner pin, so a
+# persistent module callback cannot participate in cooperative unload safely.
 kasumi_lkm-objs := \
 	kasumi_main.o \
 	core/kasumi_bootstrap.o \
@@ -21,7 +23,6 @@ kasumi_lkm-objs := \
 	hooks/kasumi_tracepoint_hooks.o \
 	hooks/kasumi_syscall_redirect.o \
 	hooks/kasumi_ftrace_hooks.o \
-	features/kasumi_sop_override.o \
 	features/kasumi_iop_override.o \
 	features/kasumi_fop_override.o \
 	features/kasumi_fake_mountinfo.o \

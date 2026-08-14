@@ -47,6 +47,7 @@ MODULE_PARM_DESC(kasumi_tsr_basic, "DBG: TSR hooks only openat/openat2 (skip pat
 
 static kasumi_syscall_hook_fn hooks[__NR_syscalls];
 static kasumi_syscall_hook_fn saved_ni_syscall;
+static int kasumi_installed_dispatcher_slot = -1;
 DEFINE_STATIC_SRCU(kasumi_redirect_srcu);
 
 static int patch_entry(int nr, kasumi_syscall_hook_fn fn)
@@ -571,9 +572,11 @@ int kasumi_syscall_redirect_init(void)
 	saved_ni_syscall = READ_ONCE(
 		((kasumi_syscall_hook_fn *)kasumi_syscall_table)[slot]);
 	WRITE_ONCE(kasumi_syscall_dispatcher_nr, slot);
+	kasumi_installed_dispatcher_slot = slot;
 	ret = patch_entry(slot, kasumi_syscall_dispatcher);
 	if (ret) {
 		WRITE_ONCE(kasumi_syscall_dispatcher_nr, -1);
+		kasumi_installed_dispatcher_slot = -1;
 		saved_ni_syscall = NULL;
 		kasumi_syscall_table = NULL;
 		return ret;
@@ -624,18 +627,56 @@ static void kasumi_redirect_drain_done(struct rcu_head *head)
 	complete(s->done);
 }
 
+KASUMI_NOCFI int kasumi_syscall_redirect_stop_new(void)
+{
+	kasumi_syscall_hook_fn installed;
+	int slot = READ_ONCE(kasumi_installed_dispatcher_slot);
+	int ret;
+
+	if (slot < 0 || !kasumi_syscall_table || !saved_ni_syscall)
+		return 0;
+	if (READ_ONCE(kasumi_syscall_dispatcher_nr) < 0)
+		return 0;
+
+	installed = READ_ONCE(
+		((kasumi_syscall_hook_fn *)kasumi_syscall_table)[slot]);
+	if (installed == kasumi_syscall_dispatcher) {
+		ret = patch_entry(slot, saved_ni_syscall);
+		if (ret)
+			return ret;
+	} else if (installed != saved_ni_syscall) {
+		pr_err("Kasumi: TSR slot %d ownership changed; refusing unsafe detach\n",
+		       slot);
+		return -EBUSY;
+	} else {
+		pr_info("Kasumi: TSR slot %d was already restored\n", slot);
+	}
+	/* A caller can invoke the occupied ni_syscall slot directly without a
+	 * sys_enter redirect guard.  Tasks-RCU closes the table-load-to-dispatcher
+	 * entry window for that guardless path before unload may proceed.
+	 */
+	kasumi_synchronize_rcu_tasks();
+
+	/* Keep the table, handlers and SRCU domain alive for dispatchers that
+	 * entered before the slot was restored. Final teardown drains them.
+	 */
+	WRITE_ONCE(kasumi_syscall_dispatcher_nr, -1);
+	return 0;
+}
+
+bool kasumi_syscall_redirect_detached(void)
+{
+	return READ_ONCE(kasumi_syscall_dispatcher_nr) < 0;
+}
+
 KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 {
 	DECLARE_COMPLETION_ONSTACK(drain_done);
 	struct kasumi_drain_state drain;
-	kasumi_syscall_hook_fn installed;
-	int slot;
 	int i;
-	bool active;
+	int ret;
 
-	slot = READ_ONCE(kasumi_syscall_dispatcher_nr);
-	active = slot >= 0 && kasumi_syscall_table && saved_ni_syscall;
-	if (!active)
+	if (READ_ONCE(kasumi_installed_dispatcher_slot) < 0)
 		goto clear_state;
 
 	/*
@@ -659,13 +700,9 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 	 * Clearing hooks before the drain would let an in-flight dispatcher see
 	 * incomplete state or return -ENOSYS unexpectedly.
 	 */
-	installed = READ_ONCE(
-		((kasumi_syscall_hook_fn *)kasumi_syscall_table)[slot]);
-	if (installed == kasumi_syscall_dispatcher)
-		(void)patch_entry(slot, saved_ni_syscall);
-	else
-		pr_warn("Kasumi: TSR slot %d changed by another owner; not restoring it\n",
-			slot);
+	ret = kasumi_syscall_redirect_stop_new();
+	if (WARN_ON_ONCE(ret))
+		return;
 
 	/* Defensive drain; task-work guards make this grace period normally empty. */
 	drain.done = &drain_done;
@@ -678,6 +715,7 @@ KASUMI_NOCFI void kasumi_syscall_redirect_exit(void)
 
 clear_state:
 	WRITE_ONCE(kasumi_syscall_dispatcher_nr, -1);
+	WRITE_ONCE(kasumi_installed_dispatcher_slot, -1);
 	saved_ni_syscall = NULL;
 	kasumi_syscall_table = NULL;
 	pr_info("Kasumi: TSR dispatcher exited\n");

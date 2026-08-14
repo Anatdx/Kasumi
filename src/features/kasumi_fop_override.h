@@ -13,6 +13,7 @@
 #include <linux/fs.h>
 
 int kasumi_fop_override_init(void);
+void kasumi_fop_override_stop_new(void);
 void kasumi_fop_override_exit(void);
 
 int kasumi_fop_install(struct inode *inode);
