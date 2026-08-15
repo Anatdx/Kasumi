@@ -1213,9 +1213,16 @@ static int kasumi_vfs_statfs_entry(struct kretprobe_instance *ri,
 	d->buf = NULL;
 #endif
 	d->spoof_f_type = 0;
+	/* Keep statfs aligned with the exact mountinfo snapshot exposed to this
+	 * namespace; spoofing every overlay mount creates the mismatch this hook
+	 * is meant to remove. */
 	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_STATFS_SPOOF) ||
+	    !(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) ||
 	    !kasumi_policy_current_is_spoof_target() ||
-	    !path || !path->dentry || !d->buf)
+	    !path || !path->dentry || !path->dentry->d_sb || !d->buf ||
+	    (unsigned long)path->dentry->d_sb->s_magic !=
+		OVERLAYFS_SUPER_MAGIC ||
+	    !kasumi_fake_mi_mount_hidden_cached(path))
 		return 0;
 	d->spoof_f_type = kasumi_statfs_spoof_magic(path->dentry);
 	return 0;

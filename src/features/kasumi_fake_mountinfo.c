@@ -26,6 +26,7 @@
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
 #include <linux/nsproxy.h>
+#include <linux/stat.h>
 #include <linux/version.h>
 
 /* Cache sizing: mountinfo is typically 20-80KB on Android; cap at 512KB. */
@@ -38,6 +39,7 @@
 struct fake_mi_id_entry {
 	int real_id;
 	int fake_id;
+	bool visible;
 };
 
 /* Per-file cursor table for stateful chunked reads. Size chosen to cover
@@ -852,6 +854,7 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
 		}
 		id_map[*id_count].real_id = mount_map[i].old_id;
 		id_map[*id_count].fake_id = fake_id;
+		id_map[*id_count].visible = mount_map[i].new_id > 0;
 		(*id_count)++;
 	}
 
@@ -1395,6 +1398,51 @@ int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
 out_unlock:
 	rcu_read_unlock();
 	return ret;
+}
+
+/* This query calls the kallsyms-resolved vfs_getattr pointer. Keep the
+ * indirect call outside strict jump-table CFI, like the other runtime
+ * symbol bridges in this module. */
+KASUMI_NOCFI bool kasumi_fake_mi_mount_hidden_cached(const struct path *path)
+{
+	const struct fake_mi_id_entry *id_map;
+	struct mnt_namespace *mnt_ns;
+	struct kstat stat = {};
+	u64 real_id;
+	int id_count;
+	int slot;
+	int i;
+	bool hidden = false;
+
+	if (!path || !path->mnt)
+		return false;
+	if (!kasumi_vfs_getattr ||
+	    kasumi_vfs_getattr(path, &stat, STATX_MNT_ID, 0) != 0 ||
+	    !(stat.result_mask & STATX_MNT_ID))
+		return false;
+	real_id = READ_ONCE(stat.mnt_id);
+
+	rcu_read_lock();
+	if (!smp_load_acquire(&g_cache.valid))
+		goto out_unlock;
+	slot = smp_load_acquire(&g_cache.active_slot);
+	if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
+		goto out_unlock;
+	mnt_ns = fake_mi_current_mnt_ns();
+	if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns)
+		goto out_unlock;
+	id_map = READ_ONCE(g_cache.slots[slot].id_map);
+	id_count = READ_ONCE(g_cache.slots[slot].id_count);
+	for (i = 0; id_map && i < id_count; i++) {
+		if ((u64)id_map[i].real_id == real_id) {
+			hidden = !id_map[i].visible;
+			break;
+		}
+	}
+
+out_unlock:
+	rcu_read_unlock();
+	return hidden;
 }
 
 /* ------------------------------------------------------------------ */

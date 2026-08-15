@@ -47,7 +47,7 @@ Use in controlled environments only. This module hooks selected VFS operations a
 - Path syscalls: TSR covers `openat/openat2`, `statfs`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
 - Data-plane syscalls: `read`, `write`, `getdents64`, and `fstatfs` are not TSR routes; cmdline, proc attr, directory iteration, and statfs spoofing run at their producer/VFS operation layers
 - KernelSU coexistence: Kasumi selects a different unused dispatcher slot and does not overwrite a syscall number already redirected by another TSR consumer
-- VFS path: iop/fop shadows handle `getattr` and `readdir`; statfs spoofing is attached to `vfs_statfs`
+- VFS path: iop/fop shadows handle `getattr` and `readdir`; statfs spoofing is attached to `vfs_statfs` and limited to mounts omitted by the current fake mountinfo view
 - Symbol resolution: prefer `kallsyms_lookup_name`, fallback to per-symbol kprobe resolution
 
 ## CI KMI Targets

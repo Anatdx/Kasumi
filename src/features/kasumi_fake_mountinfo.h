@@ -14,6 +14,8 @@
 #include <linux/fs.h>
 #include <linux/uio.h>
 
+struct path;
+
 int kasumi_fake_mi_init(void);
 void kasumi_fake_mi_exit(void);
 bool kasumi_fake_mi_active(void);
@@ -73,6 +75,10 @@ int kasumi_fake_mi_lookup_mount_id_cached(const char *path);
 
 /* Translate a real kstat mount ID using the current namespace cache. */
 int kasumi_fake_mi_translate_mount_id_cached(u64 real_id);
+
+/* True only when the current task's cached mountinfo snapshot omits the
+ * mount containing @path. A missing or stale cache returns false. */
+bool kasumi_fake_mi_mount_hidden_cached(const struct path *path);
 
 /* Drop per-file cursor state when the file is closed or refreshed. Called
  * lazily from serve() based on LRU; no explicit close hook needed.

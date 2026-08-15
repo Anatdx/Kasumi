@@ -47,7 +47,7 @@ English version： [README.md](./README.md)
 - 路径 syscall：TSR 覆盖 `openat/openat2`、`statfs`、`statx`、`newfstatat`、`faccessat`、`getxattr/lgetxattr` 与 `listxattr/llistxattr`
 - 数据面 syscall：`read`、`write`、`getdents64`、`fstatfs` 不再是 TSR 路由；cmdline、proc attr、目录遍历与 statfs 伪装分别下沉到 producer/VFS 操作层
 - KernelSU 共存：Kasumi 选择另一个空闲 dispatcher 槽位，并且不会覆盖已被其他 TSR 使用者重定向的 syscall number
-- VFS：`getattr` 与 `readdir` 使用 iop/fop shadow hook；statfs 伪装挂在 `vfs_statfs`
+- VFS：`getattr` 与 `readdir` 使用 iop/fop shadow hook；statfs 伪装挂在 `vfs_statfs`，且只作用于当前 fake mountinfo 视图中被隐藏的挂载
 - 符号解析：优先 `kallsyms_lookup_name`，失败回退逐符号 kprobe 解析
 
 ## CI 覆盖 KMI
