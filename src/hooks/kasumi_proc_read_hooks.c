@@ -116,13 +116,15 @@ static struct kprobe kasumi_kp_show_mountinfo = {
 };
 
 #define KASUMI_READ_MOUNT_FILTER_BUF 65536
-#define KASUMI_PROC_STREAM_MEMORY_BUDGET (4 * 1024 * 1024)
+#define KASUMI_PROC_STREAM_MEMORY_BUDGET (16 * 1024 * 1024)
 #define KASUMI_PROC_STREAM_ALLOCATION (KASUMI_READ_MOUNT_FILTER_BUF + 1)
+#define KASUMI_PROC_STREAM_MAX (1024 * 1024)
 
 static size_t kasumi_filter_overlay_lines(char *kbuf, size_t len);
-static size_t kasumi_filter_maps_lines(char *kbuf, size_t len, bool *changed,
-				       bool *valid,
-				       enum kasumi_policy_scope scope);
+static int kasumi_filter_maps_lines(const char *src, size_t len,
+				    char *dst, size_t dst_size, size_t *written,
+				    bool *changed, bool *valid,
+				    enum kasumi_policy_scope scope);
 
 enum kasumi_proc_proxy_kind {
 	KASUMI_PROC_PROXY_NONE = 0,
@@ -160,6 +162,9 @@ struct kasumi_mount_file_proxy {
 	atomic_t filter_invalidated;
 	struct mutex stream_lock;
 	char *stream_raw;
+	size_t stream_raw_capacity;
+	char *stream_filtered;
+	size_t stream_filtered_capacity;
 	size_t stream_raw_len;
 	size_t stream_tail_off;
 	size_t stream_out_len;
@@ -432,16 +437,15 @@ static KASUMI_NOCFI ssize_t kasumi_mount_proxy_orig_read_iter(
 	return kasumi_seq_read_iter(iocb, to);
 }
 
-static bool kasumi_mount_proxy_stream_reserve(void)
+static bool kasumi_mount_proxy_stream_reserve(size_t bytes)
 {
 	long used;
 
-	used = atomic_long_add_return(KASUMI_PROC_STREAM_ALLOCATION,
+	used = atomic_long_add_return(bytes,
 				      &kasumi_stream_memory_used);
 	if (used <= KASUMI_PROC_STREAM_MEMORY_BUDGET)
 		return true;
-	atomic_long_sub(KASUMI_PROC_STREAM_ALLOCATION,
-			&kasumi_stream_memory_used);
+	atomic_long_sub(bytes, &kasumi_stream_memory_used);
 	return false;
 }
 
@@ -449,11 +453,21 @@ static void kasumi_mount_proxy_stream_free(
 	struct kasumi_mount_file_proxy *proxy)
 {
 	if (!proxy->stream_raw)
-		return;
+		goto free_filtered;
 	kvfree(proxy->stream_raw);
-	proxy->stream_raw = NULL;
-	atomic_long_sub(KASUMI_PROC_STREAM_ALLOCATION,
+	atomic_long_sub(proxy->stream_raw_capacity,
 			&kasumi_stream_memory_used);
+	proxy->stream_raw = NULL;
+	proxy->stream_raw_capacity = 0;
+
+free_filtered:
+	if (!proxy->stream_filtered)
+		return;
+	kvfree(proxy->stream_filtered);
+	atomic_long_sub(proxy->stream_filtered_capacity,
+			&kasumi_stream_memory_used);
+	proxy->stream_filtered = NULL;
+	proxy->stream_filtered_capacity = 0;
 }
 
 static int kasumi_mount_proxy_stream_alloc(
@@ -463,18 +477,92 @@ static int kasumi_mount_proxy_stream_alloc(
 
 	if (proxy->stream_raw)
 		return 0;
-	if (!kasumi_mount_proxy_stream_reserve())
+	if (!kasumi_mount_proxy_stream_reserve(KASUMI_PROC_STREAM_ALLOCATION))
 		return -ENOMEM;
 	raw = kvmalloc(KASUMI_PROC_STREAM_ALLOCATION, GFP_KERNEL);
 	if (!raw)
 		goto out_unreserve;
 	proxy->stream_raw = raw;
+	proxy->stream_raw_capacity = KASUMI_PROC_STREAM_ALLOCATION;
 	return 0;
 
 out_unreserve:
 	atomic_long_sub(KASUMI_PROC_STREAM_ALLOCATION,
 			&kasumi_stream_memory_used);
 	return -ENOMEM;
+}
+
+static int kasumi_mount_proxy_stream_grow_raw(
+	struct kasumi_mount_file_proxy *proxy)
+{
+	char *raw;
+	size_t old_capacity = proxy->stream_raw_capacity;
+	size_t new_capacity;
+	size_t delta;
+
+	if (old_capacity >= KASUMI_PROC_STREAM_MAX)
+		return -EOVERFLOW;
+	new_capacity = min_t(size_t, old_capacity * 2,
+				    KASUMI_PROC_STREAM_MAX);
+	delta = new_capacity - old_capacity;
+	if (!kasumi_mount_proxy_stream_reserve(delta))
+		return -ENOMEM;
+	raw = kvmalloc(new_capacity, GFP_KERNEL);
+	if (!raw) {
+		atomic_long_sub(delta, &kasumi_stream_memory_used);
+		return -ENOMEM;
+	}
+	memcpy(raw, proxy->stream_raw, proxy->stream_raw_len);
+	kvfree(proxy->stream_raw);
+	proxy->stream_raw = raw;
+	proxy->stream_raw_capacity = new_capacity;
+	return 0;
+}
+
+static int kasumi_mount_proxy_stream_alloc_filtered(
+	struct kasumi_mount_file_proxy *proxy)
+{
+	char *filtered;
+
+	if (proxy->stream_filtered)
+		return 0;
+	if (!kasumi_mount_proxy_stream_reserve(KASUMI_PROC_STREAM_ALLOCATION))
+		return -ENOMEM;
+	filtered = kvmalloc(KASUMI_PROC_STREAM_ALLOCATION, GFP_KERNEL);
+	if (!filtered) {
+		atomic_long_sub(KASUMI_PROC_STREAM_ALLOCATION,
+				&kasumi_stream_memory_used);
+		return -ENOMEM;
+	}
+	proxy->stream_filtered = filtered;
+	proxy->stream_filtered_capacity = KASUMI_PROC_STREAM_ALLOCATION;
+	return 0;
+}
+
+static int kasumi_mount_proxy_stream_grow_filtered(
+	struct kasumi_mount_file_proxy *proxy)
+{
+	char *filtered;
+	size_t old_capacity = proxy->stream_filtered_capacity;
+	size_t new_capacity;
+	size_t delta;
+
+	if (old_capacity >= KASUMI_PROC_STREAM_MAX)
+		return -EOVERFLOW;
+	new_capacity = min_t(size_t, old_capacity * 2,
+				    KASUMI_PROC_STREAM_MAX);
+	delta = new_capacity - old_capacity;
+	if (!kasumi_mount_proxy_stream_reserve(delta))
+		return -ENOMEM;
+	filtered = kvmalloc(new_capacity, GFP_KERNEL);
+	if (!filtered) {
+		atomic_long_sub(delta, &kasumi_stream_memory_used);
+		return -ENOMEM;
+	}
+	kvfree(proxy->stream_filtered);
+	proxy->stream_filtered = filtered;
+	proxy->stream_filtered_capacity = new_capacity;
+	return 0;
 }
 
 static void kasumi_mount_proxy_stream_compact(
@@ -515,19 +603,32 @@ static ssize_t kasumi_mount_proxy_stream_fill(
 			complete_len--;
 
 		if (complete_len > 0) {
-			new_len = complete_len;
-			if (proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
+			if (proxy->kind == KASUMI_PROC_PROXY_MAPS) {
+				ret = kasumi_mount_proxy_stream_alloc_filtered(proxy);
+				if (ret)
+					return ret;
+				for (;;) {
+					maps_changed = false;
+					maps_valid = true;
+					ret = kasumi_filter_maps_lines(
+						proxy->stream_raw, complete_len,
+						proxy->stream_filtered,
+						proxy->stream_filtered_capacity,
+						&new_len, &maps_changed, &maps_valid,
+						proxy->scope);
+					if (ret != -ENOSPC)
+						break;
+					ret = kasumi_mount_proxy_stream_grow_filtered(proxy);
+					if (ret)
+						return ret;
+				}
+				if (ret < 0 || !maps_valid)
+					return ret < 0 ? ret : -EIO;
+			} else if (proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
 				new_len = kasumi_filter_overlay_lines(
 					proxy->stream_raw, complete_len);
 			} else {
-				maps_changed = false;
-				maps_valid = true;
-				new_len = kasumi_filter_maps_lines(
-					proxy->stream_raw, complete_len,
-					&maps_changed, &maps_valid,
-					proxy->scope);
-				if (!maps_valid)
-					return -EIO;
+				return -EIO;
 			}
 
 			tail_len = proxy->stream_raw_len - complete_len;
@@ -546,11 +647,14 @@ static ssize_t kasumi_mount_proxy_stream_fill(
 
 		if (proxy->stream_eof)
 			return proxy->stream_raw_len ? -EIO : 0;
-		if (proxy->stream_raw_len == KASUMI_READ_MOUNT_FILTER_BUF)
-			return -EOVERFLOW;
+		if (proxy->stream_raw_len + 1 >= proxy->stream_raw_capacity) {
+			ret = kasumi_mount_proxy_stream_grow_raw(proxy);
+			if (ret)
+				return ret;
+		}
 
 		kvec.iov_base = proxy->stream_raw + proxy->stream_raw_len;
-		kvec.iov_len = KASUMI_READ_MOUNT_FILTER_BUF -
+		kvec.iov_len = proxy->stream_raw_capacity - 1 -
 			proxy->stream_raw_len;
 		iov_iter_kvec(&kernel_iter, READ, &kvec, 1, kvec.iov_len);
 		init_sync_kiocb(&shadow_iocb, file);
@@ -575,6 +679,7 @@ static ssize_t kasumi_mount_proxy_filtered_read(
 	struct kasumi_mount_file_proxy *proxy, struct file *file,
 	char __user *userbuf, struct iov_iter *to, size_t count, loff_t *ppos)
 {
+	const char *outbuf;
 	size_t available;
 	size_t copied;
 	ssize_t ret;
@@ -599,13 +704,19 @@ static ssize_t kasumi_mount_proxy_filtered_read(
 		if (ret <= 0)
 			goto out_fail;
 	}
+	outbuf = proxy->kind == KASUMI_PROC_PROXY_MAPS ?
+		proxy->stream_filtered : proxy->stream_raw;
+	if (!outbuf) {
+		ret = -EIO;
+		goto out_fail;
+	}
 	available = min_t(size_t, count,
 			  proxy->stream_out_len - proxy->stream_out_off);
 	if (to)
-		copied = copy_to_iter(proxy->stream_raw + proxy->stream_out_off,
+		copied = copy_to_iter(outbuf + proxy->stream_out_off,
 				      available, to);
 	else if (copy_to_user(userbuf,
-			      proxy->stream_raw + proxy->stream_out_off,
+			      outbuf + proxy->stream_out_off,
 			      available))
 		copied = 0;
 	else
@@ -1007,7 +1118,7 @@ static int kasumi_parse_maps_line(const char *line, size_t line_len,
 	const char *p = line;
 	char *endptr;
 
-	if (line_len < 45)
+	if (line_len < 40)
 		return -1;
 	*start = simple_strtoul(p, &endptr, 16);
 	if (endptr == p || *endptr != '-')
@@ -1055,81 +1166,90 @@ static bool kasumi_maps_line_looks_like_header(const char *line,
 	return i > 0 && i < line_len && line[i] == '-';
 }
 
-static size_t kasumi_filter_maps_lines(char *kbuf, size_t len, bool *changed,
-				       bool *valid,
-				       enum kasumi_policy_scope scope)
+static int kasumi_filter_maps_lines(const char *src, size_t len,
+				    char *dst, size_t dst_size, size_t *written,
+				    bool *changed, bool *valid,
+				    enum kasumi_policy_scope scope)
 {
 	size_t in = 0, out = 0;
 	struct kasumi_maps_rule_entry *r;
 	const char *pathname;
 	char auto_spoof_path[KSM_MAX_LEN_PATHNAME];
+	char replacement_path[KSM_MAX_LEN_PATHNAME];
+	char header[128];
 	char flags[5];
 	unsigned long start, end, pgoff, dev, ino;
 	unsigned long spoof_ino, spoof_dev;
-	const char *spoof_name;
-	size_t path_len, max_path;
-	int n;
+	size_t path_len, original_path_len, pathname_offset;
+	int header_len;
+	bool have_replacement_path;
+	bool line_changed;
 	bool view = scope == KASUMI_POLICY_SCOPE_VIEW;
 	bool spoof = scope == KASUMI_POLICY_SCOPE_SPOOF;
 
+	if (written)
+		*written = 0;
 	if (changed)
 		*changed = false;
 	if (valid)
 		*valid = true;
+	if (!src || !dst || !written)
+		return -EINVAL;
 
 	while (in < len) {
 		size_t line_start = in;
 		size_t line_len;
 		bool complete_line;
 
-		while (in < len && kbuf[in] != '\n')
+		while (in < len && src[in] != '\n')
 			in++;
-		complete_line = in < len && kbuf[in] == '\n';
+		complete_line = in < len && src[in] == '\n';
 		line_len = in - line_start;
 		if (complete_line)
 			line_len++;
-
-		if (line_len == 0) {
-			if (complete_line) {
-				if (out != line_start)
-					kbuf[out] = '\n';
-				out++;
-				in++;
-			}
-			continue;
-		}
 		if (!complete_line) {
 			if (valid)
 				*valid = false;
-			break;
+			return -EINVAL;
 		}
 
-		if (kasumi_parse_maps_line(kbuf + line_start, line_len, &start,
+		if (kasumi_parse_maps_line(src + line_start, line_len, &start,
 					   &end, flags, &pgoff, &dev, &ino,
 					   &pathname) != 0) {
 			/* smaps metadata is intentionally passed through. A line that
 			 * starts like a VMA header but cannot be parsed is unsafe to expose.
 			 */
-			if (kasumi_maps_line_looks_like_header(
-				kbuf + line_start, line_len)) {
+			if (kasumi_maps_line_looks_like_header(src + line_start,
+						       line_len)) {
 				if (valid)
 					*valid = false;
-				break;
+				return -EINVAL;
 			}
-			if (out != line_start)
-				memmove(kbuf + out, kbuf + line_start, line_len);
+			if (out > dst_size || line_len > dst_size - out)
+				return -ENOSPC;
+			memcpy(dst + out, src + line_start, line_len);
 			out += line_len;
 			in++;
 			continue;
 		}
+
+		pathname_offset = (size_t)(pathname - src);
+		if (pathname_offset > line_start + line_len - 1)
+			return -EINVAL;
+		original_path_len = line_start + line_len - 1 - pathname_offset;
 		spoof_ino = ino;
 		spoof_dev = dev;
-		spoof_name = pathname;
+		have_replacement_path = false;
+		replacement_path[0] = '\0';
+
 		if (view && kasumi_file_view_lookup_maps(ino, dev,
 						 &spoof_ino, &spoof_dev,
 						 auto_spoof_path,
-						 sizeof(auto_spoof_path)))
-			spoof_name = auto_spoof_path;
+						 sizeof(auto_spoof_path))) {
+			strscpy(replacement_path, auto_spoof_path,
+				sizeof(replacement_path));
+			have_replacement_path = true;
+		}
 
 		if (spoof) {
 			mutex_lock(&kasumi_maps_mutex);
@@ -1140,41 +1260,66 @@ static size_t kasumi_filter_maps_lines(char *kbuf, size_t len, bool *changed,
 					continue;
 				spoof_ino = r->spoofed_ino;
 				spoof_dev = r->spoofed_dev;
-				spoof_name = r->spoofed_pathname;
+				/* Do not retain a rule-owned pointer after unlocking. */
+				strscpy(replacement_path, r->spoofed_pathname,
+					sizeof(replacement_path));
+				have_replacement_path = true;
 				break;
 			}
 			mutex_unlock(&kasumi_maps_mutex);
 		}
-		if (spoof_ino != ino || spoof_dev != dev || spoof_name != pathname) {
-			size_t body_len = line_len > 0 ? line_len - 1 : 0;
 
-			max_path = body_len > 56 ? body_len - 56 : 0;
-			n = scnprintf(kbuf + out, min(line_len, len - out),
-				      "%08lx-%08lx %s %08lx %02x:%02x %lu ",
-				      start, end, flags, pgoff,
-				      (unsigned int)MAJOR(spoof_dev),
-				      (unsigned int)MINOR(spoof_dev), spoof_ino);
-			path_len = strnlen(spoof_name, max_path);
-			if (body_len > n && n + path_len > body_len)
-				path_len = body_len - n;
-			if (path_len > 0 && body_len > n)
-				memcpy(kbuf + out + n, spoof_name, path_len);
-			n += path_len;
-			if (body_len > n)
-				memset(kbuf + out + n, ' ', body_len - n);
-			if (complete_line)
-				kbuf[out + body_len] = '\n';
-			out += line_len;
-			if (changed)
-				*changed = true;
+		if (have_replacement_path) {
+			path_len = strnlen(replacement_path,
+					   sizeof(replacement_path));
+			line_changed = spoof_ino != ino || spoof_dev != dev ||
+				path_len != original_path_len ||
+				memcmp(replacement_path, src + pathname_offset,
+				       min(path_len, original_path_len)) != 0;
 		} else {
-			if (out != line_start)
-				memmove(kbuf + out, kbuf + line_start, line_len);
-			out += line_len;
+			path_len = original_path_len;
+			line_changed = spoof_ino != ino || spoof_dev != dev;
 		}
+
+		if (!line_changed) {
+			if (out > dst_size || line_len > dst_size - out)
+				return -ENOSPC;
+			memcpy(dst + out, src + line_start, line_len);
+			out += line_len;
+			in++;
+			continue;
+		}
+
+		header_len = scnprintf(header, sizeof(header),
+				       "%08lx-%08lx %s %08lx %02x:%02x %lu ",
+				       start, end, flags, pgoff,
+				       (unsigned int)MAJOR(spoof_dev),
+				       (unsigned int)MINOR(spoof_dev), spoof_ino);
+		if (header_len <= 0 || header_len >= sizeof(header)) {
+			if (valid)
+				*valid = false;
+			return -EINVAL;
+		}
+		if (out > dst_size || (size_t)header_len + 1 > dst_size - out ||
+		    path_len > dst_size - out - (size_t)header_len - 1)
+			return -ENOSPC;
+		memcpy(dst + out, header, header_len);
+		out += (size_t)header_len;
+		if (path_len > 0) {
+			if (have_replacement_path)
+				memcpy(dst + out, replacement_path, path_len);
+			else
+				memcpy(dst + out, src + pathname_offset, path_len);
+			out += path_len;
+		}
+		dst[out++] = '\n';
+		if (changed)
+			*changed = true;
 		in++;
 	}
-	return out;
+
+	*written = out;
+	return 0;
 }
 
 struct kasumi_vfs_statfs_ri_data {
