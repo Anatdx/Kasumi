@@ -48,6 +48,7 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_dirhijack.h"
+#include "kasumi_vnode.h"
 #include "kasumi_bootstrap.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
@@ -1202,6 +1203,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		unsigned long dh_v_ino = 0;
 		umode_t dh_src_mode = 0;
 		bool dh_want = false;
+		unsigned long dh_nofollow_ino = 0;
+		bool dh_nofollow_valid = false;
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
@@ -1297,6 +1300,10 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		dh_v_ino = new_entry->visible_ino;
 		dh_src_mode = new_entry->source_mode;
 		dh_want = true;
+		/* Captured before the config_mutex section because new_entry is set to
+		 * NULL once it is inserted; these feed the symlink dirhijack branch. */
+		dh_nofollow_valid = new_entry->source_nofollow_path_valid;
+		dh_nofollow_ino = new_entry->nofollow_visible_ino;
 
 		mutex_lock(&kasumi_config_mutex);
 
@@ -1368,12 +1375,24 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 		/* Tier 3: when the lookup hijack is enabled, also register this rule's
 		 * visible child so VFS lookup resolves it to a Kasumi virtual inode.
-		 * v1 handles regular-file sources only. */
-		if (dh_want && kasumi_dirhijack_enabled() &&
-		    S_ISREG(dh_src_mode) && kasumi_kern_path) {
+		 * v1 handled regular-file sources; Slice 3 adds symlink sources, which
+		 * are registered as a symlink vnode pinned to the link itself (nofollow)
+		 * so lstat/readlink see the link and the kernel follows it natively. */
+		if (dh_want && kasumi_dirhijack_enabled() && kasumi_kern_path) {
 			struct path dsrc;
 
-			if (kasumi_kern_path(target, LOOKUP_FOLLOW, &dsrc) == 0) {
+			if (dh_nofollow_valid &&
+			    kasumi_kern_path(target, 0, &dsrc) == 0) {
+				struct inode *di = d_inode(dsrc.dentry);
+
+				if (di && S_ISLNK(di->i_mode))
+					(void)kasumi_dirhijack_add(src, &dsrc,
+								   dh_nofollow_ino,
+								   KASUMI_VNODE_F_LNK);
+				kasumi_path_put(&dsrc);
+			} else if (S_ISREG(dh_src_mode) &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
 				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino, 0);
 				kasumi_path_put(&dsrc);
 			}

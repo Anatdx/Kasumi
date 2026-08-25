@@ -25,6 +25,7 @@
 
 #define KASUMI_VNODE_F_DIR		(1u << 0)  /* node is a directory */
 #define KASUMI_VNODE_F_VIRTUAL_DIR	(1u << 1)  /* synthesized dir, no source */
+#define KASUMI_VNODE_F_LNK		(1u << 2)  /* node is a symlink */
 
 /*
  * Per virtual inode state, stored in inode->i_private.  @source is a pinned

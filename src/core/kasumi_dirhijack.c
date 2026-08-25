@@ -412,7 +412,8 @@ static void kasumi_dh_emit_children(struct dir_context *ctx,
 		if (cur < want)
 			continue;
 		ctx->pos = kasumi_dh_pack_pos(cur);
-		dt = (c->flags & KASUMI_VNODE_F_DIR) ? DT_DIR : DT_REG;
+		dt = (c->flags & KASUMI_VNODE_F_DIR) ? DT_DIR :
+		     (c->flags & KASUMI_VNODE_F_LNK) ? DT_LNK : DT_REG;
 		if (!dir_emit(ctx, c->name, c->name_len, (u64)c->v_ino, dt))
 			break;
 		ctx->pos = kasumi_dh_pack_pos(cur + 1);
