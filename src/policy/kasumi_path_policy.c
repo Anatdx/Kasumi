@@ -53,6 +53,7 @@
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_virtual_file.h"
+#include "kasumi_dirhijack.h"
 /* ======================================================================
  * Part 11: Core Logic - Privileged Check / Allowlist
  * ====================================================================== */
@@ -792,6 +793,11 @@ KASUMI_NOCFI bool kasumi_policy_uid_is_spoof_target(uid_t uid)
 
 bool kasumi_policy_view_tsr_demand(void)
 {
+	/* When the Tier 3 lookup hijack is enabled it serves the path view through
+	 * VFS lookup, so TSR is not required as the view transport.  Decouple the
+	 * enable/reconcile path from TSR in that mode. */
+	if (kasumi_dirhijack_enabled())
+		return false;
 	return atomic_read(&kasumi_tsr_path_count) > 0 ||
 	       atomic_read(&kasumi_hide_count) > 0 ||
 	       kasumi_virtual_file_live() > 0;
@@ -1226,7 +1232,11 @@ static bool kasumi_rule_source_from_path(struct path *resolved,
 	source->stat = stat;
 	source->visible_ino = kasumi_vnode_source_ino(
 		inode->i_sb ? inode->i_sb->s_dev : 0, inode->i_ino);
-	source->visible_dev = kasumi_vnode_device();
+	/* Scheme A: dynamic (directory/merge) sources have no cached visible dev.
+	 * Publish the captured /system dev — a real device and the correct one for
+	 * the common /system masquerade — rather than the anonymous vnode minor. */
+	source->visible_dev = kasumi_system_dev ? kasumi_system_dev :
+						  kasumi_vnode_device();
 	source->stat.ino = source->visible_ino;
 	source->stat.dev = source->visible_dev;
 	source->source_mode = stat.mode;

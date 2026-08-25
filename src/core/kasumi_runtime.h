@@ -92,6 +92,8 @@ void kasumi_resolve_kallsyms_lookup(void);
 dev_t kasumi_vnode_device(void);
 unsigned long kasumi_vnode_path_ino(const char *path);
 unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino);
+unsigned long kasumi_vnode_ino_alloc(dev_t src_dev, u64 src_ino);
+dev_t kasumi_vnode_visible_dev(const char *visible_path);
 u64 kasumi_vnode_allocated(void);
 unsigned int kasumi_vnode_live(void);
 
@@ -144,6 +146,12 @@ extern int (*kasumi_vfs_path_lookup)(struct dentry *, struct vfsmount *,
 				     const char *, unsigned int, struct path *);
 extern const char *(*kasumi_vfs_get_link)(struct dentry *,
 					  struct delayed_call *);
+/* Public LSM secctx round-trip: copy a source inode's security context onto a
+ * synthetic vnode's in-core SID without touching SELinux blob internals.  Both
+ * may be NULL when the LSM/symbols are unavailable — callers must check. */
+extern int (*kasumi_security_inode_getsecctx)(struct inode *, void **, u32 *);
+extern int (*kasumi_security_inode_notifysecctx)(struct inode *, void *, u32);
+extern void (*kasumi_security_release_secctx)(char *, u32);
 extern void (*kasumi_path_get_ptr)(const struct path *);
 extern void (*kasumi_path_put_ptr)(const struct path *);
 extern void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);

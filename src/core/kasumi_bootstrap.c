@@ -26,6 +26,7 @@
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_iop_override.h"
+#include "kasumi_dirhijack.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
@@ -172,6 +173,17 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_vfs_get_link =
 		(void *)kasumi_lookup_callable_quiet("vfs_get_link");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
+	/* Public LSM secctx round-trip for cloning a source's SELinux context onto
+	 * a vnode.  Optional: absence only means vnodes fall back to the default
+	 * label (no crash), so resolve quietly and let callers null-check. */
+	kasumi_security_inode_getsecctx =
+		(void *)kasumi_lookup_callable_quiet("security_inode_getsecctx");
+	kasumi_security_inode_notifysecctx =
+		(void *)kasumi_lookup_callable_quiet("security_inode_notifysecctx");
+	kasumi_security_release_secctx =
+		(void *)kasumi_lookup_callable_quiet("security_release_secctx");
+	if (!kasumi_security_inode_getsecctx || !kasumi_security_inode_notifysecctx)
+		pr_info("Kasumi: secctx clone unavailable, vnode SELinux label falls back to default\n");
 	kasumi_d_absolute_path = (void *)kasumi_lookup_callable("d_absolute_path");
 	kasumi_dentry_path_raw = (void *)kasumi_lookup_callable("dentry_path_raw");
 	kasumi_strncpy_from_user_nofault = (void *)kasumi_lookup_callable("strncpy_from_user_nofault");
@@ -340,6 +352,7 @@ int kasumi_bootstrap_init(void)
 		goto err_fop_bridge;
 	}
 	(void)kasumi_fop_override_init();
+	(void)kasumi_dirhijack_init();
 
 	/* On old KMI, the first ingress table published below is the module-init
 	 * commit point: bridge-open files may already pin THIS_MODULE. Keep every
@@ -419,6 +432,7 @@ void kasumi_bootstrap_exit(void)
 	kasumi_fop_override_exit();
 	kasumi_fop_bridge_exit();
 	kasumi_iop_override_exit();
+	kasumi_dirhijack_exit();
 	kasumi_fake_mi_exit();
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();

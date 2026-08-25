@@ -93,6 +93,7 @@ struct kasumi_merge_ctx {
 	struct dir_context ctx;
 	struct list_head *head;
 	const char *dir_path;
+	dev_t dir_dev;
 };
 
 static const char *kasumi_direct_child_name(const char *path,
@@ -163,7 +164,11 @@ static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_cont
 	item = kmalloc(sizeof(*item), GFP_KERNEL);
 	if (item) {
 		item->name = kstrndup(name, namlen, GFP_KERNEL);
-		item->ino = ino;
+		/* Publish the same vnode identity stat() returns for this file, so a
+		 * merge-injected entry's getdents d_ino matches its later st_ino
+		 * instead of leaking the merge target's raw inode number. */
+		item->ino = mctx->dir_dev ?
+			kasumi_vnode_source_ino(mctx->dir_dev, ino) : ino;
 		item->type = (unsigned char)d_type;
 		if (item->name)
 			list_add(&item->list, mctx->head);
@@ -331,6 +336,9 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 						.ctx.actor = kasumi_merge_filldir,
 						.head = head,
 						.dir_path = target_node->target,
+						.dir_dev = file_inode(f) &&
+							   file_inode(f)->i_sb ?
+							   file_inode(f)->i_sb->s_dev : 0,
 					};
 					kasumi_this_cpu()->in_populate_inject = 1;
 					iterate_dir(f, &mctx.ctx);

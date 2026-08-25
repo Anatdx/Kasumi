@@ -373,10 +373,20 @@ void kasumi_apply_kstat_spoof(struct inode *inode, struct kstat *stat)
 	}
 
 	if (!e) {
-		/* Generic fallback: piggyback on add_rule redirect targets. */
+		/* Generic fallback: add_rule redirect targets reaching the getattr
+		 * path.  Publish the SAME synthetic ino every other surface emits:
+		 * kasumi_vnode_source_ino() resolves the rule's allocated inode from
+		 * the resolved source (dev,ino) the kstat already carries, so stat
+		 * here == syscall stat == getdents == /proc/maps (and no 19-digit
+		 * bit-63 tell).  Compute it BEFORE overwriting stat->dev.
+		 *
+		 * dev stays the captured /system dev: this callback has no trustworthy
+		 * visible path (its @path may be the rewritten target, whose sb dev
+		 * would leak), and this holdout only fires for /system redirect
+		 * targets where the visible dev already IS the /system dev. */
+		stat->ino = kasumi_vnode_source_ino(stat->dev, (u64)stat->ino);
 		if (kasumi_system_dev)
 			stat->dev = kasumi_system_dev;
-		stat->ino = (u64)jhash(stat, sizeof(stat->ino), 0x48594D4F) | 0x100000ULL;
 		if (S_ISREG(stat->mode))
 			stat->nlink = 1;
 	}

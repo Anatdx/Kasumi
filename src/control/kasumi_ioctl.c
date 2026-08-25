@@ -47,6 +47,7 @@
 #endif
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
+#include "kasumi_dirhijack.h"
 #include "kasumi_bootstrap.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
@@ -367,6 +368,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		mutex_lock(&kasumi_config_mutex);
 		kasumi_cleanup_locked();
 		mutex_unlock(&kasumi_config_mutex);
+		kasumi_dirhijack_clear();
 		kasumi_fake_mi_invalidate_all();
 		rcu_barrier();
 		return 0;
@@ -1197,6 +1199,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		struct inode *target_inode = NULL;
 		bool install_side_effects = true;
 		char *tmp_buf;
+		unsigned long dh_v_ino = 0;
+		umode_t dh_src_mode = 0;
+		bool dh_want = false;
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
@@ -1289,6 +1294,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		ret = kasumi_entry_capture_source(new_entry, target);
 		if (ret)
 			goto add_rule_done;
+		dh_v_ino = new_entry->visible_ino;
+		dh_src_mode = new_entry->source_mode;
+		dh_want = true;
 
 		mutex_lock(&kasumi_config_mutex);
 
@@ -1356,6 +1364,19 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (target_inode) {
 			(void)kasumi_iop_mark_spoof(target_inode);
 			iput(target_inode);
+		}
+
+		/* Tier 3: when the lookup hijack is enabled, also register this rule's
+		 * visible child so VFS lookup resolves it to a Kasumi virtual inode.
+		 * v1 handles regular-file sources only. */
+		if (dh_want && kasumi_dirhijack_enabled() &&
+		    S_ISREG(dh_src_mode) && kasumi_kern_path) {
+			struct path dsrc;
+
+			if (kasumi_kern_path(target, LOOKUP_FOLLOW, &dsrc) == 0) {
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino, 0);
+				kasumi_path_put(&dsrc);
+			}
 		}
 
 		/* Exact rules are injected when the visible dentry is absent.  Existing
@@ -1585,6 +1606,8 @@ add_rule_done:
 		}
 del_done:
 		mutex_unlock(&kasumi_config_mutex);
+		if (kasumi_dirhijack_enabled())
+			(void)kasumi_dirhijack_del(src);
 		if (del_inode) {
 			if (del_inode->i_mapping)
 				clear_bit(AS_FLAGS_KASUMI_HIDE,

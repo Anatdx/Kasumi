@@ -600,7 +600,8 @@ int kasumi_virtual_exec_begin_current(
 	alias->target_dev = target_dev;
 	alias->visible_ino = target_ino ?
 		kasumi_vnode_source_ino((dev_t)target_dev, target_ino) : 0;
-	alias->visible_dev = target_ino ? kasumi_vnode_device() : 0;
+	alias->visible_dev = target_ino ?
+		kasumi_vnode_visible_dev(visible_path) : 0;
 	memcpy(alias->path, visible_path, length + 1);
 
 	get_task_struct(current);
@@ -1927,7 +1928,8 @@ int KASUMI_NOCFI kasumi_virtual_reopen_fd(const char *visible_path,
 		kasumi_vnode_source_ino(
 			source_inode->i_sb ? source_inode->i_sb->s_dev : 0,
 			source_inode->i_ino),
-		kasumi_vnode_device(), false, reopen_flags, &opened);
+		kasumi_vnode_visible_dev(visible_path), false, reopen_flags,
+		&opened);
 	kasumi_path_put(&source_path);
 	*handled = opened;
 	return opened ? ret : -EOPNOTSUPP;

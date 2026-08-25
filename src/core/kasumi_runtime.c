@@ -117,6 +117,27 @@ int KASUMI_NOCFI kasumi_vfs_getattr_unprojected(
 static atomic64_t kasumi_vnode_allocated_count = ATOMIC64_INIT(0);
 static atomic_t kasumi_vnode_live_count = ATOMIC_INIT(0);
 
+/* Per-rule synthetic inode allocator.  Each rule source is assigned a stable,
+ * plausible-magnitude (u32-range, above typical real inode usage) inode number
+ * at install time; every projection surface (getattr, getdents, /proc/maps,
+ * syscall stat handlers) resolves the SAME value through kasumi_vnode_source_ino()
+ * so stat/ls -i/maps never disagree.  Values stay < 2^32 so an f2fs/ext4 sibling
+ * comparison sees a realistic inode, not the old 19-digit bit-63 tell. */
+#define KASUMI_VNODE_INO_BASE	0xC0000000UL
+#define KASUMI_VNODE_INO_TOP	0xFFFFFF00UL
+#define KASUMI_VNODE_INO_SPAN	(KASUMI_VNODE_INO_TOP - KASUMI_VNODE_INO_BASE)
+
+struct kasumi_ino_map_entry {
+	dev_t src_dev;
+	u64 src_ino;
+	unsigned long alloc_ino;
+	struct hlist_node node;
+	struct rcu_head rcu;
+};
+static DEFINE_HASHTABLE(kasumi_ino_map, KASUMI_HASH_BITS);
+static atomic64_t kasumi_ino_next = ATOMIC64_INIT(KASUMI_VNODE_INO_BASE);
+static atomic_t kasumi_ino_map_count = ATOMIC_INIT(0);
+
 unsigned long kasumi_vnode_path_ino(const char *path)
 {
 	u64 ino;
@@ -131,8 +152,17 @@ unsigned long kasumi_vnode_path_ino(const char *path)
 	return (unsigned long)ino;
 }
 
+/*
+ * Resolve the synthetic inode for a source (dev, ino).  LOOKUP-ONLY and
+ * RCU/atomic-safe (never allocates), so it is callable from the getattr fast
+ * path.  A rule source hits the allocator map and returns its stable assigned
+ * value; a dynamic non-rule source (./.., non-materialized merge enumeration)
+ * misses and gets a deterministic plausible-range hash in the same window, so
+ * repeated calls stay stable without growing the map.
+ */
 unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino)
 {
+	struct kasumi_ino_map_entry *e;
 	u64 dev = (u64)source_dev;
 	u32 words[4] = {
 		(u32)dev,
@@ -140,17 +170,114 @@ unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino)
 		(u32)source_ino,
 		(u32)(source_ino >> 32),
 	};
-	u64 ino;
+	u64 h;
 
-	ino = ((u64)jhash2(words, ARRAY_SIZE(words), 0x4b617375) << 32) |
+	if (source_ino) {
+		rcu_read_lock();
+		hlist_for_each_entry_rcu(e,
+			&kasumi_ino_map[hash_min(source_ino, KASUMI_HASH_BITS)],
+			node) {
+			if (e->src_ino == source_ino && e->src_dev == source_dev) {
+				unsigned long ino = e->alloc_ino;
+
+				rcu_read_unlock();
+				return ino;
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	h = ((u64)jhash2(words, ARRAY_SIZE(words), 0x4b617375) << 32) |
 		jhash2(words, ARRAY_SIZE(words), 0x6d695646);
-	ino |= 1ULL << 63;
-	return (unsigned long)ino;
+	return KASUMI_VNODE_INO_BASE + (unsigned long)(h % KASUMI_VNODE_INO_SPAN);
+}
+
+/*
+ * Allocate (or return the existing) stable synthetic inode for a rule source.
+ * SLEEPABLE, install-time only, serialized by kasumi_config_mutex (like the
+ * spoof_kstat table), so the lookup-then-insert needs no extra lock.  Idempotent
+ * per (src_dev, src_ino).  On OOM falls back to the deterministic hash so a rule
+ * always gets a usable identity.
+ */
+unsigned long kasumi_vnode_ino_alloc(dev_t src_dev, u64 src_ino)
+{
+	struct kasumi_ino_map_entry *e;
+	u64 seq;
+
+	if (!src_ino)
+		return kasumi_vnode_source_ino(src_dev, src_ino);
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(e,
+		&kasumi_ino_map[hash_min(src_ino, KASUMI_HASH_BITS)], node) {
+		if (e->src_ino == src_ino && e->src_dev == src_dev) {
+			unsigned long ino = e->alloc_ino;
+
+			rcu_read_unlock();
+			return ino;
+		}
+	}
+	rcu_read_unlock();
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return kasumi_vnode_source_ino(src_dev, src_ino);
+	seq = (u64)atomic64_inc_return(&kasumi_ino_next) - KASUMI_VNODE_INO_BASE - 1;
+	e->src_dev = src_dev;
+	e->src_ino = src_ino;
+	e->alloc_ino = KASUMI_VNODE_INO_BASE +
+		(unsigned long)(seq % KASUMI_VNODE_INO_SPAN);
+	hlist_add_head_rcu(&e->node,
+		&kasumi_ino_map[hash_min(src_ino, KASUMI_HASH_BITS)]);
+	atomic_inc(&kasumi_ino_map_count);
+	return e->alloc_ino;
 }
 
 dev_t kasumi_vnode_device(void)
 {
 	return MKDEV(0, KASUMI_VNODE_MINOR);
+}
+
+/*
+ * Scheme A: publish the device a real file at the visible path would report,
+ * so a virtual node's st_dev matches its sibling real files instead of an
+ * anonymous vnode minor (which is itself an odd-dev-out tell).  Resolves the
+ * visible path, or its parent directory when nothing is backed there yet, and
+ * falls back to the captured /system dev, then to the vnode minor, so a valid
+ * non-zero device is always published.  Sleepable context only (path lookup).
+ */
+dev_t kasumi_vnode_visible_dev(const char *visible_path)
+{
+	struct path p;
+	dev_t dev = kasumi_system_dev;
+	char *parent;
+	char *slash;
+
+	if (!visible_path || !*visible_path || !kasumi_kern_path)
+		goto out;
+	if (kasumi_kern_path(visible_path, LOOKUP_FOLLOW, &p) == 0) {
+		if (p.dentry && p.dentry->d_sb)
+			dev = p.dentry->d_sb->s_dev;
+		kasumi_path_put(&p);
+		goto out;
+	}
+	parent = kstrdup(visible_path, GFP_KERNEL);
+	if (parent) {
+		slash = strrchr(parent, '/');
+		if (slash && slash != parent) {
+			*slash = '\0';
+			if (kasumi_kern_path(parent, LOOKUP_FOLLOW, &p) == 0) {
+				if (p.dentry && p.dentry->d_sb)
+					dev = p.dentry->d_sb->s_dev;
+				kasumi_path_put(&p);
+			}
+		}
+		kfree(parent);
+	}
+out:
+	if (!dev)
+		dev = kasumi_vnode_device();
+	return dev;
 }
 
 u64 kasumi_vnode_allocated(void)
@@ -218,6 +345,9 @@ dev_t kasumi_system_dev;
 int (*kasumi_kern_path)(const char *, unsigned int, struct path *);
 int (*kasumi_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
 struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
+int (*kasumi_security_inode_getsecctx)(struct inode *, void **, u32 *);
+int (*kasumi_security_inode_notifysecctx)(struct inode *, void *, u32);
+void (*kasumi_security_release_secctx)(char *, u32);
 char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 char *(*kasumi_d_path)(const struct path *, char *, int);
@@ -521,9 +651,9 @@ int KASUMI_NOCFI kasumi_entry_capture_source(struct kasumi_entry *entry,
 
 	/* Preserve inode identity across rename and hard links without publishing
 	 * the captured filesystem's raw dev/ino pair. */
-	entry->visible_ino = kasumi_vnode_source_ino(entry->source_dev,
+	entry->visible_ino = kasumi_vnode_ino_alloc(entry->source_dev,
 						    entry->source_ino);
-	entry->visible_dev = kasumi_vnode_device();
+	entry->visible_dev = kasumi_vnode_visible_dev(entry->src);
 	if (entry->src &&
 	    kasumi_kern_path(entry->src, LOOKUP_FOLLOW, &visible_path) == 0) {
 		visible_inode = d_inode(visible_path.dentry);
@@ -605,10 +735,11 @@ int KASUMI_NOCFI kasumi_entry_capture_source(struct kasumi_entry *entry,
 					1U << nofollow_inode->i_blkbits;
 				entry->source_nofollow_stat_valid = true;
 			}
-			entry->nofollow_visible_ino = kasumi_vnode_source_ino(
+			entry->nofollow_visible_ino = kasumi_vnode_ino_alloc(
 				nofollow_inode->i_sb ? nofollow_inode->i_sb->s_dev : 0,
 				nofollow_inode->i_ino);
-			entry->nofollow_visible_dev = kasumi_vnode_device();
+			entry->nofollow_visible_dev =
+				kasumi_vnode_visible_dev(entry->src);
 			entry->source_nofollow_stat.ino =
 				entry->nofollow_visible_ino;
 			entry->source_nofollow_stat.dev =
@@ -834,6 +965,16 @@ void kasumi_cleanup_locked(void)
 			call_rcu(&sk_entry->rcu, kasumi_spoof_kstat_entry_free_rcu);
 		}
 		atomic_set(&kasumi_spoof_kstat_count, 0);
+	}
+	{
+		struct kasumi_ino_map_entry *im_entry;
+
+		hash_for_each_safe(kasumi_ino_map, bkt, tmp, im_entry, node) {
+			hlist_del_rcu(&im_entry->node);
+			kfree_rcu(im_entry, rcu);
+		}
+		atomic_set(&kasumi_ino_map_count, 0);
+		atomic64_set(&kasumi_ino_next, KASUMI_VNODE_INO_BASE);
 	}
 
 	bitmap_zero(kasumi_path_bloom, KASUMI_BLOOM_SIZE);
