@@ -537,7 +537,7 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 			if (cvp) {
 				cvi = kasumi_vnode_new_virtual(
 					dir->i_sb, cvp,
-					kasumi_vnode_vpath_ino(cvp));
+					kasumi_vnode_vpath_ino(cvp), dir);
 				kfree(cvp);
 			}
 		}
@@ -687,7 +687,8 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 
 struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 				       const char *visible_path,
-				       unsigned long v_ino)
+				       unsigned long v_ino,
+				       struct inode *label_donor)
 {
 	struct inode *inode;
 	struct kasumi_vnode_info *info;
@@ -715,7 +716,9 @@ struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 	inode->i_ino = v_ino;
 	/* A synthesized container directory: world traversable/listable, owned by
 	 * root, no data source.  lookup/iterate resolve descendants from the rule
-	 * table; getattr fills from this inode with the projected ino/dev. */
+	 * table; getattr fills from this inode with the projected ino/dev.  Mode is
+	 * kept permissive (0555) rather than cloned from the donor so a restrictive
+	 * ancestor cannot make the injected subtree unreachable to the view app. */
 	inode->i_mode = S_IFDIR | 0555;
 	inode->i_uid = GLOBAL_ROOT_UID;
 	inode->i_gid = GLOBAL_ROOT_GID;
@@ -724,5 +727,12 @@ struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 	inode->i_fop = &kasumi_vnode_dir_fops;
 	inode->i_flags |= S_NOATIME | S_NOCMTIME | S_NOSEC;
 	inode->i_opflags |= IOP_NOFOLLOW;
+	/* Project the deepest real ancestor's SELinux label onto the synthesized
+	 * directory so getxattr(security.selinux)/ls -Z report a plausible context
+	 * instead of the pseudo default.  The donor is on the visible path the app
+	 * already traversed, so its label is app-searchable and cloning it does not
+	 * make the virtual dir unsearchable under AVC.  Best-effort. */
+	if (label_donor)
+		kasumi_vnode_clone_sid(inode, label_donor);
 	return inode;
 }

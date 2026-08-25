@@ -56,11 +56,15 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
  * Allocate a pure-virtual directory inode (KASUMI_VNODE_F_VIRTUAL_DIR) on @sb
  * with no data source.  @visible_path is the node's own visible path; its
  * lookup/iterate resolve children against the rule table (kasumi_rule_vpath_*).
- * Owns a copy of @visible_path, released through kasumi_vnode_free_info.
+ * @label_donor, if non-NULL, is the inode (the deepest real ancestor, or the
+ * parent virtual dir) whose SELinux label is cloned onto the node for a
+ * plausible security.selinux.  Owns a copy of @visible_path, released through
+ * kasumi_vnode_free_info.
  */
 struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 				       const char *visible_path,
-				       unsigned long v_ino);
+				       unsigned long v_ino,
+				       struct inode *label_donor);
 
 /* True if @inode is a Kasumi virtual node (its i_op is one of our tables). */
 bool kasumi_vnode_is_ours(const struct inode *inode);

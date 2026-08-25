@@ -321,7 +321,8 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 			return NULL;
 		}
 		if ((cflags & KASUMI_VNODE_F_VIRTUAL_DIR) && vpath)
-			vi = kasumi_vnode_new_virtual(dir->i_sb, vpath, v_ino);
+			vi = kasumi_vnode_new_virtual(dir->i_sb, vpath, v_ino,
+						      dir);
 		else
 			vi = kasumi_vnode_new(dir->i_sb,
 					      source.dentry ? &source : NULL,
