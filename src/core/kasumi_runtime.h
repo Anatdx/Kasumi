@@ -92,6 +92,7 @@ void kasumi_resolve_kallsyms_lookup(void);
 dev_t kasumi_vnode_device(void);
 unsigned long kasumi_vnode_path_ino(const char *path);
 unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino);
+unsigned long kasumi_vnode_vpath_ino(const char *vpath);
 unsigned long kasumi_vnode_ino_alloc(dev_t src_dev, u64 src_ino);
 dev_t kasumi_vnode_visible_dev(const char *visible_path);
 u64 kasumi_vnode_allocated(void);

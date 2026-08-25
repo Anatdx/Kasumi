@@ -1773,6 +1773,156 @@ out:
 	return found;
 }
 
+/* ---- Slice 4c-v2: pure-virtual directory topology rule-table queries ----- */
+
+int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
+					 struct path *leaf_src, umode_t *leaf_mode,
+					 unsigned long *leaf_ino)
+{
+	struct kasumi_entry *entry;
+	char *full;
+	size_t dlen, clen, full_len;
+	int kind = KASUMI_VPATH_NONE;
+	int bkt;
+
+	if (!dir || !child || !*child)
+		return KASUMI_VPATH_NONE;
+	dlen = strlen(dir);
+	clen = strlen(child);
+	full = kmalloc(dlen + 1 + clen + 1, GFP_KERNEL);
+	if (!full)
+		return KASUMI_VPATH_NONE;
+	memcpy(full, dir, dlen);
+	full[dlen] = '/';
+	memcpy(full + dlen + 1, child, clen);
+	full[dlen + 1 + clen] = '\0';
+	full_len = dlen + 1 + clen;
+
+	rcu_read_lock();
+	/* Exact rule at dir/child -> a leaf redirect. */
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		if (!entry->src || !entry->source_path_valid ||
+		    strcmp(entry->src, full) != 0)
+			continue;
+		if (entry->source_nofollow_path_valid) {
+			if (leaf_src) {
+				*leaf_src = entry->source_nofollow_path;
+				kasumi_path_get(leaf_src);
+			}
+			if (leaf_mode)
+				*leaf_mode = entry->source_nofollow_mode;
+			if (leaf_ino)
+				*leaf_ino = entry->nofollow_visible_ino;
+		} else {
+			if (leaf_src) {
+				*leaf_src = entry->source_path;
+				kasumi_path_get(leaf_src);
+			}
+			if (leaf_mode)
+				*leaf_mode = entry->source_mode;
+			if (leaf_ino)
+				*leaf_ino = entry->visible_ino;
+		}
+		kind = KASUMI_VPATH_LEAF;
+		break;
+	}
+	/* Otherwise, a prefix of some rule -> a deeper virtual directory. */
+	if (kind == KASUMI_VPATH_NONE) {
+		hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+			if (!entry->src)
+				continue;
+			if (strncmp(entry->src, full, full_len) == 0 &&
+			    entry->src[full_len] == '/') {
+				kind = KASUMI_VPATH_VDIR;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+	kfree(full);
+	return kind;
+}
+
+int KASUMI_NOCFI kasumi_rule_vpath_emit(const char *dir, struct list_head *out)
+{
+	struct kasumi_entry *entry;
+	size_t dlen;
+	int count = 0;
+	int bkt;
+
+	if (!dir || !out)
+		return 0;
+	dlen = strlen(dir);
+
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		const char *rest;
+		const char *slash;
+		size_t seg_len;
+		bool is_leaf;
+		bool dup = false;
+		struct kasumi_name_list *item, *ex;
+		umode_t m;
+
+		if (!entry->src)
+			continue;
+		if (strncmp(entry->src, dir, dlen) != 0 || entry->src[dlen] != '/')
+			continue;
+		rest = entry->src + dlen + 1;
+		if (!*rest)
+			continue;
+		slash = strchr(rest, '/');
+		seg_len = slash ? (size_t)(slash - rest) : strlen(rest);
+		if (!seg_len)
+			continue;
+		is_leaf = (slash == NULL);
+		list_for_each_entry(ex, out, list) {
+			if (strlen(ex->name) == seg_len &&
+			    memcmp(ex->name, rest, seg_len) == 0) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		item = kmalloc(sizeof(*item), GFP_ATOMIC);
+		if (!item)
+			continue;
+		item->name = kmalloc(seg_len + 1, GFP_ATOMIC);
+		if (!item->name) {
+			kfree(item);
+			continue;
+		}
+		memcpy(item->name, rest, seg_len);
+		item->name[seg_len] = '\0';
+		if (is_leaf) {
+			m = entry->source_nofollow_path_valid ?
+				entry->source_nofollow_mode : entry->source_mode;
+			item->type = (unsigned char)((m & S_IFMT) >> 12);
+			item->ino = entry->source_nofollow_path_valid ?
+				entry->nofollow_visible_ino : entry->visible_ino;
+		} else {
+			char *vpath = kmalloc(dlen + 1 + seg_len + 1, GFP_ATOMIC);
+
+			item->type = DT_DIR;
+			if (vpath) {
+				memcpy(vpath, dir, dlen);
+				vpath[dlen] = '/';
+				memcpy(vpath + dlen + 1, rest, seg_len);
+				vpath[dlen + 1 + seg_len] = '\0';
+				item->ino = kasumi_vnode_vpath_ino(vpath);
+				kfree(vpath);
+			} else {
+				item->ino = 0;
+			}
+		}
+		list_add_tail(&item->list, out);
+		count++;
+	}
+	rcu_read_unlock();
+	return count;
+}
+
 bool kasumi_rule_get_visible_path(const struct path *source,
 				  char *visible_path,
 				  size_t visible_path_size)

@@ -36,6 +36,9 @@ struct kasumi_vnode_info {
 	struct path source;
 	unsigned long v_ino;
 	u8 flags;
+	/* Visible path of a KASUMI_VNODE_F_VIRTUAL_DIR (source-less) node, used to
+	 * resolve its children against the rule table.  NULL for backed nodes. */
+	char *visible_path;
 };
 
 /*
@@ -48,6 +51,16 @@ struct kasumi_vnode_info {
  */
 struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source,
 			       unsigned long v_ino, umode_t mode, u8 flags);
+
+/*
+ * Allocate a pure-virtual directory inode (KASUMI_VNODE_F_VIRTUAL_DIR) on @sb
+ * with no data source.  @visible_path is the node's own visible path; its
+ * lookup/iterate resolve children against the rule table (kasumi_rule_vpath_*).
+ * Owns a copy of @visible_path, released through kasumi_vnode_free_info.
+ */
+struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
+				       const char *visible_path,
+				       unsigned long v_ino);
 
 /* True if @inode is a Kasumi virtual node (its i_op is one of our tables). */
 bool kasumi_vnode_is_ours(const struct inode *inode);

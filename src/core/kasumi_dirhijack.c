@@ -68,6 +68,15 @@ MODULE_PARM_DESC(kasumi_dirhijack_force,
 static atomic_t kasumi_dh_child_count = ATOMIC_INIT(0);
 
 /*
+ * Count of deep-virtual rules whose visible path has synthesized intermediate
+ * directories (Slice 4c-v2).  Multiple such rules share one F_VIRTUAL_DIR child
+ * at the real ancestor, so those children are NOT counted in child_count;
+ * instead each covered rule bumps this, and is_provider adds it to the numerator
+ * so a shared-prefix virtual subtree still reaches full coverage.
+ */
+static atomic_t kasumi_dh_vtopo_rules = ATOMIC_INIT(0);
+
+/*
  * readdir cookie tag.  Virtual children are emitted after the real entries at
  * positions carrying a signature in the high bits.  NOTE: like nomount, this
  * leaves a getdents d_off distinguishable from native cookies — the one
@@ -139,6 +148,9 @@ struct kasumi_dh_child {
 					 * readdir: the overlay filldir owns emit
 					 * and dedup for this name (Slice 4a merge
 					 * materialized files) */
+	char *vpath;			/* F_VIRTUAL_DIR: the synthesized dir's own
+					 * visible path, for rule-table child
+					 * resolution (Slice 4c-v2); NULL else */
 	char name[];
 };
 
@@ -175,13 +187,15 @@ bool kasumi_dirhijack_enabled(void)
 bool kasumi_dirhijack_is_provider(void)
 {
 	unsigned int view_rules;
+	unsigned int covered;
 
 	if (!kasumi_dirhijack_enabled())
 		return false;
 	view_rules = (unsigned int)atomic_read(&kasumi_tsr_path_count) +
 		     (unsigned int)atomic_read(&kasumi_hide_count);
-	return view_rules > 0 &&
-	       (unsigned int)atomic_read(&kasumi_dh_child_count) >= view_rules;
+	covered = (unsigned int)atomic_read(&kasumi_dh_child_count) +
+		  (unsigned int)atomic_read(&kasumi_dh_vtopo_rules);
+	return view_rules > 0 && covered >= view_rules;
 }
 
 /* ---- meta accessors ---------------------------------------------------- */
@@ -263,6 +277,7 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 	unsigned long v_ino = 0;
 	umode_t mode = S_IFREG | 0644;
 	u8 cflags = 0;
+	char *vpath = NULL;
 	bool found = false;
 	bool is_hide = false;
 
@@ -279,6 +294,8 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 			source = c->source;
 			kasumi_path_get(&source);
 		}
+		if (c->vpath)
+			vpath = kstrdup(c->vpath, GFP_ATOMIC);
 		v_ino = c->v_ino;
 		cflags = c->flags;
 		is_hide = c->hide;
@@ -298,15 +315,20 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 			 * non-seeing observer re-resolve to the real entry. */
 			if (source.dentry)
 				kasumi_path_put(&source);
+			kfree(vpath);
 			kasumi_dh_set_dentry_ops(dentry);
 			d_add(dentry, NULL);
 			return NULL;
 		}
-		vi = kasumi_vnode_new(dir->i_sb,
-				      source.dentry ? &source : NULL,
-				      v_ino, mode, cflags);
+		if ((cflags & KASUMI_VNODE_F_VIRTUAL_DIR) && vpath)
+			vi = kasumi_vnode_new_virtual(dir->i_sb, vpath, v_ino);
+		else
+			vi = kasumi_vnode_new(dir->i_sb,
+					      source.dentry ? &source : NULL,
+					      v_ino, mode, cflags);
 		if (source.dentry)
 			kasumi_path_put(&source);
+		kfree(vpath);
 		if (vi) {
 			kasumi_dh_set_dentry_ops(dentry);
 			res = d_splice_alias(vi, dentry);
@@ -753,6 +775,7 @@ static void kasumi_dh_child_free_rcu(struct rcu_head *rcu)
 
 	if (c->source.dentry)
 		kasumi_path_put(&c->source);
+	kfree(c->vpath);
 	kfree(c);
 }
 
@@ -760,13 +783,14 @@ static void kasumi_dh_child_free(struct kasumi_dh_child *c)
 {
 	if (c->source.dentry)
 		kasumi_path_put(&c->source);
+	kfree(c->vpath);
 	kfree(c);
 }
 
 static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 				   u16 len, const struct path *source,
 				   unsigned long v_ino, u8 flags, bool hide,
-				   bool lookup_only)
+				   bool lookup_only, const char *vpath)
 {
 	struct kasumi_dh_child *c, *old;
 	u32 hash = full_name_hash(dir->dir_inode, name, len);
@@ -774,6 +798,14 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	c = kmalloc(sizeof(*c) + len + 1, GFP_KERNEL);
 	if (!c)
 		return -ENOMEM;
+	c->vpath = NULL;
+	if (vpath) {
+		c->vpath = kstrdup(vpath, GFP_KERNEL);
+		if (!c->vpath) {
+			kfree(c);
+			return -ENOMEM;
+		}
+	}
 	memset(&c->source, 0, sizeof(c->source));
 	if (source && source->dentry) {
 		c->source = *source;
@@ -796,7 +828,9 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	spin_unlock(&dir->lock);
 	if (old)
 		call_rcu(&old->rcu, kasumi_dh_child_free_rcu);
-	else
+	else if (!(flags & KASUMI_VNODE_F_VIRTUAL_DIR))
+		/* F_VIRTUAL_DIR topology nodes are shared across rules and counted
+		 * via kasumi_dh_vtopo_rules instead of child_count. */
 		atomic_inc(&kasumi_dh_child_count);
 	return 0;
 }
@@ -828,6 +862,131 @@ static int kasumi_dh_split_parent(const char *visible_path, char **parent_out,
 	return 0;
 }
 
+/*
+ * Slice 4c-v2: register a rule whose visible path has missing intermediate
+ * directories.  Walk up @visible_path's parent chain to the deepest existing
+ * real directory R, then register the first missing segment s1 at R as a
+ * F_VIRTUAL_DIR child (visible path R/s1).  That synthesized directory resolves
+ * everything below it — deeper virtual dirs and the leaf — dynamically from the
+ * rule table (kasumi_rule_vpath_*), so only the top segment needs registering.
+ * The child is shared across all rules under R/s1; each covered rule bumps
+ * kasumi_dh_vtopo_rules for the provider gate.
+ */
+static int kasumi_dh_register_vtopo(const char *visible_path)
+{
+	char *pparent = NULL;
+	char *probe;
+	char *seg = NULL;
+	char *vpath = NULL;
+	const char *leaf;
+	const char *after;
+	const char *slash;
+	struct path rpath;
+	struct inode *rinode;
+	struct kasumi_dh_dir *dir;
+	size_t rlen, seg_len;
+	int ret;
+
+	ret = kasumi_dh_split_parent(visible_path, &pparent, &leaf);
+	if (ret)
+		return ret;
+	probe = kstrdup(pparent, GFP_KERNEL);
+	kfree(pparent);
+	if (!probe)
+		return -ENOMEM;
+
+	/* Walk up to the deepest existing real directory. */
+	for (;;) {
+		char *ls;
+
+		ret = kasumi_kern_path(probe, LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
+				       &rpath);
+		if (ret == 0)
+			break;
+		if (ret != -ENOENT) {
+			kfree(probe);
+			return ret;
+		}
+		ls = strrchr(probe, '/');
+		if (!ls) {
+			kfree(probe);
+			return -ENOENT;
+		}
+		if (ls == probe) {
+			if (probe[1]) {	/* collapse "/x" -> "/" and retry root */
+				probe[1] = '\0';
+				continue;
+			}
+			kfree(probe);	/* even "/" did not resolve */
+			return -ENOENT;
+		}
+		*ls = '\0';
+	}
+	rinode = d_inode(rpath.dentry);
+	if (!rinode || !S_ISDIR(rinode->i_mode)) {
+		kasumi_path_put(&rpath);
+		kfree(probe);
+		return -ENOTDIR;
+	}
+	rlen = (strcmp(probe, "/") == 0) ? 0 : strlen(probe);
+	kfree(probe);
+
+	/* First segment of @visible_path after R, and the virtual dir path R/s1. */
+	after = visible_path + rlen + 1;
+	slash = strchr(after, '/');
+	seg_len = slash ? (size_t)(slash - after) : strlen(after);
+	if (!seg_len || seg_len > NAME_MAX) {
+		kasumi_path_put(&rpath);
+		return -EINVAL;
+	}
+	seg = kstrndup(after, seg_len, GFP_KERNEL);
+	vpath = kstrndup(visible_path, rlen + 1 + seg_len, GFP_KERNEL);
+	if (!seg || !vpath) {
+		kfree(seg);
+		kfree(vpath);
+		kasumi_path_put(&rpath);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&kasumi_dh_lock);
+	ret = kasumi_dh_install_sb(rpath.dentry->d_sb);
+	if (ret)
+		goto out;
+	dir = kasumi_dh_install_dir(rinode, true);	/* readdir must emit s1 */
+	if (!dir) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = kasumi_dh_dir_add_child(dir, seg, (u16)seg_len, NULL,
+				      kasumi_vnode_vpath_ino(vpath),
+				      KASUMI_VNODE_F_DIR | KASUMI_VNODE_F_VIRTUAL_DIR,
+				      false, false, vpath);
+	if (ret)
+		goto out;
+	atomic_inc(&kasumi_dh_vtopo_rules);
+	{
+		struct qstr qn;
+		struct dentry *cached;
+
+		qn.name = seg;
+		qn.len = (u32)seg_len;
+		qn.hash = full_name_hash(rpath.dentry, seg, seg_len);
+		cached = d_lookup(rpath.dentry, &qn);
+		if (cached) {
+			d_drop(cached);
+			dput(cached);
+		}
+	}
+out:
+	mutex_unlock(&kasumi_dh_lock);
+	kasumi_path_put(&rpath);
+	pr_info("Kasumi: dirhijack_vtopo visible=%s vdir=%s ret=%d\n",
+		visible_path, vpath, ret);
+	kfree(seg);
+	kfree(vpath);
+	return ret;
+}
+
 static int kasumi_dh_register(const char *visible_path, const struct path *source,
 			      unsigned long v_ino, u8 flags, bool hide,
 			      bool lookup_only)
@@ -855,6 +1014,11 @@ static int kasumi_dh_register(const char *visible_path, const struct path *sourc
 	ret = kasumi_kern_path(parent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &ppath);
 	if (ret) {
 		kfree(parent);
+		/* Missing intermediate directory: synthesize virtual topology so a
+		 * deep visible path still resolves.  Only for backed inject/dir-source
+		 * rules — a hide or merge-shadow with a missing parent is meaningless. */
+		if (ret == -ENOENT && !hide && !lookup_only)
+			return kasumi_dh_register_vtopo(visible_path);
 		return ret;
 	}
 	pinode = d_inode(ppath.dentry);
@@ -874,7 +1038,7 @@ static int kasumi_dh_register(const char *visible_path, const struct path *sourc
 		goto out;
 	}
 	ret = kasumi_dh_dir_add_child(dir, child, (u16)child_len, source, v_ino,
-				      flags, hide, lookup_only);
+				      flags, hide, lookup_only, NULL);
 	if (ret)
 		goto out;
 
@@ -949,7 +1113,13 @@ int kasumi_dirhijack_del(const char *visible_path)
 	ret = kasumi_kern_path(parent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &ppath);
 	if (ret) {
 		kfree(parent);
-		return ret;
+		/* A deep-virtual rule's parent does not exist as a real dir; it was
+		 * registered via the vtopo path.  Drop its coverage from the provider
+		 * gate.  The shared F_VIRTUAL_DIR child stays (other rules may still
+		 * use it) and empties out via the rule table; clear/unload reclaims it. */
+		if (ret == -ENOENT)
+			atomic_dec_if_positive(&kasumi_dh_vtopo_rules);
+		return ret == -ENOENT ? 0 : ret;
 	}
 
 	mutex_lock(&kasumi_dh_lock);
@@ -1051,6 +1221,7 @@ void kasumi_dirhijack_clear(void)
 
 	/* Phase 3 freed every child directly (no per-child dec); reset the count. */
 	atomic_set(&kasumi_dh_child_count, 0);
+	atomic_set(&kasumi_dh_vtopo_rules, 0);
 }
 
 int kasumi_dirhijack_init(void)

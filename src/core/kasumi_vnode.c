@@ -15,6 +15,7 @@
  */
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/namei.h>
@@ -24,7 +25,9 @@
 #include <linux/xattr.h>
 
 #include "kasumi_base.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
+#include "kasumi_types.h"
 #include "kasumi_vnode.h"
 
 /* i_op->getattr / *attr first argument varies across kernel versions. */
@@ -71,6 +74,7 @@ void kasumi_vnode_free_info(struct inode *inode)
 		return;
 	if (info->source.dentry)
 		kasumi_path_put(&info->source);
+	kfree(info->visible_path);
 	inode->i_private = NULL;
 	kfree(info);
 }
@@ -332,8 +336,14 @@ static int KASUMI_NOCFI kasumi_vnode_dir_open(struct inode *inode,
 	struct kasumi_vnode_info *info = inode->i_private;
 	struct file *real_dir;
 
-	if (!info || !info->source.dentry)
+	if (!info)
 		return -ENOTDIR;
+	if (!info->source.dentry) {
+		/* Pure-virtual directory: nothing to open; iterate enumerates the
+		 * rule table.  release() tolerates a NULL private_data. */
+		file->private_data = NULL;
+		return 0;
+	}
 	if (!kasumi_dentry_open)
 		return -EOPNOTSUPP;
 	real_dir = kasumi_dentry_open(&info->source, O_RDONLY | O_DIRECTORY,
@@ -377,6 +387,47 @@ static KVN_DIR_ACTOR_RET KASUMI_NOCFI kasumi_vnode_dir_actor(
 	return ret;
 }
 
+/* Enumerate a pure-virtual directory's children from the rule table. */
+static int KASUMI_NOCFI kasumi_vnode_dir_iterate_virtual(
+	struct file *file, struct dir_context *ctx,
+	struct kasumi_vnode_info *info)
+{
+	struct list_head children;
+	struct kasumi_name_list *item, *tmp;
+	loff_t idx = 2;		/* children follow . and .. */
+
+	if (!info->visible_path)
+		return -ENOTDIR;
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+	INIT_LIST_HEAD(&children);
+	kasumi_rule_vpath_emit(info->visible_path, &children);
+	list_for_each_entry_safe(item, tmp, &children, list) {
+		bool stop = false;
+
+		if (idx >= ctx->pos) {
+			if (!dir_emit(ctx, item->name, strlen(item->name),
+				      item->ino ? item->ino : (u64)idx,
+				      item->type))
+				stop = true;
+			else
+				ctx->pos = idx + 1;
+		}
+		list_del(&item->list);
+		kfree(item->name);
+		kfree(item);
+		idx++;
+		if (stop)
+			break;
+	}
+	list_for_each_entry_safe(item, tmp, &children, list) {
+		list_del(&item->list);
+		kfree(item->name);
+		kfree(item);
+	}
+	return 0;
+}
+
 static int KASUMI_NOCFI kasumi_vnode_dir_iterate(struct file *file,
 						 struct dir_context *ctx)
 {
@@ -387,7 +438,11 @@ static int KASUMI_NOCFI kasumi_vnode_dir_iterate(struct file *file,
 	struct inode *r_inode;
 	int ret;
 
-	if (!real_dir || !info || !info->source.dentry)
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return kasumi_vnode_dir_iterate_virtual(file, ctx, info);
+	if (!real_dir)
 		return -ENOTDIR;
 	r_inode = d_inode(info->source.dentry);
 	dc.source_dev = (r_inode && r_inode->i_sb) ? r_inode->i_sb->s_dev : 0;
@@ -407,24 +462,17 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 	struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct kasumi_vnode_info *info = dir->i_private;
-	struct path child = {};
-	struct inode *ci;
-	struct inode *cvi;
-	unsigned long civ;
+	struct inode *cvi = NULL;
 	char *name;
-	u8 cflags;
-	int ret;
 
 	(void)flags;
-	if (!info || !info->source.dentry || !info->source.mnt ||
-	    !kasumi_vfs_path_lookup)
+	if (!info)
 		return ERR_PTR(-ENOENT);
 	if (dentry->d_name.len > NAME_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
 	/* A sleeping path-walk callback on a static module op table: pin the module
 	 * so a cooperative unload (prepare_unload's module-refcount gate) cannot
-	 * free our text mid-lookup.  The pin is released before returning, and a
-	 * pin held here keeps prepare_unload from reaching READY. */
+	 * free our text mid-lookup. */
 	if (!try_module_get(THIS_MODULE))
 		return ERR_PTR(-ENOENT);
 	name = kstrndup(dentry->d_name.name, dentry->d_name.len, GFP_KERNEL);
@@ -432,34 +480,79 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 		module_put(THIS_MODULE);
 		return ERR_PTR(-ENOMEM);
 	}
-	/* Resolve the child within the pinned source dir (single component; do not
-	 * follow a final symlink, so lstat/readlink see the link — a symlink child
-	 * becomes a KASUMI_VNODE_F_LNK vnode whose get_link forwards the source). */
-	ret = kasumi_vfs_path_lookup(info->source.dentry, info->source.mnt, name,
-				     0, &child);
-	kfree(name);
-	if (ret) {
+
+	if (info->source.dentry && info->source.mnt) {
+		/* Backed directory: resolve the child within the pinned source dir
+		 * (single component, nofollow so a symlink child stays a symlink). */
+		struct path child = {};
+		struct inode *ci;
+		int ret;
+
+		if (!kasumi_vfs_path_lookup) {
+			kfree(name);
+			module_put(THIS_MODULE);
+			return ERR_PTR(-ENOENT);
+		}
+		ret = kasumi_vfs_path_lookup(info->source.dentry, info->source.mnt,
+					     name, 0, &child);
+		kfree(name);
 		module_put(THIS_MODULE);
-		if (ret == -ENOENT) {
+		if (ret) {
+			if (ret == -ENOENT) {
+				d_add(dentry, NULL);
+				return NULL;
+			}
+			return ERR_PTR(ret);
+		}
+		ci = d_inode(child.dentry);
+		if (ci) {
+			u8 cf = S_ISDIR(ci->i_mode) ? KASUMI_VNODE_F_DIR :
+				S_ISLNK(ci->i_mode) ? KASUMI_VNODE_F_LNK : 0;
+
+			cvi = kasumi_vnode_new(dir->i_sb, &child,
+				kasumi_vnode_source_ino(
+					ci->i_sb ? ci->i_sb->s_dev : 0,
+					(u64)ci->i_ino), ci->i_mode, cf);
+		}
+		kasumi_path_put(&child);
+	} else if (info->visible_path) {
+		/* Pure-virtual directory: resolve the child against the rule table —
+		 * an exact rule is a leaf redirect, a prefix is a deeper virtual dir. */
+		struct path leaf = {};
+		umode_t lmode = 0;
+		unsigned long lino = 0;
+		int kind = kasumi_rule_vpath_child(info->visible_path, name, &leaf,
+						   &lmode, &lino);
+
+		if (kind == KASUMI_VPATH_LEAF) {
+			u8 cf = S_ISDIR(lmode) ? KASUMI_VNODE_F_DIR :
+				S_ISLNK(lmode) ? KASUMI_VNODE_F_LNK : 0;
+
+			cvi = kasumi_vnode_new(dir->i_sb, &leaf, lino, lmode, cf);
+			kasumi_path_put(&leaf);
+		} else if (kind == KASUMI_VPATH_VDIR) {
+			char *cvp = kasprintf(GFP_KERNEL, "%s/%s",
+					      info->visible_path, name);
+
+			if (cvp) {
+				cvi = kasumi_vnode_new_virtual(
+					dir->i_sb, cvp,
+					kasumi_vnode_vpath_ino(cvp));
+				kfree(cvp);
+			}
+		}
+		kfree(name);
+		module_put(THIS_MODULE);
+		if (kind == KASUMI_VPATH_NONE) {
 			d_add(dentry, NULL);
 			return NULL;
 		}
-		return ERR_PTR(ret);
-	}
-	ci = d_inode(child.dentry);
-	if (!ci) {
-		kasumi_path_put(&child);
+	} else {
+		kfree(name);
 		module_put(THIS_MODULE);
-		d_add(dentry, NULL);
-		return NULL;
+		return ERR_PTR(-ENOENT);
 	}
-	cflags = S_ISDIR(ci->i_mode) ? KASUMI_VNODE_F_DIR :
-		 S_ISLNK(ci->i_mode) ? KASUMI_VNODE_F_LNK : 0;
-	civ = kasumi_vnode_source_ino(ci->i_sb ? ci->i_sb->s_dev : 0,
-				      (u64)ci->i_ino);
-	cvi = kasumi_vnode_new(dir->i_sb, &child, civ, ci->i_mode, cflags);
-	kasumi_path_put(&child);
-	module_put(THIS_MODULE);
+
 	if (!cvi)
 		return ERR_PTR(-ENOMEM);
 	return d_splice_alias(cvi, dentry);
@@ -589,5 +682,47 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 	 * allocated by new_inode() and all identity is in place. */
 	if (r_inode)
 		kasumi_vnode_clone_sid(inode, r_inode);
+	return inode;
+}
+
+struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
+				       const char *visible_path,
+				       unsigned long v_ino)
+{
+	struct inode *inode;
+	struct kasumi_vnode_info *info;
+
+	if (!sb || !visible_path)
+		return NULL;
+	inode = new_inode(sb);
+	if (!inode)
+		return NULL;
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info) {
+		iput(inode);
+		return NULL;
+	}
+	info->visible_path = kstrdup(visible_path, GFP_KERNEL);
+	if (!info->visible_path) {
+		kfree(info);
+		iput(inode);
+		return NULL;
+	}
+	info->v_ino = v_ino;
+	info->flags = KASUMI_VNODE_F_DIR | KASUMI_VNODE_F_VIRTUAL_DIR;
+
+	inode->i_private = info;
+	inode->i_ino = v_ino;
+	/* A synthesized container directory: world traversable/listable, owned by
+	 * root, no data source.  lookup/iterate resolve descendants from the rule
+	 * table; getattr fills from this inode with the projected ino/dev. */
+	inode->i_mode = S_IFDIR | 0555;
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
+	set_nlink(inode, 2);
+	inode->i_op = &kasumi_vnode_dir_iops;
+	inode->i_fop = &kasumi_vnode_dir_fops;
+	inode->i_flags |= S_NOATIME | S_NOCMTIME | S_NOSEC;
+	inode->i_opflags |= IOP_NOFOLLOW;
 	return inode;
 }

@@ -193,6 +193,24 @@ unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino)
 }
 
 /*
+ * Synthetic inode for a pure-virtual directory node (F_VIRTUAL_DIR), which has
+ * no source (dev,ino) to project.  Derives a stable, plausible-range u32 from
+ * the visible path so stat and getdents agree across lookups.  Shares the
+ * [BASE, BASE+SPAN) window with kasumi_vnode_source_ino; a collision with a real
+ * allocated ino is possible but low-probability and non-fatal (same residual as
+ * the source-ino scheme).
+ */
+unsigned long kasumi_vnode_vpath_ino(const char *vpath)
+{
+	u32 h;
+
+	if (!vpath)
+		return KASUMI_VNODE_INO_BASE;
+	h = jhash(vpath, (u32)strlen(vpath), 0x76746F70 /* "vtop" */);
+	return KASUMI_VNODE_INO_BASE + (unsigned long)(h % KASUMI_VNODE_INO_SPAN);
+}
+
+/*
  * Allocate (or return the existing) stable synthetic inode for a rule source.
  * SLEEPABLE, install-time only, serialized by kasumi_config_mutex (like the
  * spoof_kstat table), so the lookup-then-insert needs no extra lock.  Idempotent

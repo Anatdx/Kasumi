@@ -10,6 +10,7 @@
 #ifndef _KASUMI_PATH_POLICY_H
 #define _KASUMI_PATH_POLICY_H
 
+#include <linux/list.h>
 #include <linux/path.h>
 #include <linux/stat.h>
 #include <linux/types.h>
@@ -83,5 +84,34 @@ bool kasumi_rule_path_is_virtual(const char *pathname);
 bool kasumi_should_hide(const char *pathname);
 /* Caller must hold rcu_read_lock(); returned entry is only valid until unlock. */
 struct kasumi_entry *kasumi_reverse_lookup_target(const char *path_str);
+
+/*
+ * Slice 4c-v2 pure-virtual directory topology: resolve names under a synthetic
+ * (source-less) directory against the rule table.  A F_VIRTUAL_DIR vnode uses
+ * these to decide whether a child name is an exact redirect (a leaf) or the
+ * prefix of one (a deeper virtual dir), and to enumerate its children.
+ */
+enum kasumi_vpath_kind {
+	KASUMI_VPATH_NONE = 0,	/* no rule under dir/child */
+	KASUMI_VPATH_LEAF,	/* dir/child is an exact rule -> a real redirect */
+	KASUMI_VPATH_VDIR,	/* dir/child is a prefix of some rule -> virtual dir */
+};
+
+/*
+ * Resolve @child within virtual directory @dir.  On KASUMI_VPATH_LEAF pins
+ * *leaf_src (caller kasumi_path_put) and fills *leaf_mode / *leaf_ino with the
+ * leaf's source identity (the nofollow link for a symlink target).  Non-sleeping
+ * apart from a GFP_KERNEL scratch alloc; the rule-table scan runs under RCU.
+ */
+int kasumi_rule_vpath_child(const char *dir, const char *child,
+			    struct path *leaf_src, umode_t *leaf_mode,
+			    unsigned long *leaf_ino);
+
+/*
+ * Collect the direct children of virtual directory @dir into @out as
+ * struct kasumi_name_list nodes (name/ino/type), deduplicated.  Caller emits and
+ * frees each node (kfree(name) then kfree(node)).  Returns the child count.
+ */
+int kasumi_rule_vpath_emit(const char *dir, struct list_head *out);
 
 #endif /* _KASUMI_PATH_POLICY_H */
