@@ -1417,7 +1417,7 @@ KASUMI_NOCFI bool kasumi_fake_mi_mount_hidden_cached(const struct path *path)
 	if (!path || !path->mnt)
 		return false;
 	if (!kasumi_vfs_getattr ||
-	    kasumi_vfs_getattr(path, &stat, STATX_MNT_ID, 0) != 0 ||
+	    kasumi_vfs_getattr_unprojected(path, &stat, STATX_MNT_ID, 0) != 0 ||
 	    !(stat.result_mask & STATX_MNT_ID))
 		return false;
 	real_id = READ_ONCE(stat.mnt_id);

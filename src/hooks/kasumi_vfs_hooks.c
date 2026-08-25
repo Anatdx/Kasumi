@@ -47,6 +47,7 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_virtual_file.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
@@ -92,7 +93,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 			if (unlikely(!w->orig_ctx || !w->orig_ctx->actor))
 				break;
 			ret = w->orig_ctx->actor(w->orig_ctx, item->name, nlen,
-						 inj_pos, 1, item->type);
+						 inj_pos, item->ino ?: 1, item->type);
 			atomic64_inc(&kasumi_hook_stats.filldir_injected);
 			list_del(&item->list);
 			kfree(item->name);
@@ -112,13 +113,6 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	if (unlikely(namlen <= 2 && name[0] == '.')) {
 		if (namlen == 1 || (namlen == 2 && name[1] == '.'))
 			goto passthrough;
-	}
-
-	if (w->spoof_allowed && kasumi_stealth_enabled && w->dir_path_len == 4) {
-		size_t mlen = strlen(kasumi_current_mirror_name);
-		if ((unsigned int)namlen == mlen &&
-		    memcmp(name, kasumi_current_mirror_name, namlen) == 0)
-			return KASUMI_FILLDIR_CONTINUE;
 	}
 
 	/* Hide real entries that also exist in merge targets. This prevents
@@ -272,6 +266,8 @@ KASUMI_NOCFI int kasumi_krp_vfs_getattr_entry(struct kretprobe_instance *ri,
 
 	if (!READ_ONCE(kasumi_enabled))
 		return 0;
+	if (kasumi_vfs_internal_current())
+		return 0;
 	if (!kasumi_policy_current_is_view_target())
 		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
@@ -342,6 +338,8 @@ void kasumi_apply_kstat_spoof(struct inode *inode, struct kstat *stat)
 	struct kasumi_spoof_kstat_entry *e = NULL;
 
 	if (!stat)
+		return;
+	if (kasumi_vfs_internal_current())
 		return;
 	if (!kasumi_policy_current_is_view_target())
 		return;
@@ -684,17 +682,25 @@ KASUMI_NOCFI int kasumi_krp_d_path_entry(struct kretprobe_instance *ri,
 	d->buflen = (int)KASUMI_REG2(regs);
 	d->src_path[0] = '\0';
 
-	if (!READ_ONCE(kasumi_enabled))
-		return 0;
 	if (!kasumi_policy_current_is_view_target())
 		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
-	if (atomic_read(&kasumi_rule_count) == 0)
-		return 0;
 
 	p = (const struct path *)KASUMI_REG0(regs);
 	if (!p || !p->dentry)
+		return 0;
+	if (kasumi_virtual_file_lookup_path(p, d->src_path,
+					    sizeof(d->src_path))) {
+		d->is_target = true;
+		return 0;
+	}
+	if (kasumi_rule_get_visible_path(p, d->src_path,
+					 sizeof(d->src_path))) {
+		d->is_target = true;
+		return 0;
+	}
+	if (!READ_ONCE(kasumi_enabled) || atomic_read(&kasumi_rule_count) == 0)
 		return 0;
 
 	dp = ERR_PTR(-ENOENT);

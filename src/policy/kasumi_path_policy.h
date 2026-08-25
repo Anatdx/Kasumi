@@ -10,10 +10,33 @@
 #ifndef _KASUMI_PATH_POLICY_H
 #define _KASUMI_PATH_POLICY_H
 
+#include <linux/path.h>
+#include <linux/stat.h>
 #include <linux/types.h>
 
 struct kasumi_entry;
 struct kasumi_policy_state_arg;
+
+struct kasumi_rule_source {
+	struct path path;
+	struct kstat stat;
+	umode_t source_mode;
+	unsigned long visible_ino;
+	unsigned long visible_dev;
+	bool stat_valid;
+	bool preserve_visible_metadata;
+	int error;
+};
+
+void kasumi_project_visible_stat(struct kstat *result,
+				 const struct kstat *source_stat,
+				 const struct kstat *visible_template,
+				 bool preserve_visible_metadata,
+				 unsigned long visible_ino,
+				 unsigned long visible_dev);
+int kasumi_visible_access(const struct kstat *stat, int mode,
+			  bool effective_ids);
+int kasumi_visible_open_access(const struct kstat *stat, int mode);
 
 enum kasumi_policy_scope {
 	KASUMI_POLICY_SCOPE_NONE = 0,
@@ -48,6 +71,15 @@ bool kasumi_policy_current_is_isolated(void);
 bool kasumi_current_is_selinux_guard_target(void);
 char *kasumi_resolve_target(const char *pathname);
 char *kasumi_resolve_target_slow(const char *pathname);
+bool kasumi_rule_get_source(const char *pathname,
+			    struct kasumi_rule_source *source);
+bool kasumi_rule_get_source_flags(const char *pathname,
+				  unsigned int lookup_flags,
+				  struct kasumi_rule_source *source);
+bool kasumi_rule_get_visible_path(const struct path *source,
+				  char *visible_path,
+				  size_t visible_path_size);
+bool kasumi_rule_path_is_virtual(const char *pathname);
 bool kasumi_should_hide(const char *pathname);
 /* Caller must hold rcu_read_lock(); returned entry is only valid until unlock. */
 struct kasumi_entry *kasumi_reverse_lookup_target(const char *path_str);

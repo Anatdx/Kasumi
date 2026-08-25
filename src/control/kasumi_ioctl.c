@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/jhash.h>
+#include <linux/kdev_t.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
@@ -56,7 +57,7 @@
 #include "kasumi_tracepoint_hooks.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_file_view.h"
+#include "kasumi_virtual_file.h"
 #include "kasumi_fop_bridge.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
@@ -365,10 +366,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	if (cmd == KSM_IOC_CLEAR_ALL) {
 		mutex_lock(&kasumi_config_mutex);
 		kasumi_cleanup_locked();
-		strscpy(kasumi_mirror_path_buf, KASUMI_DEFAULT_MIRROR_PATH, PATH_MAX);
-		strscpy(kasumi_mirror_name_buf, KASUMI_DEFAULT_MIRROR_NAME, NAME_MAX);
-		kasumi_current_mirror_path = kasumi_mirror_path_buf;
-		kasumi_current_mirror_name = kasumi_mirror_name_buf;
 		mutex_unlock(&kasumi_config_mutex);
 		kasumi_fake_mi_invalidate_all();
 		rcu_barrier();
@@ -573,39 +570,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == KSM_IOC_SET_MIRROR_PATH) {
-		char *new_path, *new_name, *slash;
-		size_t len;
-
-		if (copy_from_user(&req, arg, sizeof(req)))
-			return -EFAULT;
-		if (!req.src)
-			return -EINVAL;
-		new_path = kasumi_strndup_user(req.src, PATH_MAX);
-		if (IS_ERR(new_path))
-			return PTR_ERR(new_path);
-
-		len = strlen(new_path);
-		if (len > 1 && new_path[len - 1] == '/')
-			new_path[len - 1] = '\0';
-
-		slash = strrchr(new_path, '/');
-		new_name = kstrdup(slash ? slash + 1 : new_path, GFP_KERNEL);
-		if (!new_name) {
-			kfree(new_path);
-			return -ENOMEM;
-		}
-
-		mutex_lock(&kasumi_config_mutex);
-		strscpy(kasumi_mirror_path_buf, new_path, PATH_MAX);
-		strscpy(kasumi_mirror_name_buf, new_name, NAME_MAX);
-		kasumi_current_mirror_path = kasumi_mirror_path_buf;
-		kasumi_current_mirror_name = kasumi_mirror_name_buf;
-		mutex_unlock(&kasumi_config_mutex);
-
-		kasumi_log("setting mirror path to: %s\n", kasumi_mirror_path_buf);
-		kfree(new_path);
-		kfree(new_name);
-		return 0;
+		/* ABI slot 14 is intentionally retained, but pure virtual mode no
+		 * longer owns or consumes a mirror/workdir path. */
+		return -EOPNOTSUPP;
 	}
 
 	if (cmd == KSM_IOC_SET_CMDLINE) {
@@ -999,8 +966,34 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
 		written += n;
-		n = scnprintf(kbuf + written, buf_size - written, "xattr path: %s\n",
-			      xattr_path_tsr ? "TSR" : "none");
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "virtual open: live=%u total=%llu; dir iterate=%llu; virtual access=%llu; legacy path=%llu; file_view=removed\n",
+			      kasumi_virtual_file_live(),
+			      (unsigned long long)kasumi_virtual_file_open_count(),
+			      (unsigned long long)
+				      kasumi_virtual_dir_iterate_count(),
+			      (unsigned long long)
+				      kasumi_syscall_virtual_access_count(),
+			      (unsigned long long)
+				      kasumi_syscall_redirect_fallback_count());
+		written += n;
+		{
+			dev_t vnode_dev = kasumi_vnode_device();
+
+			n = scnprintf(kbuf + written, buf_size - written,
+				      "vnode: live=%u allocated=%llu dev=%u:%u\n",
+				      kasumi_vnode_live(),
+				      (unsigned long long)kasumi_vnode_allocated(),
+				      MAJOR(vnode_dev), MINOR(vnode_dev));
+			written += n;
+		}
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "xattr path: %s; virtual handled=%llu; virtual mutate=%llu\n",
+			      xattr_path_tsr ? "TSR" : "none",
+			      (unsigned long long)
+				      kasumi_syscall_virtual_xattr_count(),
+			      (unsigned long long)
+				      kasumi_syscall_virtual_mutation_count());
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
 			      "task marker: %s%s\n",
@@ -1234,21 +1227,35 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			kasumi_path_put(&path);
 		} else {
 			char *ls = strrchr(src, '/');
-			if (ls && ls != src) {
+			if (ls) {
 				size_t l = ls - src;
-				char *p_str = kmalloc(l + 1, GFP_KERNEL);
+				char *p_str;
+
+				if (ls == src) {
+					p_str = kstrdup("/", GFP_KERNEL);
+				} else {
+					p_str = kmalloc(l + 1, GFP_KERNEL);
+					if (p_str) {
+						memcpy(p_str, src, l);
+						p_str[l] = '\0';
+					}
+				}
 				if (p_str) {
-					memcpy(p_str, src, l);
-					p_str[l] = '\0';
 					if (kasumi_kern_path(p_str, LOOKUP_FOLLOW, &path) == 0) {
 						char *res = kasumi_d_path ? kasumi_d_path(&path, tmp_buf, PATH_MAX) : ERR_PTR(-ENOENT);
 						if (!IS_ERR(res)) {
-							size_t rl = strlen(res);
-							size_t nl = strlen(ls);
-							resolved_src = kmalloc(rl + nl + 1, GFP_KERNEL);
-							if (resolved_src) {
-								strcpy(resolved_src, res);
-								strcat(resolved_src, ls);
+							if (!strcmp(res, "/")) {
+								resolved_src = kstrdup(ls, GFP_KERNEL);
+							} else {
+								size_t rl = strlen(res);
+								size_t nl = strlen(ls);
+
+								resolved_src = kmalloc(rl + nl + 1,
+										      GFP_KERNEL);
+								if (resolved_src) {
+									strcpy(resolved_src, res);
+									strcat(resolved_src, ls);
+								}
 							}
 							parent_dir = kstrdup(res, GFP_KERNEL);
 						}
@@ -1279,6 +1286,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			ret = -ENOMEM;
 			goto add_rule_done;
 		}
+		ret = kasumi_entry_capture_source(new_entry, target);
+		if (ret)
+			goto add_rule_done;
 
 		mutex_lock(&kasumi_config_mutex);
 
@@ -1348,13 +1358,15 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			iput(target_inode);
 		}
 
-		/* Do not mark redirect source as hidden: we do not inject a virtual
-		 * entry for simple ADD_RULE, so hiding would make the file disappear
-		 * from the listing. Open of the path is still redirected by exact TSR. */
+		/* Exact rules are injected when the visible dentry is absent.  Existing
+		 * real names are de-duplicated by the directory view, so no hide marker
+		 * is needed for either form. */
 add_rule_done:
 		if (new_entry) {
+			kasumi_entry_release_source(new_entry);
 			kfree(new_entry->src);
 			kfree(new_entry->target);
+			kfree(new_entry->source_canonical);
 			kfree(new_entry);
 		}
 		kfree(parent_dir);
@@ -1634,7 +1646,7 @@ static void kasumi_quiesce_stop_new(void)
 	 */
 
 	/* No new object may acquire module-owned callbacks after this point. */
-	kasumi_file_view_stop_new();
+	kasumi_virtual_file_stop_new();
 	kasumi_proc_hooks_stop_new();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
@@ -1656,7 +1668,7 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	unsigned int marker;
 	unsigned int redirect;
 	unsigned int proxies;
-	unsigned int file_views;
+	unsigned int virtual_files;
 	unsigned int iop_active;
 	bool iop_quiesced;
 	unsigned int known_refs;
@@ -1702,13 +1714,13 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	redirect = kasumi_tracepoint_hooks_pending_guard_count();
 	dispatcher_detached = kasumi_syscall_redirect_detached();
 	proxies = kasumi_proc_proxy_live();
-	file_views = kasumi_file_view_live();
+	virtual_files = kasumi_virtual_file_live();
 	iop_active = kasumi_iop_override_active();
 	iop_quiesced = kasumi_iop_override_quiesced();
 	unload_pin_held = kasumi_bootstrap_unload_pin_held();
 	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
 	known_refs = control_files + getfd + marker + redirect + proxies +
-		file_views + (unload_pin_held ? 1U : 0U);
+		virtual_files + (unload_pin_held ? 1U : 0U);
 
 	a.state = KSM_QUIESCE_STATE_DRAINING;
 	a.busy_mask = 0;
@@ -1720,15 +1732,14 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 		a.busy_mask |= KSM_QUIESCE_BUSY_REDIRECT;
 	if (proxies)
 		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
-	if (file_views)
-		a.busy_mask |= KSM_QUIESCE_BUSY_FILE_VIEW;
 	if (control_files != 1)
 		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
-	if (module_refs > known_refs || iop_active || !iop_quiesced ||
+	if (virtual_files || module_refs > known_refs || iop_active ||
+	    !iop_quiesced ||
 	    !dispatcher_detached)
 		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
 
-	ready = !getfd && !marker && !redirect && !proxies && !file_views &&
+	ready = !getfd && !marker && !redirect && !proxies && !virtual_files &&
 		dispatcher_detached && iop_quiesced && control_files == 1 &&
 		module_refs == control_files + (unload_pin_held ? 1U : 0U);
 
@@ -1757,7 +1768,7 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	a.pending_marker = marker;
 	a.pending_redirect = redirect;
 	a.live_proc_proxy = proxies;
-	a.live_file_view = file_views;
+	a.live_file_view = 0;
 	a.control_files = control_files;
 	a.module_refs = module_refs;
 	if (copy_to_user(arg, &a, sizeof(a)))

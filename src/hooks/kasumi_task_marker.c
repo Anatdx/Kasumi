@@ -28,6 +28,7 @@
 #include "kasumi_runtime.h"
 #include "kasumi_task_marker.h"
 #include "kasumi_tracepoint_hooks.h"
+#include "kasumi_virtual_file.h"
 
 #define KASUMI_MARKER_WORK_RESERVE 32
 #define KASUMI_ANDROID_PER_USER_RANGE 100000
@@ -442,6 +443,8 @@ static void kasumi_marker_process_fork(void *data, struct task_struct *parent,
 	bool inherited;
 
 	(void)data;
+	if (child)
+		kasumi_virtual_exec_task_fork(parent, child);
 	/* Pairs with marker activation after the provider has been pinned. */
 	if (!smp_load_acquire(&kasumi_marker_active_state) || unlikely(!child))
 		return;
@@ -468,6 +471,7 @@ static void kasumi_marker_process_exit(void *data, struct task_struct *task)
 	(void)data;
 	if (!task)
 		return;
+	kasumi_virtual_exec_task_exit(task);
 	old = xa_erase(&kasumi_marker_owned_marks, (unsigned long)task);
 	if (old == task)
 		put_task_struct(task);

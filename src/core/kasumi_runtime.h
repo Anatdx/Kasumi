@@ -89,16 +89,17 @@ unsigned long kasumi_lookup_name_quiet(const char *name);
 unsigned long kasumi_lookup_callable(const char *name);
 unsigned long kasumi_lookup_callable_quiet(const char *name);
 void kasumi_resolve_kallsyms_lookup(void);
+dev_t kasumi_vnode_device(void);
+unsigned long kasumi_vnode_path_ino(const char *path);
+unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino);
+u64 kasumi_vnode_allocated(void);
+unsigned int kasumi_vnode_live(void);
 
 typedef bool (*kasumi_ksu_uid_should_umount_fn)(uid_t uid);
 
 extern kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 
 extern bool kasumi_stealth_enabled;
-extern char kasumi_mirror_path_buf[PATH_MAX];
-extern char kasumi_mirror_name_buf[NAME_MAX];
-extern char *kasumi_current_mirror_path;
-extern char *kasumi_current_mirror_name;
 
 struct kasumi_cmdline_rcu {
 	struct rcu_head rcu;
@@ -124,18 +125,44 @@ extern dev_t kasumi_system_dev;
 
 extern int (*kasumi_kern_path)(const char *, unsigned int, struct path *);
 extern int (*kasumi_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
+int kasumi_vfs_getattr_unprojected(const struct path *path,
+				   struct kstat *stat, u32 request_mask,
+				   unsigned int query_flags);
+bool kasumi_vfs_internal_current(void);
 extern struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
 extern char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 extern char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 extern char *(*kasumi_d_path)(const struct path *, char *, int);
 extern struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 extern void *kasumi_vfs_getxattr_addr;
+extern void *kasumi_vfs_listxattr_addr;
+extern void *kasumi_vfs_setxattr_addr;
+extern void *kasumi_vfs_removexattr_addr;
+extern void *kasumi_mnt_want_write_addr;
+extern void *kasumi_mnt_drop_write_addr;
+extern int (*kasumi_vfs_path_lookup)(struct dentry *, struct vfsmount *,
+				     const char *, unsigned int, struct path *);
+extern const char *(*kasumi_vfs_get_link)(struct dentry *,
+					  struct delayed_call *);
 extern void (*kasumi_path_get_ptr)(const struct path *);
 extern void (*kasumi_path_put_ptr)(const struct path *);
 extern void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 extern struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 extern int (*kasumi_filp_close)(struct file *, fl_owner_t);
 extern ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
+extern ssize_t (*kasumi_kernel_write)(struct file *, const void *, size_t, loff_t *);
+extern void (*kasumi_cdev_put_ptr)(struct cdev *);
+extern struct file *(*kasumi_shmem_file_setup)(const char *, loff_t,
+							 unsigned long);
+extern ssize_t (*kasumi_vfs_copy_file_range)(struct file *, loff_t,
+							    struct file *, loff_t,
+							    size_t, unsigned int);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+extern unsigned long (*kasumi_mm_get_unmapped_area_ptr)(struct mm_struct *,
+								struct file *, unsigned long,
+								unsigned long, unsigned long,
+								unsigned long);
+#endif
 extern char *(*kasumi_strndup_user)(const char __user *, long);
 extern void (*kasumi_ihold)(struct inode *);
 extern long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
@@ -157,6 +184,14 @@ extern void (*kasumi_synchronize_rcu_tasks_ptr)(void);
 void kasumi_synchronize_rcu_tasks(void);
 extern int (*kasumi_module_refcount_ptr)(struct module *module);
 int kasumi_module_refcount(struct module *module);
+
+KASUMI_NOCFI ssize_t kasumi_copy_file_range(struct file *file_in,
+						loff_t pos_in,
+						struct file *file_out,
+						loff_t pos_out,
+						size_t len,
+						unsigned int flags);
+KASUMI_NOCFI void kasumi_cdev_put(struct cdev *cdev);
 
 /* KASUMI_NOCFI: these call kallsyms-resolved pointers (path_get/path_put).
  * Whether a kernel build emits a .cfi_jt thunk for those symbols varies per

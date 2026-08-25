@@ -304,6 +304,7 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_SET_STEALTH        _IOW(KSM_IOC_MAGIC, 10, int)
 #define KSM_IOC_HIDE_OVERLAY_XATTRS _IOW(KSM_IOC_MAGIC, 11, struct kasumi_syscall_arg)
 #define KSM_IOC_ADD_MERGE_RULE     _IOW(KSM_IOC_MAGIC, 12, struct kasumi_syscall_arg)
+/* ABI-reserved legacy slot; pure virtual kernels return -EOPNOTSUPP. */
 #define KSM_IOC_SET_MIRROR_PATH    _IOW(KSM_IOC_MAGIC, 14, struct kasumi_syscall_arg)
 #define KSM_IOC_ADD_SPOOF_KSTAT    _IOW(KSM_IOC_MAGIC, 15, struct kasumi_spoof_kstat)
 #define KSM_IOC_UPDATE_SPOOF_KSTAT _IOW(KSM_IOC_MAGIC, 16, struct kasumi_spoof_kstat)

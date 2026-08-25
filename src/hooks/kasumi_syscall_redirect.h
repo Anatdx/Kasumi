@@ -24,4 +24,8 @@ int  kasumi_register_syscall_hook(int nr, kasumi_syscall_hook_fn fn);
 void kasumi_unregister_syscall_hook(int nr);
 bool kasumi_has_syscall_hook(int nr);
 bool kasumi_syscall_redirect_claimable(int nr, int current_nr);
+u64 kasumi_syscall_redirect_fallback_count(void);
+u64 kasumi_syscall_virtual_access_count(void);
+u64 kasumi_syscall_virtual_xattr_count(void);
+u64 kasumi_syscall_virtual_mutation_count(void);
 #endif

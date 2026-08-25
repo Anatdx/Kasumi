@@ -17,10 +17,10 @@
 
 #include "kasumi_bootstrap.h"
 #include "kasumi_runtime.h"
+#include "kasumi_virtual_file.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_store.h"
-#include "kasumi_file_view.h"
 #include "kasumi_fop_bridge.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
@@ -141,7 +141,36 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_filp_open = (void *)kasumi_lookup_callable("filp_open");
 	kasumi_filp_close = (void *)kasumi_lookup_callable("filp_close");
 	kasumi_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
+	kasumi_kernel_write = (void *)kasumi_lookup_callable_quiet("kernel_write");
+	kasumi_cdev_put_ptr =
+		(void *)kasumi_lookup_callable_quiet("cdev_put");
+	kasumi_shmem_file_setup =
+		(void *)kasumi_lookup_callable_quiet("shmem_file_setup");
+	kasumi_vfs_copy_file_range =
+		(void *)kasumi_lookup_callable_quiet("vfs_copy_file_range");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	kasumi_mm_get_unmapped_area_ptr =
+		(void *)kasumi_lookup_callable_quiet("mm_get_unmapped_area");
+	if (!kasumi_mm_get_unmapped_area_ptr)
+		pr_warn("Kasumi: mm_get_unmapped_area not found, virtual mmap uses the arch fallback\n");
+#endif
 	kasumi_vfs_getattr = (void *)kasumi_lookup_callable("vfs_getattr");
+	kasumi_vfs_getxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_getxattr");
+	kasumi_vfs_listxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_listxattr");
+	kasumi_vfs_setxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_setxattr");
+	kasumi_vfs_removexattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_removexattr");
+	kasumi_mnt_want_write_addr =
+		(void *)kasumi_lookup_callable_quiet("mnt_want_write");
+	kasumi_mnt_drop_write_addr =
+		(void *)kasumi_lookup_callable_quiet("mnt_drop_write");
+	kasumi_vfs_path_lookup =
+		(void *)kasumi_lookup_callable_quiet("vfs_path_lookup");
+	kasumi_vfs_get_link =
+		(void *)kasumi_lookup_callable_quiet("vfs_get_link");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
 	kasumi_d_absolute_path = (void *)kasumi_lookup_callable("d_absolute_path");
 	kasumi_dentry_path_raw = (void *)kasumi_lookup_callable("dentry_path_raw");
@@ -204,6 +233,16 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_warn("Kasumi: free_inode_nonrcu not found, sop fallback disabled\n");
 	if (!kasumi_vfs_getattr || !kasumi_dentry_open)
 		pr_warn("Kasumi: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
+	if (!kasumi_vfs_path_lookup)
+		pr_warn("Kasumi: vfs_path_lookup not found, virtual directory descendants disabled\n");
+	if (!kasumi_vfs_getxattr_addr || !kasumi_vfs_listxattr_addr ||
+	    !kasumi_vfs_setxattr_addr || !kasumi_vfs_removexattr_addr ||
+	    !kasumi_mnt_want_write_addr || !kasumi_mnt_drop_write_addr)
+		pr_warn("Kasumi: captured xattr helpers unavailable\n");
+	if (!kasumi_kernel_write || !kasumi_shmem_file_setup)
+		pr_warn("Kasumi: kernel_write/shmem_file_setup not found, virtual mmap disabled\n");
+	if (!kasumi_vfs_copy_file_range)
+		pr_warn("Kasumi: vfs_copy_file_range not found, virtual mmap uses buffered copy\n");
 	if (!kasumi_d_absolute_path && !kasumi_dentry_path_raw)
 		pr_warn("Kasumi: neither d_absolute_path nor dentry_path_raw found, inject/merge listing disabled\n");
 
@@ -370,7 +409,7 @@ void kasumi_bootstrap_exit(void)
 	kasumi_syscall_redirect_exit();
 
 	/* PHASE 2: handlers can no longer be reached, free their dependencies. */
-	kasumi_file_view_shutdown();
+	kasumi_virtual_file_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();

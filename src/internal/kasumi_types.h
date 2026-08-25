@@ -16,6 +16,7 @@
 #include <linux/hashtable.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/path.h>
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
@@ -25,6 +26,34 @@
 struct kasumi_entry {
 	char *src;
 	char *target;
+	char *source_canonical;
+	/* Pinned data source resolved from target when the rule is installed. */
+	struct path source_path;
+	struct path source_nofollow_path;
+	struct inode *source_inode;
+	struct kstat source_stat;
+	struct kstat source_nofollow_stat;
+	struct kstat visible_stat;
+	unsigned long source_ino;
+	unsigned long source_dev;
+	unsigned long visible_ino;
+	unsigned long visible_dev;
+	unsigned long nofollow_visible_ino;
+	unsigned long nofollow_visible_dev;
+	umode_t source_mode;
+	umode_t source_nofollow_mode;
+	kuid_t source_uid;
+	kgid_t source_gid;
+	loff_t source_size;
+	bool source_stat_valid;
+	bool visible_stat_valid;
+	/* A real node existed at src when the rule was installed.  Its DAC and
+	 * timestamp metadata remains the visible template while source-backed
+	 * type/size/allocation fields are refreshed dynamically. */
+	bool preserve_visible_metadata;
+	bool source_path_valid;
+	bool source_nofollow_stat_valid;
+	bool source_nofollow_path_valid;
 	unsigned char type;
 	u32 src_hash;
 	struct hlist_node node;
@@ -68,6 +97,7 @@ struct kasumi_merge_target_node {
 
 struct kasumi_name_list {
 	char *name;
+	u64 ino;
 	unsigned char type;
 	struct list_head list;
 };

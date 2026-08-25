@@ -40,7 +40,7 @@
 #include "kasumi_runtime.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_store.h"
-#include "kasumi_file_view.h"
+#include "kasumi_virtual_file.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
@@ -1042,7 +1042,7 @@ static int kasumi_mount_proxy_install_file(
 	return 0;
 }
 
-KASUMI_NOCFI void kasumi_mount_proxy_drain(void)
+static KASUMI_NOCFI void kasumi_mount_proxy_drain(void)
 {
 	struct kasumi_mount_file_proxy *p, *tmp;
 	LIST_HEAD(stale_proxies);
@@ -1242,12 +1242,12 @@ static int kasumi_filter_maps_lines(const char *src, size_t len,
 		have_replacement_path = false;
 		replacement_path[0] = '\0';
 
-		if (view && kasumi_file_view_lookup_maps(ino, dev,
+		if (view && kasumi_virtual_file_lookup_maps(ino, dev,
 						 &spoof_ino, &spoof_dev,
 						 auto_spoof_path,
 						 sizeof(auto_spoof_path))) {
 			strscpy(replacement_path, auto_spoof_path,
-				sizeof(replacement_path));
+				 sizeof(replacement_path));
 			have_replacement_path = true;
 		}
 

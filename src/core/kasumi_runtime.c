@@ -20,6 +20,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/jhash.h>
+#include <linux/kdev_t.h>
+#include <linux/hashtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
@@ -44,7 +46,6 @@
 
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
-#include "kasumi_file_view.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_task_marker.h"
 #include "kasumi_tracepoint_hooks.h"
@@ -55,6 +56,112 @@ atomic_t kasumi_rule_count = ATOMIC_INIT(0);
 atomic_t kasumi_hide_count = ATOMIC_INIT(0);
 atomic_t kasumi_tsr_path_count = ATOMIC_INIT(0);
 struct kasumi_hook_stats kasumi_hook_stats;
+
+#define KASUMI_INTERNAL_VFS_HASH_BITS 5
+
+struct kasumi_internal_vfs_guard {
+	struct task_struct *task;
+	struct hlist_node node;
+};
+
+static DEFINE_HASHTABLE(kasumi_internal_vfs_tasks,
+			KASUMI_INTERNAL_VFS_HASH_BITS);
+static DEFINE_SPINLOCK(kasumi_internal_vfs_lock);
+
+bool kasumi_vfs_internal_current(void)
+{
+	struct kasumi_internal_vfs_guard *guard;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&kasumi_internal_vfs_lock, flags);
+	hash_for_each_possible(kasumi_internal_vfs_tasks, guard, node,
+			       (unsigned long)current) {
+		if (guard->task == current) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&kasumi_internal_vfs_lock, flags);
+	return found;
+}
+
+int KASUMI_NOCFI kasumi_vfs_getattr_unprojected(
+	const struct path *path, struct kstat *stat, u32 request_mask,
+	unsigned int query_flags)
+{
+	struct kasumi_internal_vfs_guard guard = { .task = current };
+	unsigned long flags;
+	int ret;
+
+	if (!kasumi_vfs_getattr)
+		return -EOPNOTSUPP;
+	/* Internal source inspection must not be fed back through Kasumi's own
+	 * legacy kstat projection.  A stack-backed, lock-protected task marker is
+	 * safe across sleeping filesystem getattr implementations and nests. */
+	spin_lock_irqsave(&kasumi_internal_vfs_lock, flags);
+	hash_add(kasumi_internal_vfs_tasks, &guard.node,
+		 (unsigned long)current);
+	spin_unlock_irqrestore(&kasumi_internal_vfs_lock, flags);
+	ret = kasumi_vfs_getattr(path, stat, request_mask, query_flags);
+	spin_lock_irqsave(&kasumi_internal_vfs_lock, flags);
+	hash_del(&guard.node);
+	spin_unlock_irqrestore(&kasumi_internal_vfs_lock, flags);
+	return ret;
+}
+
+/* Metadata-only device namespace for virtual nodes.  No real superblock is
+ * registered: pathname hooks, virtual descriptors and proc projections all
+ * publish this identity from the rule snapshot. */
+#define KASUMI_VNODE_MINOR 0x4b5
+static atomic64_t kasumi_vnode_allocated_count = ATOMIC64_INIT(0);
+static atomic_t kasumi_vnode_live_count = ATOMIC_INIT(0);
+
+unsigned long kasumi_vnode_path_ino(const char *path)
+{
+	u64 ino;
+	size_t len;
+
+	if (!path || !*path)
+		return 1;
+	len = strlen(path);
+	ino = ((u64)jhash(path, (u32)len, 0x4b617375) << 32) |
+		jhash(path, (u32)len, 0x6d695646);
+	ino |= 1ULL << 63;
+	return (unsigned long)ino;
+}
+
+unsigned long kasumi_vnode_source_ino(dev_t source_dev, u64 source_ino)
+{
+	u64 dev = (u64)source_dev;
+	u32 words[4] = {
+		(u32)dev,
+		(u32)(dev >> 32),
+		(u32)source_ino,
+		(u32)(source_ino >> 32),
+	};
+	u64 ino;
+
+	ino = ((u64)jhash2(words, ARRAY_SIZE(words), 0x4b617375) << 32) |
+		jhash2(words, ARRAY_SIZE(words), 0x6d695646);
+	ino |= 1ULL << 63;
+	return (unsigned long)ino;
+}
+
+dev_t kasumi_vnode_device(void)
+{
+	return MKDEV(0, KASUMI_VNODE_MINOR);
+}
+
+u64 kasumi_vnode_allocated(void)
+{
+	return (u64)atomic64_read(&kasumi_vnode_allocated_count);
+}
+
+unsigned int kasumi_vnode_live(void)
+{
+	return (unsigned int)atomic_read(&kasumi_vnode_live_count);
+}
 
 struct kasumi_percpu *kasumi_percpu_base;
 char *kasumi_iterate_buf_base;
@@ -86,11 +193,6 @@ kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 bool kasumi_debug_enabled;
 bool kasumi_stealth_enabled;
 
-char kasumi_mirror_path_buf[PATH_MAX] = KASUMI_DEFAULT_MIRROR_PATH;
-char kasumi_mirror_name_buf[NAME_MAX] = KASUMI_DEFAULT_MIRROR_NAME;
-char *kasumi_current_mirror_path = kasumi_mirror_path_buf;
-char *kasumi_current_mirror_name = kasumi_mirror_name_buf;
-
 struct kasumi_cmdline_rcu __rcu *kasumi_spoof_cmdline_ptr;
 bool kasumi_cmdline_spoof_active;
 
@@ -121,12 +223,32 @@ char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 char *(*kasumi_d_path)(const struct path *, char *, int);
 struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 void *kasumi_vfs_getxattr_addr;
+void *kasumi_vfs_listxattr_addr;
+void *kasumi_vfs_setxattr_addr;
+void *kasumi_vfs_removexattr_addr;
+void *kasumi_mnt_want_write_addr;
+void *kasumi_mnt_drop_write_addr;
+int (*kasumi_vfs_path_lookup)(struct dentry *, struct vfsmount *,
+			      const char *, unsigned int, struct path *);
+const char *(*kasumi_vfs_get_link)(struct dentry *, struct delayed_call *);
 void (*kasumi_path_get_ptr)(const struct path *);
 void (*kasumi_path_put_ptr)(const struct path *);
 void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 int (*kasumi_filp_close)(struct file *, fl_owner_t);
 ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
+ssize_t (*kasumi_kernel_write)(struct file *, const void *, size_t, loff_t *);
+void (*kasumi_cdev_put_ptr)(struct cdev *);
+struct file *(*kasumi_shmem_file_setup)(const char *, loff_t, unsigned long);
+ssize_t (*kasumi_vfs_copy_file_range)(struct file *, loff_t,
+					      struct file *, loff_t,
+					      size_t, unsigned int);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+unsigned long (*kasumi_mm_get_unmapped_area_ptr)(struct mm_struct *,
+							 struct file *, unsigned long,
+							 unsigned long, unsigned long,
+							 unsigned long);
+#endif
 char *(*kasumi_strndup_user)(const char __user *, long);
 void (*kasumi_ihold)(struct inode *);
 long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
@@ -167,6 +289,22 @@ noinline KASUMI_NOCFI void kasumi_synchronize_rcu_tasks(void)
 noinline KASUMI_NOCFI int kasumi_module_refcount(struct module *module)
 {
 	return kasumi_module_refcount_ptr(module);
+}
+
+noinline KASUMI_NOCFI ssize_t kasumi_copy_file_range(
+	struct file *file_in, loff_t pos_in, struct file *file_out,
+	loff_t pos_out, size_t len, unsigned int flags)
+{
+	if (!kasumi_vfs_copy_file_range)
+		return -EOPNOTSUPP;
+	return kasumi_vfs_copy_file_range(file_in, pos_in, file_out, pos_out,
+					  len, flags);
+}
+
+noinline KASUMI_NOCFI void kasumi_cdev_put(struct cdev *cdev)
+{
+	if (kasumi_cdev_put_ptr && cdev)
+		kasumi_cdev_put_ptr(cdev);
 }
 
 bool kasumi_valid_kernel_addr(unsigned long addr)
@@ -306,12 +444,212 @@ void kasumi_resolve_kallsyms_lookup(void)
 		 (unsigned long)kasumi_kallsyms_lookup_name);
 }
 
+int KASUMI_NOCFI kasumi_entry_capture_source(struct kasumi_entry *entry,
+					     const char *source_path)
+{
+	struct path nofollow_path;
+	struct inode *nofollow_inode;
+	struct kstat visible_kstat;
+	struct path visible_path;
+	struct inode *visible_inode;
+	struct inode *inode;
+	struct path path;
+	int ret;
+
+	if (!entry || !source_path || !*source_path)
+		return -EINVAL;
+	if (entry->source_path_valid)
+		return -EALREADY;
+	if (!kasumi_kern_path || !kasumi_path_get_ptr || !kasumi_path_put_ptr)
+		return -EOPNOTSUPP;
+
+	ret = kasumi_kern_path(source_path, LOOKUP_FOLLOW, &path);
+	if (ret)
+		return ret;
+	inode = d_inode(path.dentry);
+	if (!inode) {
+		kasumi_path_put(&path);
+		return -ENOENT;
+	}
+
+	entry->source_path = path;
+	kasumi_path_get(&entry->source_path);
+	if (kasumi_d_absolute_path) {
+		char *buffer = kmalloc(KSM_MAX_LEN_PATHNAME, GFP_KERNEL);
+
+		if (buffer) {
+			char *canonical = kasumi_d_absolute_path(
+				&path, buffer, KSM_MAX_LEN_PATHNAME);
+
+			if (!IS_ERR_OR_NULL(canonical) && canonical[0] == '/')
+				entry->source_canonical = kstrdup(canonical,
+								   GFP_KERNEL);
+			kfree(buffer);
+		}
+	}
+	entry->source_inode = inode;
+	entry->source_ino = inode->i_ino;
+	entry->source_dev = inode->i_sb ? inode->i_sb->s_dev : 0;
+	entry->source_mode = inode->i_mode;
+	entry->source_uid = inode->i_uid;
+	entry->source_gid = inode->i_gid;
+	entry->source_size = i_size_read(inode);
+	memset(&entry->source_stat, 0, sizeof(entry->source_stat));
+	if (kasumi_vfs_getattr &&
+	    kasumi_vfs_getattr_unprojected(&path, &entry->source_stat,
+			       STATX_BASIC_STATS | STATX_BTIME,
+			       AT_STATX_SYNC_AS_STAT) == 0) {
+		entry->source_stat_valid = true;
+	} else {
+		entry->source_stat.result_mask =
+			STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_UID |
+			STATX_GID | STATX_INO | STATX_SIZE | STATX_BLOCKS;
+		entry->source_stat.dev = entry->source_dev;
+		entry->source_stat.ino = entry->source_ino;
+		entry->source_stat.mode = entry->source_mode;
+		entry->source_stat.nlink = inode->i_nlink;
+		entry->source_stat.uid = entry->source_uid;
+		entry->source_stat.gid = entry->source_gid;
+		entry->source_stat.rdev = inode->i_rdev;
+		entry->source_stat.size = entry->source_size;
+		entry->source_stat.blocks = inode->i_blocks;
+		entry->source_stat.blksize = 1U << inode->i_blkbits;
+		entry->source_stat_valid = true;
+	}
+	entry->visible_stat = entry->source_stat;
+	entry->visible_stat_valid = entry->source_stat_valid;
+
+	/* Preserve inode identity across rename and hard links without publishing
+	 * the captured filesystem's raw dev/ino pair. */
+	entry->visible_ino = kasumi_vnode_source_ino(entry->source_dev,
+						    entry->source_ino);
+	entry->visible_dev = kasumi_vnode_device();
+	if (entry->src &&
+	    kasumi_kern_path(entry->src, LOOKUP_FOLLOW, &visible_path) == 0) {
+		visible_inode = d_inode(visible_path.dentry);
+		if (visible_inode) {
+			entry->preserve_visible_metadata = true;
+			memset(&visible_kstat, 0, sizeof(visible_kstat));
+			if (kasumi_vfs_getattr &&
+			    kasumi_vfs_getattr_unprojected(&visible_path,
+						     &visible_kstat,
+					       STATX_BASIC_STATS | STATX_BTIME,
+					       AT_STATX_SYNC_AS_STAT) == 0) {
+				entry->visible_stat = visible_kstat;
+				/* The virtual node lives at the visible path, but its data
+				 * and file kind come from the captured source. Keep visible
+				 * ownership, permissions and timestamps while publishing the
+				 * source type, size and backing allocation semantics. */
+				entry->visible_stat.mode =
+					(entry->source_stat.mode & S_IFMT) |
+					(visible_kstat.mode & ~S_IFMT);
+				entry->visible_stat.rdev = entry->source_stat.rdev;
+				entry->visible_stat.size = entry->source_stat.size;
+				entry->visible_stat.blocks = entry->source_stat.blocks;
+				entry->visible_stat.blksize = entry->source_stat.blksize;
+				entry->visible_stat.result_mask |=
+					entry->source_stat.result_mask &
+					(STATX_TYPE | STATX_MODE | STATX_SIZE |
+					 STATX_BLOCKS);
+				entry->visible_stat_valid = true;
+			} else {
+				entry->visible_stat.mode =
+					(entry->source_stat.mode & S_IFMT) |
+					(visible_inode->i_mode & ~S_IFMT);
+				entry->visible_stat.nlink = visible_inode->i_nlink;
+				entry->visible_stat.uid = visible_inode->i_uid;
+				entry->visible_stat.gid = visible_inode->i_gid;
+			}
+		}
+		kasumi_path_put(&visible_path);
+	}
+	entry->visible_stat.ino = entry->visible_ino;
+	entry->visible_stat.dev = entry->visible_dev;
+	if (kasumi_kern_path(source_path, 0, &nofollow_path) == 0) {
+		nofollow_inode = d_inode(nofollow_path.dentry);
+		if (nofollow_inode && S_ISLNK(nofollow_inode->i_mode)) {
+			entry->source_nofollow_path = nofollow_path;
+			kasumi_path_get(&entry->source_nofollow_path);
+			entry->source_nofollow_mode = nofollow_inode->i_mode;
+			memset(&entry->source_nofollow_stat, 0,
+			       sizeof(entry->source_nofollow_stat));
+			if (kasumi_vfs_getattr &&
+			    kasumi_vfs_getattr_unprojected(&nofollow_path,
+					       &entry->source_nofollow_stat,
+					       STATX_BASIC_STATS | STATX_BTIME,
+					       AT_STATX_SYNC_AS_STAT) == 0) {
+				entry->source_nofollow_stat_valid = true;
+			} else {
+				entry->source_nofollow_stat.result_mask =
+					STATX_TYPE | STATX_MODE | STATX_NLINK |
+					STATX_UID | STATX_GID | STATX_INO |
+					STATX_SIZE | STATX_BLOCKS;
+				entry->source_nofollow_stat.dev =
+					nofollow_inode->i_sb ?
+					nofollow_inode->i_sb->s_dev : 0;
+				entry->source_nofollow_stat.ino =
+					nofollow_inode->i_ino;
+				entry->source_nofollow_stat.mode =
+					nofollow_inode->i_mode;
+				entry->source_nofollow_stat.nlink =
+					nofollow_inode->i_nlink;
+				entry->source_nofollow_stat.uid =
+					nofollow_inode->i_uid;
+				entry->source_nofollow_stat.gid =
+					nofollow_inode->i_gid;
+				entry->source_nofollow_stat.size =
+					i_size_read(nofollow_inode);
+				entry->source_nofollow_stat.blocks =
+					nofollow_inode->i_blocks;
+				entry->source_nofollow_stat.blksize =
+					1U << nofollow_inode->i_blkbits;
+				entry->source_nofollow_stat_valid = true;
+			}
+			entry->nofollow_visible_ino = kasumi_vnode_source_ino(
+				nofollow_inode->i_sb ? nofollow_inode->i_sb->s_dev : 0,
+				nofollow_inode->i_ino);
+			entry->nofollow_visible_dev = kasumi_vnode_device();
+			entry->source_nofollow_stat.ino =
+				entry->nofollow_visible_ino;
+			entry->source_nofollow_stat.dev =
+				entry->nofollow_visible_dev;
+			entry->source_nofollow_path_valid = true;
+		}
+		kasumi_path_put(&nofollow_path);
+	}
+	entry->source_path_valid = true;
+	atomic64_inc(&kasumi_vnode_allocated_count);
+	atomic_inc(&kasumi_vnode_live_count);
+	kasumi_path_put(&path);
+	return 0;
+}
+
+void KASUMI_NOCFI kasumi_entry_release_source(struct kasumi_entry *entry)
+{
+	if (!entry || !entry->source_path_valid)
+		return;
+
+	entry->source_path_valid = false;
+	atomic_dec(&kasumi_vnode_live_count);
+	kasumi_path_put(&entry->source_path);
+	memset(&entry->source_path, 0, sizeof(entry->source_path));
+	if (entry->source_nofollow_path_valid) {
+		entry->source_nofollow_path_valid = false;
+		kasumi_path_put(&entry->source_nofollow_path);
+		memset(&entry->source_nofollow_path, 0,
+		       sizeof(entry->source_nofollow_path));
+	}
+	entry->source_inode = NULL;
+}
+
 void kasumi_entry_free_rcu(struct rcu_head *head)
 {
 	struct kasumi_entry *e = container_of(head, struct kasumi_entry, rcu);
 
+	kasumi_entry_release_source(e);
 	kfree(e->src);
 	kfree(e->target);
+	kfree(e->source_canonical);
 	kfree(e);
 }
 
@@ -452,7 +790,6 @@ void kasumi_cleanup_locked(void)
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
 	kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;
-	kasumi_file_view_clear();
 	/* Stop provider calls and release any external module reference. */
 	kasumi_policy_disable_provider_locked();
 
