@@ -1395,6 +1395,15 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 						    &dsrc) == 0) {
 				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino, 0);
 				kasumi_path_put(&dsrc);
+			} else if (S_ISDIR(dh_src_mode) &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
+				/* Slice 4c: a directory-source redirect resolves
+				 * to a Kasumi directory vnode whose lookup/iterate
+				 * delegate to the pinned source dir. */
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino,
+							   KASUMI_VNODE_F_DIR);
+				kasumi_path_put(&dsrc);
 			}
 		}
 

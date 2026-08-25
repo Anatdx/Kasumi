@@ -16,6 +16,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
@@ -39,14 +40,24 @@
 #endif
 
 static const struct inode_operations kasumi_vnode_file_iops;
+static const struct inode_operations kasumi_vnode_dir_iops;
 static const struct file_operations kasumi_vnode_file_fops;
+static const struct file_operations kasumi_vnode_dir_fops;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 static const struct file_operations kasumi_vnode_file_fops_mmap_prepare;
 #endif
 
+/* dir_context actor (filldir_t) returns int pre-6.1, bool since 6.1. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+#define KVN_DIR_ACTOR_RET	bool
+#else
+#define KVN_DIR_ACTOR_RET	int
+#endif
+
 bool kasumi_vnode_is_ours(const struct inode *inode)
 {
-	return inode && inode->i_op == &kasumi_vnode_file_iops;
+	return inode && (inode->i_op == &kasumi_vnode_file_iops ||
+			 inode->i_op == &kasumi_vnode_dir_iops);
 }
 
 void kasumi_vnode_free_info(struct inode *inode)
@@ -313,6 +324,162 @@ static const struct file_operations kasumi_vnode_file_fops_mmap_prepare = {
 };
 #endif
 
+/* ---- directory vnode: lookup/iterate delegate to the pinned source dir ---- */
+
+static int KASUMI_NOCFI kasumi_vnode_dir_open(struct inode *inode,
+					      struct file *file)
+{
+	struct kasumi_vnode_info *info = inode->i_private;
+	struct file *real_dir;
+
+	if (!info || !info->source.dentry)
+		return -ENOTDIR;
+	if (!kasumi_dentry_open)
+		return -EOPNOTSUPP;
+	real_dir = kasumi_dentry_open(&info->source, O_RDONLY | O_DIRECTORY,
+				      file->f_cred);
+	if (IS_ERR(real_dir))
+		return PTR_ERR(real_dir);
+	file->private_data = real_dir;
+	return 0;
+}
+
+struct kasumi_vnode_dir_ctx {
+	struct dir_context ctx;
+	struct dir_context *orig;
+	dev_t source_dev;
+	unsigned long self_ino;
+};
+
+static KVN_DIR_ACTOR_RET KASUMI_NOCFI kasumi_vnode_dir_actor(
+	struct dir_context *ctx, const char *name, int namlen, loff_t offset,
+	u64 ino, unsigned int d_type)
+{
+	struct kasumi_vnode_dir_ctx *dc =
+		container_of(ctx, struct kasumi_vnode_dir_ctx, ctx);
+	KVN_DIR_ACTOR_RET ret;
+	u64 proj;
+
+	/* Project each child's identity so getdents d_ino matches a later stat.
+	 * "." maps to this vnode's own ino; ".." is left as the source value (the
+	 * real parent's identity is projected where that dir is itself virtual);
+	 * everything else goes through the scheme-A projection. */
+	if (namlen == 1 && name[0] == '.')
+		proj = dc->self_ino;
+	else if (namlen == 2 && name[0] == '.' && name[1] == '.')
+		proj = ino;
+	else
+		proj = kasumi_vnode_source_ino(dc->source_dev, ino);
+
+	dc->orig->pos = dc->ctx.pos;
+	ret = dc->orig->actor(dc->orig, name, namlen, offset, proj, d_type);
+	dc->ctx.pos = dc->orig->pos;
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_iterate(struct file *file,
+						 struct dir_context *ctx)
+{
+	struct file *real_dir = file->private_data;
+	struct inode *vi = file_inode(file);
+	struct kasumi_vnode_info *info = vi ? vi->i_private : NULL;
+	struct kasumi_vnode_dir_ctx dc = { .ctx.actor = kasumi_vnode_dir_actor };
+	struct inode *r_inode;
+	int ret;
+
+	if (!real_dir || !info || !info->source.dentry)
+		return -ENOTDIR;
+	r_inode = d_inode(info->source.dentry);
+	dc.source_dev = (r_inode && r_inode->i_sb) ? r_inode->i_sb->s_dev : 0;
+	dc.self_ino = info->v_ino;
+	dc.orig = ctx;
+	/* iterate_dir keeps the cursor in the source dir file's f_pos; drive it
+	 * from the vnode's requested position so rewinddir/seek work, and copy the
+	 * advanced position back out. */
+	real_dir->f_pos = ctx->pos;
+	dc.ctx.pos = ctx->pos;
+	ret = iterate_dir(real_dir, &dc.ctx);
+	ctx->pos = real_dir->f_pos;
+	return ret;
+}
+
+static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
+	struct inode *dir, struct dentry *dentry, unsigned int flags)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct path child = {};
+	struct inode *ci;
+	struct inode *cvi;
+	unsigned long civ;
+	char *name;
+	u8 cflags;
+	int ret;
+
+	(void)flags;
+	if (!info || !info->source.dentry || !info->source.mnt ||
+	    !kasumi_vfs_path_lookup)
+		return ERR_PTR(-ENOENT);
+	if (dentry->d_name.len > NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+	/* A sleeping path-walk callback on a static module op table: pin the module
+	 * so a cooperative unload (prepare_unload's module-refcount gate) cannot
+	 * free our text mid-lookup.  The pin is released before returning, and a
+	 * pin held here keeps prepare_unload from reaching READY. */
+	if (!try_module_get(THIS_MODULE))
+		return ERR_PTR(-ENOENT);
+	name = kstrndup(dentry->d_name.name, dentry->d_name.len, GFP_KERNEL);
+	if (!name) {
+		module_put(THIS_MODULE);
+		return ERR_PTR(-ENOMEM);
+	}
+	/* Resolve the child within the pinned source dir (single component; do not
+	 * follow a final symlink, so lstat/readlink see the link — a symlink child
+	 * becomes a KASUMI_VNODE_F_LNK vnode whose get_link forwards the source). */
+	ret = kasumi_vfs_path_lookup(info->source.dentry, info->source.mnt, name,
+				     0, &child);
+	kfree(name);
+	if (ret) {
+		module_put(THIS_MODULE);
+		if (ret == -ENOENT) {
+			d_add(dentry, NULL);
+			return NULL;
+		}
+		return ERR_PTR(ret);
+	}
+	ci = d_inode(child.dentry);
+	if (!ci) {
+		kasumi_path_put(&child);
+		module_put(THIS_MODULE);
+		d_add(dentry, NULL);
+		return NULL;
+	}
+	cflags = S_ISDIR(ci->i_mode) ? KASUMI_VNODE_F_DIR :
+		 S_ISLNK(ci->i_mode) ? KASUMI_VNODE_F_LNK : 0;
+	civ = kasumi_vnode_source_ino(ci->i_sb ? ci->i_sb->s_dev : 0,
+				      (u64)ci->i_ino);
+	cvi = kasumi_vnode_new(dir->i_sb, &child, civ, ci->i_mode, cflags);
+	kasumi_path_put(&child);
+	module_put(THIS_MODULE);
+	if (!cvi)
+		return ERR_PTR(-ENOMEM);
+	return d_splice_alias(cvi, dentry);
+}
+
+static const struct inode_operations kasumi_vnode_dir_iops = {
+	.lookup = kasumi_vnode_dir_lookup,
+	.getattr = kasumi_vnode_getattr,
+	.listxattr = kasumi_vnode_listxattr,
+};
+
+static const struct file_operations kasumi_vnode_dir_fops = {
+	.owner = THIS_MODULE,
+	.open = kasumi_vnode_dir_open,
+	.release = kasumi_vnode_release,
+	.read = generic_read_dir,
+	.iterate_shared = kasumi_vnode_dir_iterate,
+	.llseek = generic_file_llseek,
+};
+
 /* Clone the source inode's SELinux context onto the vnode's in-core SID, so
  * getxattr(security.selinux) and AVC checks on the vnode report the same label
  * as the source — the last view-consistency axis for a synthetic inode.  Uses
@@ -383,19 +550,30 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 	if (r_inode) {
 		inode->i_size = i_size_read(r_inode);
 		/* Share the source page cache so the generic mmap/read path serves
-		 * source content without a private snapshot. */
-		inode->i_mapping = r_inode->i_mapping;
+		 * source content without a private snapshot.  Directories don't mmap
+		 * and iterate through the pinned source, so keep their own mapping
+		 * and carry the source link count. */
+		if (!S_ISDIR(r_inode->i_mode))
+			inode->i_mapping = r_inode->i_mapping;
+		else
+			set_nlink(inode, r_inode->i_nlink);
 	}
 
-	inode->i_op = &kasumi_vnode_file_iops;
+	if ((flags & KASUMI_VNODE_F_DIR) ||
+	    (r_inode && S_ISDIR(r_inode->i_mode))) {
+		inode->i_op = &kasumi_vnode_dir_iops;
+		inode->i_fop = &kasumi_vnode_dir_fops;
+	} else {
+		inode->i_op = &kasumi_vnode_file_iops;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
-	inode->i_fop = (r_inode && !S_ISLNK(r_inode->i_mode) && r_inode->i_fop &&
-			r_inode->i_fop->mmap_prepare) ?
-			       &kasumi_vnode_file_fops_mmap_prepare :
-			       &kasumi_vnode_file_fops;
+		inode->i_fop = (r_inode && !S_ISLNK(r_inode->i_mode) &&
+				r_inode->i_fop && r_inode->i_fop->mmap_prepare) ?
+				       &kasumi_vnode_file_fops_mmap_prepare :
+				       &kasumi_vnode_file_fops;
 #else
-	inode->i_fop = &kasumi_vnode_file_fops;
+		inode->i_fop = &kasumi_vnode_file_fops;
 #endif
+	}
 	/* Deliberately NOT S_PRIVATE: the vnode must stay LSM-visible so SELinux
 	 * serves security.selinux from the in-core SID we clone below and applies
 	 * AVC using the source's label.  S_PRIVATE would make
