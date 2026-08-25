@@ -135,6 +135,10 @@ struct kasumi_dh_child {
 	u8 flags;
 	u8 hide;			/* 1 = suppress-only: negative lookup, no
 					 * vnode, not emitted in readdir (Slice 2) */
+	u8 lookup_only;			/* 1 = dh serves lookup (vnode) but not
+					 * readdir: the overlay filldir owns emit
+					 * and dedup for this name (Slice 4a merge
+					 * materialized files) */
 	char name[];
 };
 
@@ -375,10 +379,15 @@ static KASUMI_DH_ACTOR_RET KASUMI_NOCFI kasumi_dh_proxy_actor(
 
 	if (p->dir) {
 		u32 hash = full_name_hash(p->dir->dir_inode, name, namelen);
+		struct kasumi_dh_child *c;
 
 		rcu_read_lock();
-		injected = kasumi_dh_find_child(p->dir, name, (u16)namelen,
-						hash) != NULL;
+		c = kasumi_dh_find_child(p->dir, name, (u16)namelen, hash);
+		/* Suppress the real entry only for names dirhijack itself emits
+		 * (inject / hide).  A lookup_only child leaves readdir to the
+		 * overlay filldir, which already emits and dedups the name, so it
+		 * must pass through here untouched. */
+		injected = c && !c->lookup_only;
 		rcu_read_unlock();
 	}
 	if (injected) {
@@ -406,8 +415,9 @@ static void kasumi_dh_emit_children(struct dir_context *ctx,
 		u32 cur;
 		u8 dt;
 
-		if (c->hide)
-			continue;	/* suppress-only: occupies no readdir slot */
+		if (c->hide || c->lookup_only)
+			continue;	/* suppress-only, or readdir owned by the
+					 * overlay filldir: occupies no readdir slot */
 		cur = idx++;
 		if (cur < want)
 			continue;
@@ -659,17 +669,47 @@ static int kasumi_dh_install_sb(struct super_block *sb)
 	return 0;
 }
 
-static struct kasumi_dh_dir *kasumi_dh_install_dir(struct inode *inode)
+/* Install (or, on a dir already carrying our lookup shadow, upgrade to add) the
+ * iterate_shared shadow so readdir runs through kasumi_dh_iterate.  Only inject
+ * and hide children need it; lookup_only (merge) children leave readdir to the
+ * overlay filldir, so their dir is installed iop-only and never gets this shadow
+ * — lookup (i_op) and iterate (i_fop) are independent inode fields, so the two
+ * layers never contend when dirhijack only owns lookup. */
+static void kasumi_dh_install_iterate(struct inode *inode,
+				      struct kasumi_dh_dir *dir)
+{
+	struct kasumi_dh_fop *fop_meta;
+	const struct file_operations *orig_fop;
+
+	if (dir->fop_meta)
+		return;
+	orig_fop = READ_ONCE(inode->i_fop);
+	if (!orig_fop || !orig_fop->iterate_shared)
+		return;
+	fop_meta = kzalloc(sizeof(*fop_meta), GFP_KERNEL);
+	if (!fop_meta)
+		return;
+	fop_meta->fake_fop = *orig_fop;
+	fop_meta->orig_fop = orig_fop;
+	fop_meta->dir = dir;
+	fop_meta->fake_fop.iterate_shared = kasumi_dh_iterate;
+	dir->fop_meta = fop_meta;
+	smp_store_release(&inode->i_fop, &fop_meta->fake_fop);
+}
+
+static struct kasumi_dh_dir *kasumi_dh_install_dir(struct inode *inode,
+						   bool need_iterate)
 {
 	struct kasumi_dh_iop *iop_meta = kasumi_dh_iop_of(inode);
-	struct kasumi_dh_fop *fop_meta = NULL;
 	struct kasumi_dh_iop *im;
 	struct kasumi_dh_dir *dir;
 	const struct inode_operations *orig_iop;
-	const struct file_operations *orig_fop;
 
-	if (iop_meta)
+	if (iop_meta) {
+		if (need_iterate)
+			kasumi_dh_install_iterate(inode, iop_meta->dir);
 		return iop_meta->dir;
+	}
 	orig_iop = inode->i_op;
 	if (!orig_iop || !orig_iop->lookup)
 		return NULL;
@@ -698,21 +738,9 @@ static struct kasumi_dh_dir *kasumi_dh_install_dir(struct inode *inode)
 	im->fake_iop.lookup = kasumi_dh_lookup;
 	dir->iop_meta = im;
 
-	orig_fop = READ_ONCE(inode->i_fop);
-	if (orig_fop && orig_fop->iterate_shared) {
-		fop_meta = kzalloc(sizeof(*fop_meta), GFP_KERNEL);
-		if (fop_meta) {
-			fop_meta->fake_fop = *orig_fop;
-			fop_meta->orig_fop = orig_fop;
-			fop_meta->dir = dir;
-			fop_meta->fake_fop.iterate_shared = kasumi_dh_iterate;
-			dir->fop_meta = fop_meta;
-		}
-	}
-
 	list_add_tail(&dir->list, &kasumi_dh_dirs);
-	if (fop_meta)
-		smp_store_release(&inode->i_fop, &fop_meta->fake_fop);
+	if (need_iterate)
+		kasumi_dh_install_iterate(inode, dir);
 	smp_store_release(&inode->i_op, &im->fake_iop);
 	return dir;
 }
@@ -737,7 +765,8 @@ static void kasumi_dh_child_free(struct kasumi_dh_child *c)
 
 static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 				   u16 len, const struct path *source,
-				   unsigned long v_ino, u8 flags, bool hide)
+				   unsigned long v_ino, u8 flags, bool hide,
+				   bool lookup_only)
 {
 	struct kasumi_dh_child *c, *old;
 	u32 hash = full_name_hash(dir->dir_inode, name, len);
@@ -755,6 +784,7 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	c->name_len = len;
 	c->flags = flags;
 	c->hide = hide ? 1 : 0;
+	c->lookup_only = lookup_only ? 1 : 0;
 	memcpy(c->name, name, len);
 	c->name[len] = '\0';
 
@@ -799,7 +829,8 @@ static int kasumi_dh_split_parent(const char *visible_path, char **parent_out,
 }
 
 static int kasumi_dh_register(const char *visible_path, const struct path *source,
-			      unsigned long v_ino, u8 flags, bool hide)
+			      unsigned long v_ino, u8 flags, bool hide,
+			      bool lookup_only)
 {
 	char *parent = NULL;
 	const char *child = NULL;
@@ -837,13 +868,13 @@ static int kasumi_dh_register(const char *visible_path, const struct path *sourc
 	ret = kasumi_dh_install_sb(ppath.dentry->d_sb);
 	if (ret)
 		goto out;
-	dir = kasumi_dh_install_dir(pinode);
+	dir = kasumi_dh_install_dir(pinode, !lookup_only);
 	if (!dir) {
 		ret = -ENOMEM;
 		goto out;
 	}
 	ret = kasumi_dh_dir_add_child(dir, child, (u16)child_len, source, v_ino,
-				      flags, hide);
+				      flags, hide, lookup_only);
 	if (ret)
 		goto out;
 
@@ -859,8 +890,8 @@ out:
 	mutex_unlock(&kasumi_dh_lock);
 	kasumi_path_put(&ppath);
 	pr_info("Kasumi: dirhijack_%s visible=%s child=%s ret=%d\n",
-		hide ? "hide" : "add", visible_path, child ? child : "(null)",
-		ret);
+		hide ? "hide" : lookup_only ? "shadow" : "add",
+		visible_path, child ? child : "(null)", ret);
 	kfree(parent);
 	return ret;
 }
@@ -868,7 +899,24 @@ out:
 int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
 			 unsigned long v_ino, u8 flags)
 {
-	return kasumi_dh_register(visible_path, source, v_ino, flags, false);
+	return kasumi_dh_register(visible_path, source, v_ino, flags, false,
+				  false);
+}
+
+/*
+ * Register a lookup-only child at @visible_path backed by @source: VFS lookup
+ * resolves it to a Kasumi vnode (open/stat/readlink), but dirhijack does not
+ * touch this dir's readdir — the overlay filldir injection owns emit and dedup
+ * for the name.  Used to sink a merge-materialized file's lookup axis onto the
+ * VFS layer (Slice 4a) so a merge config can reach is_provider without
+ * double-injecting the entry into getdents.  Sleepable context only.
+ */
+int kasumi_dirhijack_add_shadow(const char *visible_path,
+				const struct path *source,
+				unsigned long v_ino, u8 flags)
+{
+	return kasumi_dh_register(visible_path, source, v_ino, flags, false,
+				  true);
 }
 
 /*
@@ -879,7 +927,7 @@ int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
  */
 int kasumi_dirhijack_hide(const char *visible_path)
 {
-	return kasumi_dh_register(visible_path, NULL, 0, 0, true);
+	return kasumi_dh_register(visible_path, NULL, 0, 0, true, false);
 }
 
 int kasumi_dirhijack_del(const char *visible_path)

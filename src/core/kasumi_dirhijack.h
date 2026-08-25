@@ -44,6 +44,17 @@ bool kasumi_dirhijack_is_provider(void);
 int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
 			 unsigned long v_ino, u8 flags);
 
+/*
+ * Register a lookup-only child at @visible_path backed by @source: VFS lookup
+ * resolves it to a Kasumi vnode, but dirhijack does not shadow this dir's
+ * readdir — the overlay filldir injection keeps emitting and deduping the name.
+ * Sinks a merge-materialized file's lookup axis onto the VFS layer (Slice 4a).
+ * Sleepable context only.  Returns 0 or a negative errno.
+ */
+int kasumi_dirhijack_add_shadow(const char *visible_path,
+				const struct path *source,
+				unsigned long v_ino, u8 flags);
+
 /* Remove one registered child (by visible path). */
 int kasumi_dirhijack_del(const char *visible_path);
 

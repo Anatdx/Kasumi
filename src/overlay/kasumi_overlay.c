@@ -50,6 +50,8 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
 #include "kasumi_iop_override.h"
+#include "kasumi_dirhijack.h"
+#include "kasumi_vnode.h"
 /* ======================================================================
  * Part 10: Inject Rule Helper
  * ====================================================================== */
@@ -415,6 +417,33 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 							(void)kasumi_iop_mark_spoof(d_inode(p.dentry));
 						}
 						kasumi_path_put(&p);
+					}
+				}
+				/* Slice 4a: sink this materialized file's lookup axis
+				 * onto dirhijack as a lookup-only child so a merge
+				 * config can reach is_provider; readdir stays with the
+				 * overlay filldir injection.  Mirror the ADD_RULE gate:
+				 * a symlink target registers a symlink vnode (nofollow),
+				 * otherwise a regular vnode. */
+				if (kasumi_dirhijack_enabled() && kasumi_kern_path) {
+					struct path dsrc;
+
+					if (e->source_nofollow_path_valid &&
+					    kasumi_kern_path(tgt, 0, &dsrc) == 0) {
+						struct inode *di = d_inode(dsrc.dentry);
+
+						if (di && S_ISLNK(di->i_mode))
+							(void)kasumi_dirhijack_add_shadow(
+								src, &dsrc,
+								e->nofollow_visible_ino,
+								KASUMI_VNODE_F_LNK);
+						kasumi_path_put(&dsrc);
+					} else if (S_ISREG(e->source_mode) &&
+						   kasumi_kern_path(tgt, LOOKUP_FOLLOW,
+								    &dsrc) == 0) {
+						(void)kasumi_dirhijack_add_shadow(
+							src, &dsrc, e->visible_ino, 0);
+						kasumi_path_put(&dsrc);
 					}
 				}
 			} else {
