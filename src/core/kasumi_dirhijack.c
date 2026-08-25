@@ -61,6 +61,13 @@ MODULE_PARM_DESC(kasumi_dirhijack_force,
 		 "DBG: bypass view-target gating so any observer sees virtual nodes (test only)");
 
 /*
+ * Count of registered virtual children across all hijacked dirs.  Used by
+ * kasumi_dirhijack_is_provider() to decide whether dirhijack has taken
+ * responsibility for every active view rule (parity-then-flip safety gate).
+ */
+static atomic_t kasumi_dh_child_count = ATOMIC_INIT(0);
+
+/*
  * readdir cookie tag.  Virtual children are emitted after the real entries at
  * positions carrying a signature in the high bits.  NOTE: like nomount, this
  * leaves a getdents d_off distinguishable from native cookies — the one
@@ -121,11 +128,13 @@ struct kasumi_dh_sop {
 struct kasumi_dh_child {
 	struct hlist_node node;
 	struct rcu_head rcu;
-	struct path source;		/* pinned; {NULL} for a virtual dir */
+	struct path source;		/* pinned; {NULL} for a hide or virtual dir */
 	unsigned long v_ino;
 	u32 name_hash;
 	u16 name_len;
 	u8 flags;
+	u8 hide;			/* 1 = suppress-only: negative lookup, no
+					 * vnode, not emitted in readdir (Slice 2) */
 	char name[];
 };
 
@@ -146,6 +155,29 @@ static void kasumi_dh_set_dentry_ops(struct dentry *dentry);
 bool kasumi_dirhijack_enabled(void)
 {
 	return READ_ONCE(kasumi_dh_ready) && READ_ONCE(kasumi_dirhijack_param);
+}
+
+/*
+ * True only when dirhijack has registered a child for every active view rule,
+ * i.e. it can serve the whole ruleset through VFS lookup so TSR is not needed
+ * as the view transport.  Conservative: dirhijack registers at most one child
+ * per serviceable redirect (S_ISREG source, real parent) and at most one child
+ * per hide (real parent), so child_count can only reach tsr_path_count+hide_count
+ * when every redirect AND every hide was registered.  Any uncovered class
+ * (non-regular redirect source, overlay-materialized redirect that bypasses
+ * dirhijack_add, merge, unresolved parent, failed add) leaves child_count short
+ * -> not a provider -> TSR is kept (no regression).
+ */
+bool kasumi_dirhijack_is_provider(void)
+{
+	unsigned int view_rules;
+
+	if (!kasumi_dirhijack_enabled())
+		return false;
+	view_rules = (unsigned int)atomic_read(&kasumi_tsr_path_count) +
+		     (unsigned int)atomic_read(&kasumi_hide_count);
+	return view_rules > 0 &&
+	       (unsigned int)atomic_read(&kasumi_dh_child_count) >= view_rules;
 }
 
 /* ---- meta accessors ---------------------------------------------------- */
@@ -207,6 +239,10 @@ static bool kasumi_dh_current_sees(void)
 		return false;
 	if (READ_ONCE(kasumi_dirhijack_force))
 		return true;
+	/* Only serve once dirhijack covers the whole ruleset (sole provider);
+	 * while TSR still handles a residue class, do not double-project. */
+	if (!kasumi_dirhijack_is_provider())
+		return false;
 	return kasumi_policy_current_is_view_target();
 }
 
@@ -224,6 +260,7 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 	umode_t mode = S_IFREG | 0644;
 	u8 cflags = 0;
 	bool found = false;
+	bool is_hide = false;
 
 	if (!m || !dn || !kasumi_dh_current_sees())
 		goto orig;
@@ -240,16 +277,30 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 		}
 		v_ino = c->v_ino;
 		cflags = c->flags;
+		is_hide = c->hide;
 		found = true;
 	}
 	rcu_read_unlock();
 
 	if (found) {
-		struct inode *vi = kasumi_vnode_new(dir->i_sb,
-						    source.dentry ? &source : NULL,
-						    v_ino, mode, cflags);
+		struct inode *vi;
 		struct dentry *res;
 
+		if (is_hide) {
+			/* Hidden for this observer: confirm a negative dentry so
+			 * the name resolves to -ENOENT.  Never call the real
+			 * lookup (it would surface the hidden inode) and never
+			 * mint a vnode (a hide has no source).  Our d_op makes a
+			 * non-seeing observer re-resolve to the real entry. */
+			if (source.dentry)
+				kasumi_path_put(&source);
+			kasumi_dh_set_dentry_ops(dentry);
+			d_add(dentry, NULL);
+			return NULL;
+		}
+		vi = kasumi_vnode_new(dir->i_sb,
+				      source.dentry ? &source : NULL,
+				      v_ino, mode, cflags);
 		if (source.dentry)
 			kasumi_path_put(&source);
 		if (vi) {
@@ -352,9 +403,12 @@ static void kasumi_dh_emit_children(struct dir_context *ctx,
 		ctx->pos = kasumi_dh_pack_pos(0);
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(c, &dir->children, node) {
-		u32 cur = idx++;
+		u32 cur;
 		u8 dt;
 
+		if (c->hide)
+			continue;	/* suppress-only: occupies no readdir slot */
+		cur = idx++;
 		if (cur < want)
 			continue;
 		ctx->pos = kasumi_dh_pack_pos(cur);
@@ -419,7 +473,9 @@ static int KASUMI_NOCFI kasumi_dh_revalidate_inner(struct inode *dir,
 	struct kasumi_dh_dir *dn;
 	struct inode *inode;
 	bool is_virtual;
-	bool rule_visible = false;
+	bool governed = false;
+	bool child_hide = false;
+	bool sees;
 
 	if (!dir)
 		return 1;
@@ -427,27 +483,55 @@ static int KASUMI_NOCFI kasumi_dh_revalidate_inner(struct inode *dir,
 	dn = m ? READ_ONCE(m->dir) : NULL;
 	inode = READ_ONCE(dentry->d_inode);
 	is_virtual = inode && kasumi_vnode_is_ours(inode);
+	sees = dn && kasumi_dh_current_sees();
 
-	if (dn && kasumi_dh_current_sees()) {
+	if (dn) {
+		struct kasumi_dh_child *c;
+
 		rcu_read_lock();
-		rule_visible = kasumi_dh_find_child(dn, name->name,
-						    (u16)name->len,
-						    full_name_hash(dir, name->name,
-								   name->len)) != NULL;
+		c = kasumi_dh_find_child(dn, name->name, (u16)name->len,
+					 full_name_hash(dir, name->name,
+							name->len));
+		if (c) {
+			governed = true;
+			child_hide = c->hide;
+		}
 		rcu_read_unlock();
 	}
 
-	/* A virtual dentry is valid iff the current observer's rule still makes
-	 * it visible.  A cached real/negative dentry is valid unless a rule now
-	 * injects this name for the current observer, in which case it must be
-	 * re-resolved so the shadow lookup runs and yields the virtual inode.
-	 * Correctly-hidden negatives are kept as-is (no d_drop / -ECHILD churn),
-	 * so a hidden name stays indistinguishable from a genuinely absent one
-	 * and the decision is rcu-walk safe (only 0/1, never sleeps). */
 	(void)flags;
-	if (is_virtual)
-		return rule_visible ? 1 : 0;
-	return rule_visible ? 0 : 1;
+
+	/*
+	 * Decide, per current observer, whether the cached dentry still matches
+	 * what a fresh lookup would yield; return 0 to force re-resolution.  Only
+	 * 0/1 is returned and nothing sleeps, so this is rcu-walk safe.
+	 *
+	 * Not governed: no rule touches this name.  Keep a real/negative dentry;
+	 * invalidate a stale virtual left by a since-deleted rule so the name
+	 * drops back to its real entry.
+	 *
+	 * Inject rule: a seeing observer must resolve to the virtual inode, so a
+	 * cached real/negative is stale; a non-seeing observer must resolve to
+	 * the real entry, so a cached virtual is stale.
+	 *
+	 * Hide rule: a seeing observer must resolve to a negative (hidden), so a
+	 * cached real or virtual dentry is stale; a non-seeing observer (e.g.
+	 * root) must resolve to the real entry, so a negative cached by a seeing
+	 * observer -- and any stray virtual -- is stale.  This is the §5.2
+	 * cross-observer mirror: a correctly hidden negative must not leak to an
+	 * observer the rule does not target, which still has to see the file.
+	 */
+	if (!governed)
+		return is_virtual ? 0 : 1;
+	if (!child_hide) {				/* inject */
+		if (sees)
+			return is_virtual ? 1 : 0;
+		return is_virtual ? 0 : 1;
+	}
+	/* hide */
+	if (sees)
+		return !inode ? 1 : 0;			/* valid iff negative */
+	return (inode && !is_virtual) ? 1 : 0;		/* valid iff positive-real */
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
@@ -652,7 +736,7 @@ static void kasumi_dh_child_free(struct kasumi_dh_child *c)
 
 static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 				   u16 len, const struct path *source,
-				   unsigned long v_ino, u8 flags)
+				   unsigned long v_ino, u8 flags, bool hide)
 {
 	struct kasumi_dh_child *c, *old;
 	u32 hash = full_name_hash(dir->dir_inode, name, len);
@@ -669,6 +753,7 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	c->name_hash = hash;
 	c->name_len = len;
 	c->flags = flags;
+	c->hide = hide ? 1 : 0;
 	memcpy(c->name, name, len);
 	c->name[len] = '\0';
 
@@ -680,6 +765,8 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	spin_unlock(&dir->lock);
 	if (old)
 		call_rcu(&old->rcu, kasumi_dh_child_free_rcu);
+	else
+		atomic_inc(&kasumi_dh_child_count);
 	return 0;
 }
 
@@ -710,8 +797,8 @@ static int kasumi_dh_split_parent(const char *visible_path, char **parent_out,
 	return 0;
 }
 
-int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
-			 unsigned long v_ino, u8 flags)
+static int kasumi_dh_register(const char *visible_path, const struct path *source,
+			      unsigned long v_ino, u8 flags, bool hide)
 {
 	char *parent = NULL;
 	const char *child = NULL;
@@ -755,7 +842,7 @@ int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
 		goto out;
 	}
 	ret = kasumi_dh_dir_add_child(dir, child, (u16)child_len, source, v_ino,
-				      flags);
+				      flags, hide);
 	if (ret)
 		goto out;
 
@@ -770,10 +857,28 @@ int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
 out:
 	mutex_unlock(&kasumi_dh_lock);
 	kasumi_path_put(&ppath);
-	pr_info("Kasumi: dirhijack_add visible=%s child=%s ret=%d\n",
-		visible_path, child ? child : "(null)", ret);
+	pr_info("Kasumi: dirhijack_%s visible=%s child=%s ret=%d\n",
+		hide ? "hide" : "add", visible_path, child ? child : "(null)",
+		ret);
 	kfree(parent);
 	return ret;
+}
+
+int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
+			 unsigned long v_ino, u8 flags)
+{
+	return kasumi_dh_register(visible_path, source, v_ino, flags, false);
+}
+
+/*
+ * Register a suppress-only child at @visible_path: VFS lookup returns a negative
+ * dentry (-ENOENT) and readdir omits the name for view-target observers, while
+ * non-target observers keep resolving the real entry.  Sinks a hide rule off
+ * the TSR path routes.  Sleepable context only.  Returns 0 or a negative errno.
+ */
+int kasumi_dirhijack_hide(const char *visible_path)
+{
+	return kasumi_dh_register(visible_path, NULL, 0, 0, true);
 }
 
 int kasumi_dirhijack_del(const char *visible_path)
@@ -808,8 +913,29 @@ int kasumi_dirhijack_del(const char *visible_path)
 		if (c)
 			hlist_del_rcu(&c->node);
 		spin_unlock(&m->dir->lock);
-		if (c)
+		if (c) {
 			call_rcu(&c->rcu, kasumi_dh_child_free_rcu);
+			atomic_dec(&kasumi_dh_child_count);
+		}
+	}
+	if (c) {
+		/* Drop any dentry cached under this name so the next resolution
+		 * runs the now child-free real lookup.  Essential for a hide: the
+		 * cached negative that made the name -ENOENT for a view observer
+		 * must be dropped, else the name stays "hidden" after its rule is
+		 * gone (revalidate treats an ungoverned negative as a genuine
+		 * absence and keeps it). */
+		struct qstr qname;
+		struct dentry *cached;
+
+		qname.name = child;
+		qname.len = (u32)child_len;
+		qname.hash = full_name_hash(ppath.dentry, child, child_len);
+		cached = d_lookup(ppath.dentry, &qname);
+		if (cached) {
+			d_drop(cached);
+			dput(cached);
+		}
 	}
 	mutex_unlock(&kasumi_dh_lock);
 	kasumi_path_put(&ppath);
@@ -873,6 +999,9 @@ void kasumi_dirhijack_clear(void)
 
 	/* Cover any per-child call_rcu() still pending from kasumi_dirhijack_del(). */
 	rcu_barrier();
+
+	/* Phase 3 freed every child directly (no per-child dec); reset the count. */
+	atomic_set(&kasumi_dh_child_count, 0);
 }
 
 int kasumi_dirhijack_init(void)

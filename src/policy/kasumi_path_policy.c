@@ -793,10 +793,14 @@ KASUMI_NOCFI bool kasumi_policy_uid_is_spoof_target(uid_t uid)
 
 bool kasumi_policy_view_tsr_demand(void)
 {
-	/* When the Tier 3 lookup hijack is enabled it serves the path view through
-	 * VFS lookup, so TSR is not required as the view transport.  Decouple the
-	 * enable/reconcile path from TSR in that mode. */
-	if (kasumi_dirhijack_enabled())
+	/* When the Tier 3 lookup hijack has taken responsibility for every active
+	 * view rule (is_provider), it serves the path view through VFS lookup and
+	 * TSR is not required as the view transport.  Until then — a mixed ruleset
+	 * with a class dirhijack cannot serve yet — keep demanding TSR so the
+	 * residue is never dropped (parity-then-flip: no regression before parity).
+	 * The virtual_file_live()==0 guard avoids dropping TSR while pre-existing
+	 * TSR virtual files are still draining during a live transition. */
+	if (kasumi_dirhijack_is_provider() && kasumi_virtual_file_live() == 0)
 		return false;
 	return atomic_read(&kasumi_tsr_path_count) > 0 ||
 	       atomic_read(&kasumi_hide_count) > 0 ||

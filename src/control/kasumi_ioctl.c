@@ -1492,6 +1492,15 @@ add_rule_done:
 			kasumi_mark_dir_has_inject(parent_dir);
 			kasumi_add_inject_rule(parent_dir);
 		}
+
+		/* Tier 3: when the lookup hijack is enabled, register this hidden
+		 * path so VFS lookup returns a negative dentry and readdir omits it
+		 * for view observers — sinking the hide off the TSR path routes.
+		 * Called regardless of the "already present" fast path so a hide
+		 * issued before dirhijack was enabled re-syncs its child; add_child
+		 * is idempotent. */
+		if (kasumi_dirhijack_enabled())
+			(void)kasumi_dirhijack_hide(src);
 		break;
 	}
 
