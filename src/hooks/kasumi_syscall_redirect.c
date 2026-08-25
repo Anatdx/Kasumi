@@ -2247,35 +2247,14 @@ static long h_lgetxattr(const struct pt_regs *regs)
 }
 #endif
 
-#ifdef __NR_fgetxattr
-static long h_fgetxattr(const struct pt_regs *regs)
-{
-	const char __user *name_user;
-	void __user *value_user;
-	struct path source;
-	unsigned int fd;
-	size_t size;
-	long ret;
-
-#if defined(__aarch64__)
-	fd = (unsigned int)regs->regs[0];
-	name_user = (const char __user *)(uintptr_t)regs->regs[1];
-	value_user = (void __user *)(uintptr_t)regs->regs[2];
-	size = (size_t)regs->regs[3];
-#else
-	fd = (unsigned int)regs->di;
-	name_user = (const char __user *)(uintptr_t)regs->si;
-	value_user = (void __user *)(uintptr_t)regs->dx;
-	size = (size_t)regs->r10;
-#endif
-	if (!kasumi_virtual_file_get_source_fd(fd, &source))
-		return kasumi_call_original(__NR_fgetxattr, regs);
-	atomic64_inc(&kasumi_virtual_xattr_handled_count);
-	ret = kasumi_getxattr_to_user(&source, name_user, value_user, size);
-	kasumi_path_put(&source);
-	return ret;
-}
-#endif
+/*
+ * fgetxattr/flistxattr/fsetxattr/fremovexattr are intentionally NOT TSR routes.
+ * A virtual descriptor adopts the captured source inode and mount (see
+ * kasumi_virtual_adopt_real_file), so the ordinary VFS fd xattr path already
+ * dispatches on exactly the (dentry, mnt) these handlers used to forward to.
+ * Serving them at the syscall boundary duplicated that work and left an extra
+ * observable route; the VFS layer produces identical results with no seam.
+ */
 
 #ifdef __NR_listxattr
 static long do_listxattr(const struct pt_regs *regs, int nr)
@@ -2333,32 +2312,7 @@ static long h_llistxattr(const struct pt_regs *regs)
 }
 #endif
 
-#ifdef __NR_flistxattr
-static long h_flistxattr(const struct pt_regs *regs)
-{
-	char __user *list_user;
-	struct path source;
-	unsigned int fd;
-	size_t size;
-	long ret;
-
-#if defined(__aarch64__)
-	fd = (unsigned int)regs->regs[0];
-	list_user = (char __user *)(uintptr_t)regs->regs[1];
-	size = (size_t)regs->regs[2];
-#else
-	fd = (unsigned int)regs->di;
-	list_user = (char __user *)(uintptr_t)regs->si;
-	size = (size_t)regs->dx;
-#endif
-	if (!kasumi_virtual_file_get_source_fd(fd, &source))
-		return kasumi_call_original(__NR_flistxattr, regs);
-	atomic64_inc(&kasumi_virtual_xattr_handled_count);
-	ret = kasumi_listxattr_to_user(&source, list_user, size);
-	kasumi_path_put(&source);
-	return ret;
-}
-#endif
+/* flistxattr: not a TSR route; served by VFS via the adopted inode (see above). */
 
 #ifdef __NR_setxattr
 static long do_setxattr(const struct pt_regs *regs, int nr)
@@ -2423,39 +2377,7 @@ static long h_lsetxattr(const struct pt_regs *regs)
 }
 #endif
 
-#ifdef __NR_fsetxattr
-static long h_fsetxattr(const struct pt_regs *regs)
-{
-	const char __user *name_user;
-	const void __user *value_user;
-	struct path source;
-	unsigned int fd;
-	size_t size;
-	int flags;
-	long ret;
-
-#if defined(__aarch64__)
-	fd = (unsigned int)regs->regs[0];
-	name_user = (const char __user *)(uintptr_t)regs->regs[1];
-	value_user = (const void __user *)(uintptr_t)regs->regs[2];
-	size = (size_t)regs->regs[3];
-	flags = (int)regs->regs[4];
-#else
-	fd = (unsigned int)regs->di;
-	name_user = (const char __user *)(uintptr_t)regs->si;
-	value_user = (const void __user *)(uintptr_t)regs->dx;
-	size = (size_t)regs->r10;
-	flags = (int)regs->r8;
-#endif
-	if (!kasumi_virtual_file_get_source_fd(fd, &source))
-		return kasumi_call_original(__NR_fsetxattr, regs);
-	atomic64_inc(&kasumi_virtual_xattr_handled_count);
-	ret = kasumi_setxattr_from_user(&source, name_user, value_user, size,
-				       flags);
-	kasumi_path_put(&source);
-	return ret;
-}
-#endif
+/* fsetxattr: not a TSR route; served by VFS via the adopted inode (see above). */
 
 #ifdef __NR_removexattr
 static long do_removexattr(const struct pt_regs *regs, int nr)
@@ -2510,29 +2432,7 @@ static long h_lremovexattr(const struct pt_regs *regs)
 }
 #endif
 
-#ifdef __NR_fremovexattr
-static long h_fremovexattr(const struct pt_regs *regs)
-{
-	const char __user *name_user;
-	struct path source;
-	unsigned int fd;
-	long ret;
-
-#if defined(__aarch64__)
-	fd = (unsigned int)regs->regs[0];
-	name_user = (const char __user *)(uintptr_t)regs->regs[1];
-#else
-	fd = (unsigned int)regs->di;
-	name_user = (const char __user *)(uintptr_t)regs->si;
-#endif
-	if (!kasumi_virtual_file_get_source_fd(fd, &source))
-		return kasumi_call_original(__NR_fremovexattr, regs);
-	atomic64_inc(&kasumi_virtual_xattr_handled_count);
-	ret = kasumi_removexattr_from_user(&source, name_user);
-	kasumi_path_put(&source);
-	return ret;
-}
-#endif
+/* fremovexattr: not a TSR route; served by VFS via the adopted inode (see above). */
 
 /* ---- Init / exit ------------------------------------------------------- */
 
@@ -2648,17 +2548,11 @@ int kasumi_syscall_redirect_init(void)
 #ifdef __NR_lgetxattr
 		kasumi_add_syscall_hook_counted(__NR_lgetxattr, h_lgetxattr, &n);
 #endif
-#ifdef __NR_fgetxattr
-		kasumi_add_syscall_hook_counted(__NR_fgetxattr, h_fgetxattr, &n);
-#endif
 #ifdef __NR_listxattr
 		kasumi_add_syscall_hook_counted(__NR_listxattr, h_listxattr, &n);
 #endif
 #ifdef __NR_llistxattr
 		kasumi_add_syscall_hook_counted(__NR_llistxattr, h_llistxattr, &n);
-#endif
-#ifdef __NR_flistxattr
-		kasumi_add_syscall_hook_counted(__NR_flistxattr, h_flistxattr, &n);
 #endif
 #ifdef __NR_setxattr
 		kasumi_add_syscall_hook_counted(__NR_setxattr, h_setxattr, &n);
@@ -2666,18 +2560,11 @@ int kasumi_syscall_redirect_init(void)
 #ifdef __NR_lsetxattr
 		kasumi_add_syscall_hook_counted(__NR_lsetxattr, h_lsetxattr, &n);
 #endif
-#ifdef __NR_fsetxattr
-		kasumi_add_syscall_hook_counted(__NR_fsetxattr, h_fsetxattr, &n);
-#endif
 #ifdef __NR_removexattr
 		kasumi_add_syscall_hook_counted(__NR_removexattr, h_removexattr, &n);
 #endif
 #ifdef __NR_lremovexattr
 		kasumi_add_syscall_hook_counted(__NR_lremovexattr, h_lremovexattr, &n);
-#endif
-#ifdef __NR_fremovexattr
-		kasumi_add_syscall_hook_counted(__NR_fremovexattr,
-					  h_fremovexattr, &n);
 #endif
 	}
 
