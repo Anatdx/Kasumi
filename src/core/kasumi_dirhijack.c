@@ -23,8 +23,9 @@
  * Scope (v1): inject a virtual *file* into an existing real directory.  Nested
  * pure-virtual directory topology is not built here.
  *
- * DEFAULT-OFF (kasumi_dirhijack=0).  Behaviour-critical dcache code; enable
- * only with on-device validation.
+ * DEFAULT-ON (kasumi_dirhijack=1): the VFS lookup layer is the production path
+ * view transport, and the coverage gate keeps TSR as a live fallback for any
+ * rule class it cannot yet serve.  Set kasumi_dirhijack=0 to force legacy TSR.
  *
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
@@ -50,10 +51,10 @@
 #include "kasumi_runtime.h"
 #include "kasumi_vnode.h"
 
-static int kasumi_dirhijack_param;
+static int kasumi_dirhijack_param = 1;
 module_param_named(kasumi_dirhijack, kasumi_dirhijack_param, int, 0600);
 MODULE_PARM_DESC(kasumi_dirhijack,
-		 "DBG/WIP: enable Tier 3 parent-dir lookup/iterate hijack (default 0)");
+		 "Serve the path view through the VFS lookup layer, retiring the TSR path routes once every active view rule is covered (default 1); set 0 to force the legacy TSR transport");
 
 static int kasumi_dirhijack_force;
 module_param_named(kasumi_dirhijack_force, kasumi_dirhijack_force, int, 0600);

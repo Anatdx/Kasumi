@@ -9,8 +9,9 @@
  * super_operations->destroy_inode on the same superblock reclaims virtual
  * inode state on eviction.
  *
- * DEFAULT-OFF: nothing installs unless kasumi_dirhijack is explicitly enabled.
- * This is behaviour-critical dcache code; enable only with on-device validation.
+ * DEFAULT-ON (kasumi_dirhijack=1): the production path-view transport.  The
+ * coverage gate keeps TSR as a live fallback for any class not yet served, and
+ * kasumi_dirhijack=0 forces the legacy TSR routes.
  *
  * License: Author's work under Apache-2.0; when used as a kernel module
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
