@@ -660,6 +660,20 @@ int KASUMI_NOCFI kasumi_entry_capture_source(struct kasumi_entry *entry,
 		return -ENOENT;
 	}
 
+	/* A character or block device source has no vnode path: the redirect's
+	 * synthetic inode lives on the visible parent's real (nodev) superblock,
+	 * and may_open_dev() refuses to open a device node there (-EACCES), so
+	 * only the retired anon-fd route could ever have served it.  Reject the
+	 * source at install time rather than admitting a rule that would silently
+	 * demand the TSR fallback; the errno surfaces to userspace unchanged. */
+	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
+		pr_warn("Kasumi: rejecting %s-device source '%s': device-node redirects are unsupported\n",
+			S_ISCHR(inode->i_mode) ? "character" : "block",
+			source_path);
+		kasumi_path_put(&path);
+		return -EOPNOTSUPP;
+	}
+
 	entry->source_path = path;
 	kasumi_path_get(&entry->source_path);
 	if (kasumi_d_absolute_path) {
