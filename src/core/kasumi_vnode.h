@@ -27,6 +27,7 @@
 #define KASUMI_VNODE_F_DIR		(1u << 0)  /* node is a directory */
 #define KASUMI_VNODE_F_VIRTUAL_DIR	(1u << 1)  /* synthesized dir, no source */
 #define KASUMI_VNODE_F_LNK		(1u << 2)  /* node is a symlink */
+#define KASUMI_VNODE_F_SPECIAL		(1u << 3)  /* char/blk/fifo source wrapper */
 
 /*
  * Per virtual inode state, stored in inode->i_private.  @source is a pinned
@@ -45,6 +46,12 @@ struct kasumi_vnode_info {
 	 * inode that has no on-disk security.capability).  @has_caps gates it. */
 	bool has_caps;
 	struct cpu_vfs_cap_data caps;
+	/* For a char/blk/fifo source wrapper (KASUMI_VNODE_F_SPECIAL): the vnode
+	 * inode is minted S_IFREG so it passes may_open_dev on a nodev visible
+	 * mount and uses our special fops, but stat must present the source's real
+	 * type and rdev.  0 when the node is not a special wrapper. */
+	umode_t special_mode;
+	dev_t special_rdev;
 };
 
 /*

@@ -376,6 +376,7 @@ int kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;
 int kasumi_statfs_kretprobe_registered;
 int kasumi_fscap_kretprobe_registered;
 int kasumi_fscaps_enabled = 1;
+int kasumi_device_sources_enabled = 1;
 int kasumi_reboot_kprobe_registered;
 bool kasumi_vfs_use_ftrace;
 
@@ -396,6 +397,8 @@ int (*kasumi_notify_change)(struct user_namespace *, struct dentry *,
 int (*kasumi_notify_change)(struct dentry *, struct iattr *, struct inode **);
 #endif
 struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
+ssize_t (*kasumi_vfs_read)(struct file *, char __user *, size_t, loff_t *);
+ssize_t (*kasumi_vfs_write)(struct file *, const char __user *, size_t, loff_t *);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 int (*kasumi_get_vfs_caps_from_disk)(struct mnt_idmap *, const struct dentry *,
 				     struct cpu_vfs_cap_data *);
@@ -666,22 +669,24 @@ int KASUMI_NOCFI kasumi_entry_capture_source(struct kasumi_entry *entry,
 		return -ENOENT;
 	}
 
-	/* A source with no vnode path cannot be served once the anon-fd TSR route
-	 * is retired: a char/blk device node is unopenable on the visible parent's
-	 * real (nodev) superblock (may_open_dev -> -EACCES), and a fifo/socket
-	 * source has no delegating vnode form (a S_ISFIFO vnode would route to the
-	 * pipe ops, a socket inode cannot be opened).  The dirhijack registration
-	 * gate mints a child only for S_ISLNK/S_ISREG/S_ISDIR sources, so anything
-	 * else is served exclusively by the anon-fd TSR fallback.  Reject such a
-	 * source at install rather than admit a rule that would demand the TSR
-	 * fallback; the errno surfaces to userspace unchanged. */
-	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
-	    S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+	/* char/blk/fifo sources are served by a KASUMI_VNODE_F_SPECIAL wrapper: the
+	 * vnode is minted S_IFREG (so it passes may_open_dev on the visible nodev
+	 * mount) while its .open delegates to the pinned source via dentry_open
+	 * (which bypasses may_open), and getattr projects the real type+rdev.  A
+	 * socket has no openable form (sock_no_open -> -ENXIO on the real source
+	 * too), so it is always rejected.  When device-source support is disabled,
+	 * reject all four rather than admit a rule with no working transport. */
+	if (S_ISSOCK(inode->i_mode) ||
+	    (!kasumi_device_sources_enabled &&
+	     (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
+	      S_ISFIFO(inode->i_mode)))) {
 		const char *kind = S_ISCHR(inode->i_mode) ? "character-device" :
 				   S_ISBLK(inode->i_mode) ? "block-device" :
 				   S_ISFIFO(inode->i_mode) ? "fifo" : "socket";
-		pr_warn("Kasumi: rejecting %s source '%s': only regular-file, directory and symlink sources have a vnode path\n",
-			kind, source_path);
+		pr_warn("Kasumi: rejecting %s source '%s': %s\n", kind, source_path,
+			S_ISSOCK(inode->i_mode) ?
+				"a socket has no openable vnode form" :
+				"char/blk/fifo source support is disabled");
 		kasumi_path_put(&path);
 		return -EOPNOTSUPP;
 	}

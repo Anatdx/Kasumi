@@ -125,6 +125,7 @@ extern int kasumi_mount_hide_mode;
 extern int kasumi_statfs_kretprobe_registered;
 extern int kasumi_fscap_kretprobe_registered;
 extern int kasumi_fscaps_enabled;
+extern int kasumi_device_sources_enabled;
 extern int kasumi_reboot_kprobe_registered;
 extern bool kasumi_vfs_use_ftrace;
 extern dev_t kasumi_system_dev;
@@ -167,6 +168,12 @@ extern int (*kasumi_get_vfs_caps_from_disk)(const struct dentry *,
 int kasumi_source_vfs_caps(const struct path *src,
 			   struct cpu_vfs_cap_data *out);
 extern struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
+/* Data-plane delegates for a char/blk/fifo source wrapper's special fops.
+ * Stable signatures across all supported KMIs; NULL disables special read/write
+ * (the op returns -EINVAL). */
+extern ssize_t (*kasumi_vfs_read)(struct file *, char __user *, size_t, loff_t *);
+extern ssize_t (*kasumi_vfs_write)(struct file *, const char __user *, size_t,
+				   loff_t *);
 extern char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 extern char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 extern char *(*kasumi_d_path)(const struct path *, char *, int);

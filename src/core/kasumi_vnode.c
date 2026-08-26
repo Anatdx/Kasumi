@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
+#include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <linux/version.h>
@@ -149,6 +150,12 @@ static int KASUMI_NOCFI kasumi_vnode_getattr(KVN_IDMAP_ARG const struct path *pa
 #endif
 		stat->ino = info->v_ino;
 		stat->dev = vi->i_sb->s_dev;
+		/* A special (char/blk/fifo) wrapper is minted S_IFREG; present the
+		 * source's real type and rdev even on this source-less fallback. */
+		if (info->special_mode) {
+			stat->mode = (stat->mode & 07777) | (info->special_mode & S_IFMT);
+			stat->rdev = info->special_rdev;
+		}
 		return 0;
 	}
 
@@ -428,6 +435,94 @@ static const struct file_operations kasumi_vnode_file_fops_mmap_prepare = {
 	.fsync = kasumi_vnode_fsync,
 };
 #endif
+
+/* ---- special vnode: char/blk/fifo source, full fop delegation --------------
+ *
+ * The inode is minted S_IFREG (kasumi_vnode_new) so path_openat's may_open does
+ * not apply the device (may_open_dev) check on the nodev visible mount; .open
+ * (kasumi_vnode_open) then opens the *real* source via dentry_open, which routes
+ * through chrdev_open/blkdev/fifo_open and bypasses may_open entirely.  Read,
+ * write, poll, mmap, ioctl and fasync forward to that real file.  getattr still
+ * projects the source's real type and rdev, so userspace sees a device/fifo.
+ */
+static ssize_t KASUMI_NOCFI kasumi_vnode_special_read(struct file *file,
+						      char __user *buf,
+						      size_t len, loff_t *ppos)
+{
+	struct file *real = file->private_data;
+
+	if (!real || !kasumi_vfs_read)
+		return -EINVAL;
+	return kasumi_vfs_read(real, buf, len, ppos);
+}
+
+static ssize_t KASUMI_NOCFI kasumi_vnode_special_write(struct file *file,
+						       const char __user *buf,
+						       size_t len, loff_t *ppos)
+{
+	struct file *real = file->private_data;
+
+	if (!real || !kasumi_vfs_write)
+		return -EINVAL;
+	return kasumi_vfs_write(real, buf, len, ppos);
+}
+
+static __poll_t KASUMI_NOCFI kasumi_vnode_special_poll(struct file *file,
+						       struct poll_table_struct *wait)
+{
+	struct file *real = file->private_data;
+
+	if (!real)
+		return EPOLLERR;
+	return vfs_poll(real, wait);
+}
+
+static int KASUMI_NOCFI kasumi_vnode_special_mmap(struct file *file,
+						  struct vm_area_struct *vma)
+{
+	struct file *real = file->private_data;
+
+	if (!real || !real->f_op || !real->f_op->mmap)
+		return -ENODEV;
+	/* Redirect the vma onto the real device file (drops the ref on our outer
+	 * file, takes one on the real file), then run the device's own mmap. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+	vma_set_file(vma, real);
+#else
+	get_file(real);
+	fput(vma->vm_file);
+	vma->vm_file = real;
+#endif
+	return real->f_op->mmap(real, vma);
+}
+
+static int KASUMI_NOCFI kasumi_vnode_special_fasync(int fd, struct file *file,
+						    int on)
+{
+	struct file *real = file->private_data;
+
+	if (real && real->f_op && real->f_op->fasync)
+		return real->f_op->fasync(fd, real, on);
+	return 0;
+}
+
+static const struct file_operations kasumi_vnode_special_fops = {
+	.owner = THIS_MODULE,
+	.open = kasumi_vnode_open,
+	.release = kasumi_vnode_release,
+	.llseek = kasumi_vnode_llseek,
+	.read = kasumi_vnode_special_read,
+	.write = kasumi_vnode_special_write,
+	.poll = kasumi_vnode_special_poll,
+	.unlocked_ioctl = kasumi_vnode_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = kasumi_vnode_compat_ioctl,
+#endif
+	.mmap = kasumi_vnode_special_mmap,
+	.fasync = kasumi_vnode_special_fasync,
+	.splice_read = kasumi_vnode_splice_read,
+	.fsync = kasumi_vnode_fsync,
+};
 
 /* ---- directory vnode: lookup/iterate delegate to the pinned source dir ---- */
 
@@ -1295,35 +1390,52 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 
 	inode->i_private = info;
 	inode->i_ino = v_ino;
-	inode->i_mode = r_inode ? r_inode->i_mode : mode;
 	inode->i_uid = r_inode ? r_inode->i_uid : GLOBAL_ROOT_UID;
 	inode->i_gid = r_inode ? r_inode->i_gid : GLOBAL_ROOT_GID;
-	if (r_inode) {
-		inode->i_size = i_size_read(r_inode);
-		/* Share the source page cache so the generic mmap/read path serves
-		 * source content without a private snapshot.  Directories don't mmap
-		 * and iterate through the pinned source, so keep their own mapping
-		 * and carry the source link count. */
-		if (!S_ISDIR(r_inode->i_mode))
-			inode->i_mapping = r_inode->i_mapping;
-		else
-			set_nlink(inode, r_inode->i_nlink);
-	}
 
-	if ((flags & KASUMI_VNODE_F_DIR) ||
-	    (r_inode && S_ISDIR(r_inode->i_mode))) {
-		inode->i_op = &kasumi_vnode_dir_iops;
-		inode->i_fop = &kasumi_vnode_dir_fops;
-	} else {
+	if (r_inode && (flags & KASUMI_VNODE_F_SPECIAL) &&
+	    (S_ISCHR(r_inode->i_mode) || S_ISBLK(r_inode->i_mode) ||
+	     S_ISFIFO(r_inode->i_mode))) {
+		/* char/blk/fifo source wrapper: mint S_IFREG so path_openat's
+		 * may_open() does not apply may_open_dev() on the nodev visible
+		 * mount; the special fops' .open delegates to the real source via
+		 * dentry_open (which bypasses may_open) and the data plane forwards
+		 * there.  Remember the real type+rdev so getattr still presents a
+		 * device/fifo.  No shared page cache: the device owns its mapping. */
+		info->special_mode = r_inode->i_mode;
+		info->special_rdev = r_inode->i_rdev;
+		inode->i_mode = S_IFREG | (r_inode->i_mode & 07777);
 		inode->i_op = &kasumi_vnode_file_iops;
+		inode->i_fop = &kasumi_vnode_special_fops;
+	} else {
+		inode->i_mode = r_inode ? r_inode->i_mode : mode;
+		if (r_inode) {
+			inode->i_size = i_size_read(r_inode);
+			/* Share the source page cache so the generic mmap/read path
+			 * serves source content without a private snapshot.  Directories
+			 * don't mmap and iterate through the pinned source, so keep their
+			 * own mapping and carry the source link count. */
+			if (!S_ISDIR(r_inode->i_mode))
+				inode->i_mapping = r_inode->i_mapping;
+			else
+				set_nlink(inode, r_inode->i_nlink);
+		}
+
+		if ((flags & KASUMI_VNODE_F_DIR) ||
+		    (r_inode && S_ISDIR(r_inode->i_mode))) {
+			inode->i_op = &kasumi_vnode_dir_iops;
+			inode->i_fop = &kasumi_vnode_dir_fops;
+		} else {
+			inode->i_op = &kasumi_vnode_file_iops;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
-		inode->i_fop = (r_inode && !S_ISLNK(r_inode->i_mode) &&
-				r_inode->i_fop && r_inode->i_fop->mmap_prepare) ?
-				       &kasumi_vnode_file_fops_mmap_prepare :
-				       &kasumi_vnode_file_fops;
+			inode->i_fop = (r_inode && !S_ISLNK(r_inode->i_mode) &&
+					r_inode->i_fop && r_inode->i_fop->mmap_prepare) ?
+					       &kasumi_vnode_file_fops_mmap_prepare :
+					       &kasumi_vnode_file_fops;
 #else
-		inode->i_fop = &kasumi_vnode_file_fops;
+			inode->i_fop = &kasumi_vnode_file_fops;
 #endif
+		}
 	}
 	/* Deliberately NOT S_PRIVATE: the vnode must stay LSM-visible so SELinux
 	 * serves security.selinux from the in-core SID we clone below and applies

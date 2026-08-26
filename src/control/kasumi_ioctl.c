@@ -1334,6 +1334,18 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino,
 							   KASUMI_VNODE_F_DIR);
 				kasumi_path_put(&dsrc);
+			} else if ((S_ISCHR(dh_src_mode) || S_ISBLK(dh_src_mode) ||
+				    S_ISFIFO(dh_src_mode)) &&
+				   kasumi_device_sources_enabled &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
+				/* char/blk/fifo source: resolves to a special vnode
+				 * wrapper (S_IFREG inode to clear may_open_dev on the
+				 * nodev visible mount; .open delegates to the real
+				 * device/fifo, getattr projects the source type+rdev). */
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino,
+							   KASUMI_VNODE_F_SPECIAL);
+				kasumi_path_put(&dsrc);
 			}
 		}
 
