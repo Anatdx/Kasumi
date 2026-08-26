@@ -214,20 +214,6 @@ extern void (*kasumi_path_put_ptr)(const struct path *);
 extern void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 extern struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 extern int (*kasumi_filp_close)(struct file *, fl_owner_t);
-extern ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
-extern ssize_t (*kasumi_kernel_write)(struct file *, const void *, size_t, loff_t *);
-extern void (*kasumi_cdev_put_ptr)(struct cdev *);
-extern struct file *(*kasumi_shmem_file_setup)(const char *, loff_t,
-							 unsigned long);
-extern ssize_t (*kasumi_vfs_copy_file_range)(struct file *, loff_t,
-							    struct file *, loff_t,
-							    size_t, unsigned int);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-extern unsigned long (*kasumi_mm_get_unmapped_area_ptr)(struct mm_struct *,
-								struct file *, unsigned long,
-								unsigned long, unsigned long,
-								unsigned long);
-#endif
 extern char *(*kasumi_strndup_user)(const char __user *, long);
 extern void (*kasumi_ihold)(struct inode *);
 extern long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
@@ -249,14 +235,6 @@ extern void (*kasumi_synchronize_rcu_tasks_ptr)(void);
 void kasumi_synchronize_rcu_tasks(void);
 extern int (*kasumi_module_refcount_ptr)(struct module *module);
 int kasumi_module_refcount(struct module *module);
-
-KASUMI_NOCFI ssize_t kasumi_copy_file_range(struct file *file_in,
-						loff_t pos_in,
-						struct file *file_out,
-						loff_t pos_out,
-						size_t len,
-						unsigned int flags);
-KASUMI_NOCFI void kasumi_cdev_put(struct cdev *cdev);
 
 /* KASUMI_NOCFI: these call kallsyms-resolved pointers (path_get/path_put).
  * Whether a kernel build emits a .cfi_jt thunk for those symbols varies per

@@ -47,7 +47,6 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
-#include "kasumi_virtual_file.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
@@ -699,11 +698,6 @@ KASUMI_NOCFI int kasumi_krp_d_path_entry(struct kretprobe_instance *ri,
 	p = (const struct path *)KASUMI_REG0(regs);
 	if (!p || !p->dentry)
 		return 0;
-	if (kasumi_virtual_file_lookup_path(p, d->src_path,
-					    sizeof(d->src_path))) {
-		d->is_target = true;
-		return 0;
-	}
 	if (kasumi_rule_get_visible_path(p, d->src_path,
 					 sizeof(d->src_path))) {
 		d->is_target = true;

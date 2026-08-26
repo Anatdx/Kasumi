@@ -422,19 +422,6 @@ void (*kasumi_path_put_ptr)(const struct path *);
 void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 struct file *(*kasumi_filp_open)(const char *, int, umode_t);
 int (*kasumi_filp_close)(struct file *, fl_owner_t);
-ssize_t (*kasumi_kernel_read)(struct file *, void *, size_t, loff_t *);
-ssize_t (*kasumi_kernel_write)(struct file *, const void *, size_t, loff_t *);
-void (*kasumi_cdev_put_ptr)(struct cdev *);
-struct file *(*kasumi_shmem_file_setup)(const char *, loff_t, unsigned long);
-ssize_t (*kasumi_vfs_copy_file_range)(struct file *, loff_t,
-					      struct file *, loff_t,
-					      size_t, unsigned int);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-unsigned long (*kasumi_mm_get_unmapped_area_ptr)(struct mm_struct *,
-							 struct file *, unsigned long,
-							 unsigned long, unsigned long,
-							 unsigned long);
-#endif
 char *(*kasumi_strndup_user)(const char __user *, long);
 void (*kasumi_ihold)(struct inode *);
 long (*kasumi_strncpy_from_user_nofault)(char *dst, const void __user *src, long count);
@@ -475,22 +462,6 @@ noinline KASUMI_NOCFI void kasumi_synchronize_rcu_tasks(void)
 noinline KASUMI_NOCFI int kasumi_module_refcount(struct module *module)
 {
 	return kasumi_module_refcount_ptr(module);
-}
-
-noinline KASUMI_NOCFI ssize_t kasumi_copy_file_range(
-	struct file *file_in, loff_t pos_in, struct file *file_out,
-	loff_t pos_out, size_t len, unsigned int flags)
-{
-	if (!kasumi_vfs_copy_file_range)
-		return -EOPNOTSUPP;
-	return kasumi_vfs_copy_file_range(file_in, pos_in, file_out, pos_out,
-					  len, flags);
-}
-
-noinline KASUMI_NOCFI void kasumi_cdev_put(struct cdev *cdev)
-{
-	if (kasumi_cdev_put_ptr && cdev)
-		kasumi_cdev_put_ptr(cdev);
 }
 
 bool kasumi_valid_kernel_addr(unsigned long addr)

@@ -56,7 +56,6 @@
 #include "kasumi_overlay.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_virtual_file.h"
 #include "kasumi_fop_bridge.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
@@ -921,13 +920,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		 * layer; no syscall dispatcher or sys_enter tracepoint remains. */
 		n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
 		written += n;
-		n = scnprintf(kbuf + written, buf_size - written,
-			      "virtual open: live=%u total=%llu; dir iterate=%llu; file_view=removed\n",
-			      kasumi_virtual_file_live(),
-			      (unsigned long long)kasumi_virtual_file_open_count(),
-			      (unsigned long long)
-				      kasumi_virtual_dir_iterate_count());
-		written += n;
 		{
 			dev_t vnode_dev = kasumi_vnode_device();
 
@@ -1635,7 +1627,6 @@ static void kasumi_quiesce_stop_new(void)
 	smp_store_release(&kasumi_enabled, false);
 
 	/* No new object may acquire module-owned callbacks after this point. */
-	kasumi_virtual_file_stop_new();
 	kasumi_proc_hooks_stop_new();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
@@ -1655,7 +1646,6 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	unsigned int control_files;
 	unsigned int getfd;
 	unsigned int proxies;
-	unsigned int virtual_files;
 	unsigned int iop_active;
 	bool iop_quiesced;
 	unsigned int known_refs;
@@ -1686,13 +1676,12 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	control_files = (unsigned int)atomic_read(&kasumi_control_files);
 	getfd = kasumi_proc_getfd_pending();
 	proxies = kasumi_proc_proxy_live();
-	virtual_files = kasumi_virtual_file_live();
 	iop_active = kasumi_iop_override_active();
 	iop_quiesced = kasumi_iop_override_quiesced();
 	unload_pin_held = kasumi_bootstrap_unload_pin_held();
 	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
 	known_refs = control_files + getfd + proxies +
-		virtual_files + (unload_pin_held ? 1U : 0U);
+		(unload_pin_held ? 1U : 0U);
 
 	a.state = KSM_QUIESCE_STATE_DRAINING;
 	a.busy_mask = 0;
@@ -1702,11 +1691,11 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
 	if (control_files != 1)
 		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
-	if (virtual_files || module_refs > known_refs || iop_active ||
+	if (module_refs > known_refs || iop_active ||
 	    !iop_quiesced)
 		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
 
-	ready = !getfd && !proxies && !virtual_files &&
+	ready = !getfd && !proxies &&
 		iop_quiesced && control_files == 1 &&
 		module_refs == control_files + (unload_pin_held ? 1U : 0U);
 

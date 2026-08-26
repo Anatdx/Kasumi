@@ -52,7 +52,6 @@
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
-#include "kasumi_virtual_file.h"
 #include "kasumi_dirhijack.h"
 /* ======================================================================
  * Part 11: Core Logic - Privileged Check / Allowlist

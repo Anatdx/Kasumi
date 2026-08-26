@@ -40,7 +40,6 @@
 #include "kasumi_runtime.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_store.h"
-#include "kasumi_virtual_file.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
@@ -1169,7 +1168,6 @@ static int kasumi_filter_maps_lines(const char *src, size_t len,
 	size_t in = 0, out = 0;
 	struct kasumi_maps_rule_entry *r;
 	const char *pathname;
-	char auto_spoof_path[KSM_MAX_LEN_PATHNAME];
 	char replacement_path[KSM_MAX_LEN_PATHNAME];
 	char header[128];
 	char flags[5];
@@ -1179,7 +1177,6 @@ static int kasumi_filter_maps_lines(const char *src, size_t len,
 	int header_len;
 	bool have_replacement_path;
 	bool line_changed;
-	bool view = scope == KASUMI_POLICY_SCOPE_VIEW;
 	bool spoof = scope == KASUMI_POLICY_SCOPE_SPOOF;
 
 	if (written)
@@ -1236,15 +1233,6 @@ static int kasumi_filter_maps_lines(const char *src, size_t len,
 		spoof_dev = dev;
 		have_replacement_path = false;
 		replacement_path[0] = '\0';
-
-		if (view && kasumi_virtual_file_lookup_maps(ino, dev,
-						 &spoof_ino, &spoof_dev,
-						 auto_spoof_path,
-						 sizeof(auto_spoof_path))) {
-			strscpy(replacement_path, auto_spoof_path,
-				 sizeof(replacement_path));
-			have_replacement_path = true;
-		}
 
 		if (spoof) {
 			mutex_lock(&kasumi_maps_mutex);

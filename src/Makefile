@@ -12,7 +12,6 @@ kasumi_lkm-objs := \
 	core/kasumi_bootstrap.o \
 	core/kasumi_runtime.o \
 	core/kasumi_fop_bridge.o \
-	core/kasumi_virtual_file.o \
 	core/kasumi_vnode.o \
 	core/kasumi_dirhijack.o \
 	core/kasumi_root_detection.o \

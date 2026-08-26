@@ -17,7 +17,6 @@
 
 #include "kasumi_bootstrap.h"
 #include "kasumi_runtime.h"
-#include "kasumi_virtual_file.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_store.h"
@@ -138,20 +137,6 @@ static int kasumi_resolve_runtime_symbols(void)
 
 	kasumi_filp_open = (void *)kasumi_lookup_callable("filp_open");
 	kasumi_filp_close = (void *)kasumi_lookup_callable("filp_close");
-	kasumi_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
-	kasumi_kernel_write = (void *)kasumi_lookup_callable_quiet("kernel_write");
-	kasumi_cdev_put_ptr =
-		(void *)kasumi_lookup_callable_quiet("cdev_put");
-	kasumi_shmem_file_setup =
-		(void *)kasumi_lookup_callable_quiet("shmem_file_setup");
-	kasumi_vfs_copy_file_range =
-		(void *)kasumi_lookup_callable_quiet("vfs_copy_file_range");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	kasumi_mm_get_unmapped_area_ptr =
-		(void *)kasumi_lookup_callable_quiet("mm_get_unmapped_area");
-	if (!kasumi_mm_get_unmapped_area_ptr)
-		pr_warn("Kasumi: mm_get_unmapped_area not found, virtual mmap uses the arch fallback\n");
-#endif
 	kasumi_vfs_getattr = (void *)kasumi_lookup_callable("vfs_getattr");
 	kasumi_notify_change =
 		(void *)kasumi_lookup_callable_quiet("notify_change");
@@ -266,10 +251,6 @@ static int kasumi_resolve_runtime_symbols(void)
 	    !kasumi_vfs_setxattr_addr || !kasumi_vfs_removexattr_addr ||
 	    !kasumi_mnt_want_write_addr || !kasumi_mnt_drop_write_addr)
 		pr_warn("Kasumi: captured xattr helpers unavailable\n");
-	if (!kasumi_kernel_write || !kasumi_shmem_file_setup)
-		pr_warn("Kasumi: kernel_write/shmem_file_setup not found, virtual mmap disabled\n");
-	if (!kasumi_vfs_copy_file_range)
-		pr_warn("Kasumi: vfs_copy_file_range not found, virtual mmap uses buffered copy\n");
 	if (!kasumi_d_absolute_path && !kasumi_dentry_path_raw)
 		pr_warn("Kasumi: neither d_absolute_path nor dentry_path_raw found, inject/merge listing disabled\n");
 
@@ -395,7 +376,6 @@ void kasumi_bootstrap_exit(void)
 	 * the resources those VFS/proc hooks depend on (proc fd proxies, fake
 	 * mountinfo, fop/iop shadows, vfs hooks).
 	 */
-	kasumi_virtual_file_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
