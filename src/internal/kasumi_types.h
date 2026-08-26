@@ -11,6 +11,7 @@
 #define _KASUMI_TYPES_H
 
 #include <linux/atomic.h>
+#include <linux/capability.h>
 #include <linux/dcache.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
@@ -178,6 +179,19 @@ struct kasumi_filldir_wrapper {
 struct kasumi_iterate_ri_data {
 	int did_swap;
 	struct kasumi_filldir_wrapper *wrapper;
+};
+
+/*
+ * get_vfs_caps_from_disk kretprobe state.  The exec-path file-capability read
+ * lands on the visible vnode's dentry, whose synthetic inode carries no on-disk
+ * security.capability.  We stash the source's parsed caps at vnode-create time
+ * (sleepable) and replay them here (atomic): @have gates the replay, @caps is
+ * the pre-parsed value, @out points at the caller's cpu_vfs_cap_data.
+ */
+struct kasumi_fscap_ri_data {
+	bool have;
+	struct cpu_vfs_cap_data *out;
+	struct cpu_vfs_cap_data caps;
 };
 
 #endif /* _KASUMI_TYPES_H */

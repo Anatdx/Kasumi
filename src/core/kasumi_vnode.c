@@ -90,6 +90,21 @@ bool kasumi_vnode_is_ours(const struct inode *inode)
 			 inode->i_op == &kasumi_vnode_dir_iops);
 }
 
+bool kasumi_vnode_peek_caps(const struct dentry *dentry,
+			    struct cpu_vfs_cap_data *out)
+{
+	struct inode *inode = dentry ? d_inode(dentry) : NULL;
+	struct kasumi_vnode_info *info;
+
+	if (!inode || !out || !kasumi_vnode_is_ours(inode))
+		return false;
+	info = inode->i_private;
+	if (!info || !info->has_caps)
+		return false;
+	*out = info->caps;
+	return true;
+}
+
 void kasumi_vnode_free_info(struct inode *inode)
 {
 	struct kasumi_vnode_info *info;
@@ -1325,6 +1340,16 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 	 * allocated by new_inode() and all identity is in place. */
 	if (r_inode)
 		kasumi_vnode_clone_sid(inode, r_inode);
+
+	/* Stash the source's file capabilities so an exec of a redirected setcap
+	 * binary keeps them: the exec-path get_vfs_caps_from_disk read lands on
+	 * this synthetic inode, which has no on-disk security.capability.  Only
+	 * meaningful for executable regular files; the read is sleepable and safe
+	 * here (lookup context).  Failure/-ENODATA simply leaves has_caps false. */
+	if (r_inode && S_ISREG(r_inode->i_mode) && (r_inode->i_mode & 0111) &&
+	    kasumi_get_vfs_caps_from_disk &&
+	    kasumi_source_vfs_caps(&info->source, &info->caps) == 0)
+		info->has_caps = true;
 	return inode;
 }
 

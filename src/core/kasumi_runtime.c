@@ -108,6 +108,30 @@ int KASUMI_NOCFI kasumi_vfs_getattr_unprojected(
 	return ret;
 }
 
+/*
+ * Parse the source file's on-disk capabilities via the kernel's own reader, so
+ * an exec of a redirected setcap binary keeps its file capabilities.  Sleepable
+ * (reads security.capability): call from vnode-create context, never from a
+ * kprobe handler.  @out is filled and 0 returned only when the source carries
+ * caps; any error (incl. -ENODATA) leaves @out untouched.
+ */
+int KASUMI_NOCFI kasumi_source_vfs_caps(const struct path *src,
+					struct cpu_vfs_cap_data *out)
+{
+	if (!src || !src->dentry || !src->mnt || !out ||
+	    !kasumi_get_vfs_caps_from_disk)
+		return -EOPNOTSUPP;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	return kasumi_get_vfs_caps_from_disk(mnt_idmap(src->mnt), src->dentry,
+					     out);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	return kasumi_get_vfs_caps_from_disk(mnt_user_ns(src->mnt), src->dentry,
+					     out);
+#else
+	return kasumi_get_vfs_caps_from_disk(src->dentry, out);
+#endif
+}
+
 /* Metadata-only device namespace for virtual nodes.  No real superblock is
  * registered: pathname hooks, virtual descriptors and proc projections all
  * publish this identity from the rule snapshot. */
@@ -350,6 +374,8 @@ int kasumi_proc_ns_readlink_registered;
 int kasumi_feature_enabled_mask;
 int kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;
 int kasumi_statfs_kretprobe_registered;
+int kasumi_fscap_kretprobe_registered;
+int kasumi_fscaps_enabled = 1;
 int kasumi_reboot_kprobe_registered;
 bool kasumi_vfs_use_ftrace;
 
@@ -370,6 +396,17 @@ int (*kasumi_notify_change)(struct user_namespace *, struct dentry *,
 int (*kasumi_notify_change)(struct dentry *, struct iattr *, struct inode **);
 #endif
 struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+int (*kasumi_get_vfs_caps_from_disk)(struct mnt_idmap *, const struct dentry *,
+				     struct cpu_vfs_cap_data *);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int (*kasumi_get_vfs_caps_from_disk)(struct user_namespace *,
+				     const struct dentry *,
+				     struct cpu_vfs_cap_data *);
+#else
+int (*kasumi_get_vfs_caps_from_disk)(const struct dentry *,
+				     struct cpu_vfs_cap_data *);
+#endif
 int (*kasumi_security_inode_getsecctx)(struct inode *, void **, u32 *);
 int (*kasumi_security_inode_notifysecctx)(struct inode *, void *, u32);
 void (*kasumi_security_release_secctx)(char *, u32);

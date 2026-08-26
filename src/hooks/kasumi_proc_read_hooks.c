@@ -44,6 +44,7 @@
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_fake_mountinfo.h"
+#include "kasumi_vnode.h"
 
 #ifndef D_REAL_DATA
 #define D_REAL_DATA 0
@@ -1383,6 +1384,80 @@ static struct kretprobe kasumi_krp_vfs_statfs = {
 	.maxactive = 64,
 };
 
+/*
+ * get_vfs_caps_from_disk kretprobe (cold, exec path only).  When a redirected
+ * setcap binary is exec'd, the kernel reads its file capabilities off the
+ * *visible* dentry, which is our synthetic vnode with no on-disk
+ * security.capability, so the read misses and the binary would lose its caps.
+ * The source's caps were parsed and stashed on the vnode at create time; here
+ * we simply replay them (atomic-safe: pure copy) and report success.
+ *
+ * Argument layout follows get_vfs_caps_from_disk():
+ *   < 5.12: (dentry, cpu_caps)              -> reg0, reg1
+ *  >= 5.12: (idmap/userns, dentry, cpu_caps)-> reg1, reg2
+ */
+static int kasumi_get_vfs_caps_entry(struct kretprobe_instance *ri,
+				     struct pt_regs *regs)
+{
+	struct kasumi_fscap_ri_data *d = (void *)ri->data;
+	const struct dentry *dentry;
+
+	d->have = false;
+	d->out = NULL;
+	if (!READ_ONCE(kasumi_fscaps_enabled))
+		return 0;
+#if defined(__aarch64__)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	dentry = (const struct dentry *)regs->regs[1];
+	d->out = (struct cpu_vfs_cap_data *)regs->regs[2];
+#else
+	dentry = (const struct dentry *)regs->regs[0];
+	d->out = (struct cpu_vfs_cap_data *)regs->regs[1];
+#endif
+#elif defined(__x86_64__)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	dentry = (const struct dentry *)regs->si;
+	d->out = (struct cpu_vfs_cap_data *)regs->dx;
+#else
+	dentry = (const struct dentry *)regs->di;
+	d->out = (struct cpu_vfs_cap_data *)regs->si;
+#endif
+#else
+	dentry = NULL;
+	d->out = NULL;
+#endif
+	if (!dentry || !d->out)
+		return 0;
+	if (kasumi_vnode_peek_caps(dentry, &d->caps))
+		d->have = true;
+	return 0;
+}
+
+static int kasumi_get_vfs_caps_ret(struct kretprobe_instance *ri,
+				   struct pt_regs *regs)
+{
+	struct kasumi_fscap_ri_data *d = (void *)ri->data;
+
+	if (!d->have || !d->out)
+		return 0;
+	*d->out = d->caps;
+	/* Report success (0) so the caller applies the replayed caps regardless of
+	 * the miss the real read returned on the synthetic inode. */
+#if defined(__aarch64__)
+	regs->regs[0] = 0;
+#elif defined(__x86_64__)
+	regs->ax = 0;
+#endif
+	return 0;
+}
+
+static struct kretprobe kasumi_krp_get_vfs_caps = {
+	.entry_handler = kasumi_get_vfs_caps_entry,
+	.handler = kasumi_get_vfs_caps_ret,
+	.data_size = sizeof(struct kasumi_fscap_ri_data),
+	.maxactive = 64,
+};
+
 static struct kprobe kasumi_kp_cp_statx;
 static bool kasumi_cp_statx_registered;
 
@@ -1444,6 +1519,7 @@ void kasumi_proc_read_hooks_init(void)
 	unsigned long readlink_addr = kasumi_lookup_name("vfs_readlink");
 	unsigned long fd_install_addr = kasumi_lookup_name("fd_install");
 	unsigned long cp_statx_addr = kasumi_lookup_name("cp_statx");
+	unsigned long caps_addr = kasumi_lookup_name("get_vfs_caps_from_disk");
 	bool use_proxy_filter = false;
 
 	atomic_set(&kasumi_proxy_shutdown, 0);
@@ -1487,6 +1563,18 @@ void kasumi_proc_read_hooks_init(void)
 		}
 	} else {
 		pr_warn("Kasumi: cp_statx not found, statx mount ID spoof disabled\n");
+	}
+
+	if (caps_addr) {
+		kasumi_krp_get_vfs_caps.kp.addr = (kprobe_opcode_t *)caps_addr;
+		if (register_kretprobe(&kasumi_krp_get_vfs_caps) == 0) {
+			kasumi_fscap_kretprobe_registered = 1;
+			pr_info("Kasumi: source file-capability replay via get_vfs_caps_from_disk\n");
+		} else {
+			pr_warn("Kasumi: register_kretprobe(get_vfs_caps_from_disk) failed\n");
+		}
+	} else {
+		pr_warn("Kasumi: get_vfs_caps_from_disk not found, redirected fscaps disabled\n");
 	}
 
 	if (fd_install_addr) {
@@ -1551,6 +1639,10 @@ void kasumi_proc_read_hooks_stop_new(void)
 	if (kasumi_statfs_kretprobe_registered) {
 		unregister_kretprobe(&kasumi_krp_vfs_statfs);
 		kasumi_statfs_kretprobe_registered = 0;
+	}
+	if (kasumi_fscap_kretprobe_registered) {
+		unregister_kretprobe(&kasumi_krp_get_vfs_caps);
+		kasumi_fscap_kretprobe_registered = 0;
 	}
 	if (kasumi_mount_hide_mountinfo_registered) {
 		unregister_kprobe(&kasumi_kp_show_mountinfo);

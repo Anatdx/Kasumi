@@ -46,6 +46,9 @@ static int kasumi_dummy_mode_param;
 module_param_named(kasumi_dummy_mode, kasumi_dummy_mode_param, int, 0600);
 MODULE_PARM_DESC(kasumi_dummy_mode, "1=exit immediately after init starts (for testing).");
 
+module_param_named(kasumi_fscaps, kasumi_fscaps_enabled, int, 0644);
+MODULE_PARM_DESC(kasumi_fscaps, "1=replay a redirected source's file capabilities onto exec (default 1).");
+
 static char kasumi_owner_nonce[33];
 module_param_string(kasumi_owner_nonce, kasumi_owner_nonce,
 		    sizeof(kasumi_owner_nonce), 0400);
@@ -170,6 +173,13 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_vfs_link = (void *)kasumi_lookup_callable_quiet("vfs_link");
 	kasumi_vfs_rename = (void *)kasumi_lookup_callable_quiet("vfs_rename");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
+	/* Source file-capability reader for exec-path fscap replay (Item A).
+	 * Optional: absence only disables carrying a redirected setcap binary's
+	 * capabilities across exec, never crashes. */
+	kasumi_get_vfs_caps_from_disk =
+		(void *)kasumi_lookup_callable_quiet("get_vfs_caps_from_disk");
+	if (!kasumi_get_vfs_caps_from_disk)
+		pr_info("Kasumi: get_vfs_caps_from_disk unavailable, redirected file capabilities not carried across exec\n");
 	/* Public LSM secctx round-trip for cloning a source's SELinux context onto
 	 * a vnode.  Optional: absence only means vnodes fall back to the default
 	 * label (no crash), so resolve quietly and let callers null-check. */

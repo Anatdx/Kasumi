@@ -14,6 +14,7 @@
 
 #include <linux/anon_inodes.h>
 #include <linux/bitmap.h>
+#include <linux/capability.h>
 #include <linux/fcntl.h>
 #include <linux/kprobes.h>
 #include <linux/limits.h>
@@ -122,6 +123,8 @@ extern int kasumi_proc_ns_readlink_registered;
 extern int kasumi_feature_enabled_mask;
 extern int kasumi_mount_hide_mode;
 extern int kasumi_statfs_kretprobe_registered;
+extern int kasumi_fscap_kretprobe_registered;
+extern int kasumi_fscaps_enabled;
 extern int kasumi_reboot_kprobe_registered;
 extern bool kasumi_vfs_use_ftrace;
 extern dev_t kasumi_system_dev;
@@ -143,6 +146,26 @@ int kasumi_vfs_getattr_unprojected(const struct path *path,
 				   struct kstat *stat, u32 request_mask,
 				   unsigned int query_flags);
 bool kasumi_vfs_internal_current(void);
+/*
+ * Resolved get_vfs_caps_from_disk (security/commoncap.c).  Its leading
+ * idmap/user_namespace argument varies by version exactly like notify_change;
+ * absent (NULL) simply disables source-file-capability forwarding.  Use the
+ * kasumi_source_vfs_caps() wrapper, which supplies the source mount's idmap.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+extern int (*kasumi_get_vfs_caps_from_disk)(struct mnt_idmap *,
+					    const struct dentry *,
+					    struct cpu_vfs_cap_data *);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int (*kasumi_get_vfs_caps_from_disk)(struct user_namespace *,
+					    const struct dentry *,
+					    struct cpu_vfs_cap_data *);
+#else
+extern int (*kasumi_get_vfs_caps_from_disk)(const struct dentry *,
+					    struct cpu_vfs_cap_data *);
+#endif
+int kasumi_source_vfs_caps(const struct path *src,
+			   struct cpu_vfs_cap_data *out);
 extern struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
 extern char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 extern char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);

@@ -19,6 +19,7 @@
 #ifndef _KASUMI_VNODE_H
 #define _KASUMI_VNODE_H
 
+#include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/path.h>
 #include <linux/types.h>
@@ -39,6 +40,11 @@ struct kasumi_vnode_info {
 	/* Visible path of a KASUMI_VNODE_F_VIRTUAL_DIR (source-less) node, used to
 	 * resolve its children against the rule table.  NULL for backed nodes. */
 	char *visible_path;
+	/* File capabilities parsed from the source at create time, replayed onto
+	 * the exec-path get_vfs_caps_from_disk read (which lands on this synthetic
+	 * inode that has no on-disk security.capability).  @has_caps gates it. */
+	bool has_caps;
+	struct cpu_vfs_cap_data caps;
 };
 
 /*
@@ -68,6 +74,14 @@ struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 
 /* True if @inode is a Kasumi virtual node (its i_op is one of our tables). */
 bool kasumi_vnode_is_ours(const struct inode *inode);
+
+/*
+ * If @dentry resolves to a Kasumi vnode that stashed file capabilities from its
+ * source, copy them into @out and return true.  Atomic-context safe (pure field
+ * reads): used from the get_vfs_caps_from_disk kretprobe on the exec path.
+ */
+bool kasumi_vnode_peek_caps(const struct dentry *dentry,
+			    struct cpu_vfs_cap_data *out);
 
 /*
  * Release the i_private state of a virtual inode.  Called from the hijacked
