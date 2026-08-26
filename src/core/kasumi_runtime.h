@@ -158,6 +158,41 @@ extern int (*kasumi_vfs_path_lookup)(struct dentry *, struct vfsmount *,
 				     const char *, unsigned int, struct path *);
 extern const char *(*kasumi_vfs_get_link)(struct dentry *,
 					  struct delayed_call *);
+/*
+ * Directory-mutation delegates (Final Phase 1b): a directory-source vnode's
+ * i_op create family forwards to these against the pinned source dir.  Their
+ * leading idmap/user_namespace argument varies by version exactly like
+ * notify_change; vfs_link takes the idmap as its SECOND argument.  Any may be
+ * NULL (resolved quietly) — the vnode op returns -EOPNOTSUPP then.
+ * lookup_one_len manufactures the source-side child dentry (caller holds the
+ * source dir i_rwsem); its signature is stable across all supported KMIs.
+ */
+extern struct dentry *(*kasumi_lookup_one_len)(const char *, struct dentry *, int);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+extern int (*kasumi_vfs_create)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, bool);
+extern int (*kasumi_vfs_mkdir)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
+extern int (*kasumi_vfs_mknod)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, dev_t);
+extern int (*kasumi_vfs_symlink)(struct mnt_idmap *, struct inode *, struct dentry *, const char *);
+extern int (*kasumi_vfs_unlink)(struct mnt_idmap *, struct inode *, struct dentry *, struct inode **);
+extern int (*kasumi_vfs_rmdir)(struct mnt_idmap *, struct inode *, struct dentry *);
+extern int (*kasumi_vfs_link)(struct dentry *, struct mnt_idmap *, struct inode *, struct dentry *, struct inode **);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int (*kasumi_vfs_create)(struct user_namespace *, struct inode *, struct dentry *, umode_t, bool);
+extern int (*kasumi_vfs_mkdir)(struct user_namespace *, struct inode *, struct dentry *, umode_t);
+extern int (*kasumi_vfs_mknod)(struct user_namespace *, struct inode *, struct dentry *, umode_t, dev_t);
+extern int (*kasumi_vfs_symlink)(struct user_namespace *, struct inode *, struct dentry *, const char *);
+extern int (*kasumi_vfs_unlink)(struct user_namespace *, struct inode *, struct dentry *, struct inode **);
+extern int (*kasumi_vfs_rmdir)(struct user_namespace *, struct inode *, struct dentry *);
+extern int (*kasumi_vfs_link)(struct dentry *, struct user_namespace *, struct inode *, struct dentry *, struct inode **);
+#else
+extern int (*kasumi_vfs_create)(struct inode *, struct dentry *, umode_t, bool);
+extern int (*kasumi_vfs_mkdir)(struct inode *, struct dentry *, umode_t);
+extern int (*kasumi_vfs_mknod)(struct inode *, struct dentry *, umode_t, dev_t);
+extern int (*kasumi_vfs_symlink)(struct inode *, struct dentry *, const char *);
+extern int (*kasumi_vfs_unlink)(struct inode *, struct dentry *, struct inode **);
+extern int (*kasumi_vfs_rmdir)(struct inode *, struct dentry *);
+extern int (*kasumi_vfs_link)(struct dentry *, struct inode *, struct dentry *, struct inode **);
+#endif
 /* Public LSM secctx round-trip: copy a source inode's security context onto a
  * synthetic vnode's in-core SID without touching SELinux blob internals.  Both
  * may be NULL when the LSM/symbols are unavailable — callers must check. */

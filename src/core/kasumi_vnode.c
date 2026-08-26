@@ -18,6 +18,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
@@ -42,6 +43,20 @@
 #define KVN_IDMAP_CALL
 #endif
 
+/*
+ * Idmap of the *source* mount for a delegated create/mkdir/... — the redirect
+ * writes through the source's own mount, so the source idmap governs uid/gid
+ * mapping, not the visible idmap the VFS handed our op.  Trailing comma so it
+ * drops cleanly on pre-5.12 kernels that took no idmap argument.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define KVN_SRC_IDMAP(mnt)	mnt_idmap(mnt),
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define KVN_SRC_IDMAP(mnt)	mnt_user_ns(mnt),
+#else
+#define KVN_SRC_IDMAP(mnt)
+#endif
+
 static const struct inode_operations kasumi_vnode_file_iops;
 static const struct inode_operations kasumi_vnode_dir_iops;
 static const struct file_operations kasumi_vnode_file_fops;
@@ -49,6 +64,18 @@ static const struct file_operations kasumi_vnode_dir_fops;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 static const struct file_operations kasumi_vnode_file_fops_mmap_prepare;
 #endif
+
+/*
+ * A dedicated i_rwsem lockdep class for every Kasumi vnode.  The vnode lives on
+ * the *visible* (real) superblock — the same fs type as its source — so without
+ * this a delegated vfs_unlink/vfs_rmdir on the source, run from inside our own
+ * ->unlink/->rmdir while the VFS holds the visible victim's i_rwsem, would look
+ * to LOCKDEP like same-class recursive locking (a false positive: one task,
+ * strict visible->source order, no cycle).  Giving vnodes their own class is
+ * what a stacking filesystem gets implicitly from being its own fs type.
+ * Compiles out entirely without CONFIG_LOCKDEP.
+ */
+static struct lock_class_key kasumi_vnode_i_mutex_key;
 
 /* dir_context actor (filldir_t) returns int pre-6.1, bool since 6.1. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -175,10 +202,16 @@ static int KASUMI_NOCFI kasumi_vnode_setattr(KVN_IDMAP_ARG struct dentry *dentry
 		return -EROFS;
 	if (!kasumi_notify_change)
 		return -EOPNOTSUPP;
+	/* Sleeping callback on our static i_op table — keep the module-refcount
+	 * gate up against a cooperative unload, like the create family. */
+	if (!try_module_get(THIS_MODULE))
+		return -ENOENT;
 	src_dentry = info->source.dentry;
 	src_inode = d_inode(src_dentry);
-	if (!src_inode)
+	if (!src_inode) {
+		module_put(THIS_MODULE);
 		return -ENOENT;
+	}
 
 	/* ATTR_FILE points at the virtual file; swap it for the opened source
 	 * file so a truncate reaches the source's fs/driver, not the vnode. */
@@ -196,6 +229,7 @@ static int KASUMI_NOCFI kasumi_vnode_setattr(KVN_IDMAP_ARG struct dentry *dentry
 	inode_lock(src_inode);
 	ret = kasumi_notify_change(KVN_IDMAP_CALL src_dentry, &sattr, NULL);
 	inode_unlock(src_inode);
+	module_put(THIS_MODULE);
 	return ret;
 }
 
@@ -604,11 +638,364 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 	return d_splice_alias(cvi, dentry);
 }
 
+/* ---- directory vnode: create family delegates to the pinned source dir ----
+ *
+ * When a directory-source redirect's vnode receives a namespace mutation
+ * (create/mkdir/mknod/symlink/unlink/rmdir/link), forward it to the pinned
+ * source directory via the captured vfs_* helper, so the redirect is
+ * writable-through like a bind mount: the source's DAC/SELinux govern,
+ * evaluated against the caller's creds inside the vfs_* helper.  A pure-virtual
+ * directory (F_VIRTUAL_DIR, no source) is a synthetic container and read-only.
+ * Mutation sink (Final Phase 1b).
+ */
+
+/*
+ * Take freeze / read-only write protection on the source mount for a mutation.
+ * Both captured helpers gate as a pair: if either is missing we proceed
+ * unprotected (best-effort, mirrors the captured-xattr write path) rather than
+ * fail.  Returns 0 to proceed, or a negative errno when the write is denied
+ * (a read-only or frozen source) — in which case drop_write must NOT run.
+ */
+static int KASUMI_NOCFI kasumi_vnode_src_want_write(const struct path *src)
+{
+	int (*want)(struct vfsmount *) = kasumi_mnt_want_write_addr;
+
+	if (!want || !kasumi_mnt_drop_write_addr)
+		return 0;
+	return want(src->mnt);
+}
+
+static void KASUMI_NOCFI kasumi_vnode_src_drop_write(const struct path *src)
+{
+	void (*drop)(struct vfsmount *) = kasumi_mnt_drop_write_addr;
+
+	if (drop && kasumi_mnt_want_write_addr)
+		drop(src->mnt);
+}
+
+/*
+ * Manufacture a child dentry inside the pinned source directory named like the
+ * visible target @vis.  On success returns the source child (negative for a
+ * create, positive for a remove) with the source dir inode LOCKED — the caller
+ * releases with inode_unlock(*dir_out) + dput(child).  I_MUTEX_PARENT2 keeps
+ * lockdep from confusing this with the visible parent our VFS caller already
+ * holds at I_MUTEX_PARENT.  On error returns ERR_PTR and leaves nothing locked.
+ */
+static struct dentry *kasumi_vnode_src_child(struct kasumi_vnode_info *info,
+					     const struct dentry *vis,
+					     struct inode **dir_out)
+{
+	struct inode *src_dir;
+	struct dentry *child;
+
+	if (!info->source.dentry || !info->source.mnt)
+		return ERR_PTR(-EROFS);
+	if (!kasumi_lookup_one_len)
+		return ERR_PTR(-EOPNOTSUPP);
+	src_dir = d_inode(info->source.dentry);
+	if (!src_dir || !S_ISDIR(src_dir->i_mode))
+		return ERR_PTR(-ENOTDIR);
+	inode_lock_nested(src_dir, I_MUTEX_PARENT2);
+	child = kasumi_lookup_one_len(vis->d_name.name, info->source.dentry,
+				      vis->d_name.len);
+	if (IS_ERR(child)) {
+		inode_unlock(src_dir);
+		return child;
+	}
+	*dir_out = src_dir;
+	return child;
+}
+
+/*
+ * Begin a delegated directory mutation.  Pin the module first: like
+ * kasumi_vnode_dir_lookup, these are sleeping callbacks on our static i_op
+ * table, so an in-flight op must keep the module-refcount gate raised or a
+ * cooperative unload could free our text underneath it.  Then take source-mount
+ * write protection and manufacture the locked source child.  On any failure
+ * everything acquired here is unwound and an ERR_PTR is returned; on success
+ * pair with kasumi_vnode_src_end().
+ */
+static struct dentry *kasumi_vnode_src_begin(struct kasumi_vnode_info *info,
+					     const struct dentry *vis,
+					     struct inode **dir_out)
+{
+	struct dentry *child;
+	int ret;
+
+	if (!try_module_get(THIS_MODULE))
+		return ERR_PTR(-ENOENT);
+	ret = kasumi_vnode_src_want_write(&info->source);
+	if (ret) {
+		module_put(THIS_MODULE);
+		return ERR_PTR(ret);
+	}
+	child = kasumi_vnode_src_child(info, vis, dir_out);
+	if (IS_ERR(child)) {
+		kasumi_vnode_src_drop_write(&info->source);
+		module_put(THIS_MODULE);
+	}
+	return child;
+}
+
+static void kasumi_vnode_src_end(struct kasumi_vnode_info *info,
+				 struct inode *src_dir, struct dentry *child)
+{
+	inode_unlock(src_dir);
+	kasumi_vnode_src_drop_write(&info->source);
+	dput(child);
+	module_put(THIS_MODULE);
+}
+
+/*
+ * A create-family op just made @src_child positive in the source dir; publish
+ * it on the visible side by splicing a fresh vnode over it onto @vis so a later
+ * stat/open/iterate resolves through the vnode.  @src_child stays owned by the
+ * caller (the new vnode pins its own reference).
+ */
+static int KASUMI_NOCFI kasumi_vnode_publish_child(struct super_block *sb,
+						   const struct path *src_parent,
+						   struct dentry *src_child,
+						   struct dentry *vis)
+{
+	struct path cpath = { .mnt = src_parent->mnt, .dentry = src_child };
+	struct inode *ci = d_inode(src_child);
+	struct inode *cvi;
+	u8 cf;
+
+	if (!ci)
+		return -ENOENT;
+	cf = S_ISDIR(ci->i_mode) ? KASUMI_VNODE_F_DIR :
+	     S_ISLNK(ci->i_mode) ? KASUMI_VNODE_F_LNK : 0;
+	cvi = kasumi_vnode_new(sb, &cpath,
+			       kasumi_vnode_source_ino(
+				       ci->i_sb ? ci->i_sb->s_dev : 0,
+				       (u64)ci->i_ino), ci->i_mode, cf);
+	if (!cvi)
+		return -ENOMEM;
+	d_instantiate(vis, cvi);
+	return 0;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_create(KVN_IDMAP_ARG struct inode *dir,
+						struct dentry *dentry,
+						umode_t mode, bool excl)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_create)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	ret = kasumi_vfs_create(KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
+				mode, excl);
+	if (ret == 0)
+		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
+						 dentry);
+	kasumi_vnode_src_end(info, src_dir, child);
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_mkdir(KVN_IDMAP_ARG struct inode *dir,
+					       struct dentry *dentry,
+					       umode_t mode)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_mkdir)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	ret = kasumi_vfs_mkdir(KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
+			       mode);
+	if (ret == 0)
+		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
+						 dentry);
+	kasumi_vnode_src_end(info, src_dir, child);
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_mknod(KVN_IDMAP_ARG struct inode *dir,
+					       struct dentry *dentry,
+					       umode_t mode, dev_t dev)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_mknod)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	/* A device node created on the (nodev) source is real but unopenable —
+	 * consistent with the source itself; pass the result through untouched. */
+	ret = kasumi_vfs_mknod(KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
+			       mode, dev);
+	if (ret == 0)
+		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
+						 dentry);
+	kasumi_vnode_src_end(info, src_dir, child);
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_symlink(KVN_IDMAP_ARG
+						 struct inode *dir,
+						 struct dentry *dentry,
+						 const char *oldname)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_symlink)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	ret = kasumi_vfs_symlink(KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
+				 oldname);
+	if (ret == 0)
+		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
+						 dentry);
+	kasumi_vnode_src_end(info, src_dir, child);
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_unlink(struct inode *dir,
+						struct dentry *dentry)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_unlink)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	if (d_really_is_negative(child))
+		ret = -ENOENT;
+	else
+		ret = kasumi_vfs_unlink(KVN_SRC_IDMAP(info->source.mnt) src_dir,
+					child, NULL);
+	kasumi_vnode_src_end(info, src_dir, child);
+	/* Reflect the removal on the synthetic child so it evicts with nlink 0;
+	 * the VFS caller d_delete()s the visible dentry after we return. */
+	if (ret == 0 && d_really_is_positive(dentry))
+		drop_nlink(d_inode(dentry));
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_rmdir(struct inode *dir,
+					       struct dentry *dentry)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_rmdir)
+		return -EOPNOTSUPP;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	if (d_really_is_negative(child))
+		ret = -ENOENT;
+	else
+		ret = kasumi_vfs_rmdir(KVN_SRC_IDMAP(info->source.mnt) src_dir,
+				       child);
+	kasumi_vnode_src_end(info, src_dir, child);
+	if (ret == 0 && d_really_is_positive(dentry)) {
+		clear_nlink(d_inode(dentry));	/* removed dir: no more links */
+		drop_nlink(dir);		/* its ".." backref is gone */
+	}
+	return ret;
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_link(struct dentry *old_dentry,
+					      struct inode *dir,
+					      struct dentry *dentry)
+{
+	struct kasumi_vnode_info *info = dir->i_private;
+	struct inode *old_vi = d_inode(old_dentry);
+	struct kasumi_vnode_info *old_info =
+		(old_vi && kasumi_vnode_is_ours(old_vi)) ? old_vi->i_private :
+							   NULL;
+	struct inode *src_dir = NULL;
+	struct dentry *child;
+	int ret;
+
+	if (!info)
+		return -ENOTDIR;
+	if (!info->source.dentry)
+		return -EROFS;
+	if (!kasumi_vfs_link)
+		return -EOPNOTSUPP;
+	/* The hardlink target is a visible dentry; it must resolve to a real
+	 * source (its own redirect's pinned source).  A pure-virtual or foreign
+	 * inode has no backing store to link — report cross-device. */
+	if (!old_info || !old_info->source.dentry)
+		return -EXDEV;
+	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
+	if (IS_ERR(child))
+		return PTR_ERR(child);
+	ret = kasumi_vfs_link(old_info->source.dentry,
+			      KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
+			      NULL);
+	if (ret == 0)
+		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
+						 dentry);
+	kasumi_vnode_src_end(info, src_dir, child);
+	return ret;
+}
+
 static const struct inode_operations kasumi_vnode_dir_iops = {
 	.lookup = kasumi_vnode_dir_lookup,
 	.getattr = kasumi_vnode_getattr,
 	.setattr = kasumi_vnode_setattr,
 	.listxattr = kasumi_vnode_listxattr,
+	.create = kasumi_vnode_dir_create,
+	.mkdir = kasumi_vnode_dir_mkdir,
+	.mknod = kasumi_vnode_dir_mknod,
+	.symlink = kasumi_vnode_dir_symlink,
+	.unlink = kasumi_vnode_dir_unlink,
+	.rmdir = kasumi_vnode_dir_rmdir,
+	.link = kasumi_vnode_dir_link,
 };
 
 static const struct file_operations kasumi_vnode_dir_fops = {
@@ -668,6 +1055,7 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 	inode = new_inode(sb);
 	if (!inode)
 		return NULL;
+	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		iput(inode);
@@ -745,6 +1133,7 @@ struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 	inode = new_inode(sb);
 	if (!inode)
 		return NULL;
+	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		iput(inode);

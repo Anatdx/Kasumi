@@ -174,6 +174,18 @@ static int kasumi_resolve_runtime_symbols(void)
 		(void *)kasumi_lookup_callable_quiet("vfs_path_lookup");
 	kasumi_vfs_get_link =
 		(void *)kasumi_lookup_callable_quiet("vfs_get_link");
+	/* Directory-mutation delegates for redirected directory-source vnodes
+	 * (Final Phase 1b).  Quiet: absence only disables create/remove inside a
+	 * redirected directory (the op returns -EOPNOTSUPP), never crashes. */
+	kasumi_lookup_one_len =
+		(void *)kasumi_lookup_callable_quiet("lookup_one_len");
+	kasumi_vfs_create = (void *)kasumi_lookup_callable_quiet("vfs_create");
+	kasumi_vfs_mkdir = (void *)kasumi_lookup_callable_quiet("vfs_mkdir");
+	kasumi_vfs_mknod = (void *)kasumi_lookup_callable_quiet("vfs_mknod");
+	kasumi_vfs_symlink = (void *)kasumi_lookup_callable_quiet("vfs_symlink");
+	kasumi_vfs_unlink = (void *)kasumi_lookup_callable_quiet("vfs_unlink");
+	kasumi_vfs_rmdir = (void *)kasumi_lookup_callable_quiet("vfs_rmdir");
+	kasumi_vfs_link = (void *)kasumi_lookup_callable_quiet("vfs_link");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
 	/* Public LSM secctx round-trip for cloning a source's SELinux context onto
 	 * a vnode.  Optional: absence only means vnodes fall back to the default
@@ -249,6 +261,9 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_warn("Kasumi: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
 	if (!kasumi_vfs_path_lookup)
 		pr_warn("Kasumi: vfs_path_lookup not found, virtual directory descendants disabled\n");
+	if (!kasumi_lookup_one_len || !kasumi_vfs_mkdir || !kasumi_vfs_unlink ||
+	    !kasumi_vfs_create)
+		pr_warn("Kasumi: dir-mutation delegates unavailable, create/remove inside a redirected directory disabled\n");
 	if (!kasumi_vfs_getxattr_addr || !kasumi_vfs_listxattr_addr ||
 	    !kasumi_vfs_setxattr_addr || !kasumi_vfs_removexattr_addr ||
 	    !kasumi_mnt_want_write_addr || !kasumi_mnt_drop_write_addr)

@@ -388,6 +388,32 @@ void *kasumi_mnt_drop_write_addr;
 int (*kasumi_vfs_path_lookup)(struct dentry *, struct vfsmount *,
 			      const char *, unsigned int, struct path *);
 const char *(*kasumi_vfs_get_link)(struct dentry *, struct delayed_call *);
+struct dentry *(*kasumi_lookup_one_len)(const char *, struct dentry *, int);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+int (*kasumi_vfs_create)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, bool);
+int (*kasumi_vfs_mkdir)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
+int (*kasumi_vfs_mknod)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, dev_t);
+int (*kasumi_vfs_symlink)(struct mnt_idmap *, struct inode *, struct dentry *, const char *);
+int (*kasumi_vfs_unlink)(struct mnt_idmap *, struct inode *, struct dentry *, struct inode **);
+int (*kasumi_vfs_rmdir)(struct mnt_idmap *, struct inode *, struct dentry *);
+int (*kasumi_vfs_link)(struct dentry *, struct mnt_idmap *, struct inode *, struct dentry *, struct inode **);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int (*kasumi_vfs_create)(struct user_namespace *, struct inode *, struct dentry *, umode_t, bool);
+int (*kasumi_vfs_mkdir)(struct user_namespace *, struct inode *, struct dentry *, umode_t);
+int (*kasumi_vfs_mknod)(struct user_namespace *, struct inode *, struct dentry *, umode_t, dev_t);
+int (*kasumi_vfs_symlink)(struct user_namespace *, struct inode *, struct dentry *, const char *);
+int (*kasumi_vfs_unlink)(struct user_namespace *, struct inode *, struct dentry *, struct inode **);
+int (*kasumi_vfs_rmdir)(struct user_namespace *, struct inode *, struct dentry *);
+int (*kasumi_vfs_link)(struct dentry *, struct user_namespace *, struct inode *, struct dentry *, struct inode **);
+#else
+int (*kasumi_vfs_create)(struct inode *, struct dentry *, umode_t, bool);
+int (*kasumi_vfs_mkdir)(struct inode *, struct dentry *, umode_t);
+int (*kasumi_vfs_mknod)(struct inode *, struct dentry *, umode_t, dev_t);
+int (*kasumi_vfs_symlink)(struct inode *, struct dentry *, const char *);
+int (*kasumi_vfs_unlink)(struct inode *, struct dentry *, struct inode **);
+int (*kasumi_vfs_rmdir)(struct inode *, struct dentry *);
+int (*kasumi_vfs_link)(struct dentry *, struct inode *, struct dentry *, struct inode **);
+#endif
 void (*kasumi_path_get_ptr)(const struct path *);
 void (*kasumi_path_put_ptr)(const struct path *);
 void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
