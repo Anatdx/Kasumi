@@ -414,6 +414,11 @@ int (*kasumi_vfs_unlink)(struct inode *, struct dentry *, struct inode **);
 int (*kasumi_vfs_rmdir)(struct inode *, struct dentry *);
 int (*kasumi_vfs_link)(struct dentry *, struct inode *, struct dentry *, struct inode **);
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int (*kasumi_vfs_rename)(struct renamedata *);
+#else
+int (*kasumi_vfs_rename)(struct inode *, struct dentry *, struct inode *, struct dentry *, struct inode **, unsigned int);
+#endif
 void (*kasumi_path_get_ptr)(const struct path *);
 void (*kasumi_path_put_ptr)(const struct path *);
 void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);

@@ -984,6 +984,207 @@ static int KASUMI_NOCFI kasumi_vnode_dir_link(struct dentry *old_dentry,
 	return ret;
 }
 
+/* ---- directory vnode: rename delegates to the pinned source dir ----------
+ *
+ * Rename is the one mutation that touches two directories at once.  Both the
+ * old and new visible dirs are vnodes on the *real* superblock, so their source
+ * dirs share that superblock too.  That yields the key simplification for
+ * locking: whenever the two source dirs differ, the outer VFS is performing a
+ * cross-directory *visible* rename and already holds this sb's
+ * s_vfs_rename_mutex; whenever the outer rename is same-directory, the two
+ * source dirs are identical (same vnode -> same i_private -> same source).  So
+ * the source-side parent locking mirrors lock_rename() but never re-takes
+ * s_vfs_rename_mutex.  Mutation sink (Final Phase 1c).
+ */
+
+/* d_ancestor() is not exported; reimplement it.  Safe here because the caller
+ * runs under the outer rename's s_vfs_rename_mutex (held whenever the two dirs
+ * differ), which freezes directory ancestry against concurrent renames.
+ * Returns the child of @p1 on the path to @p2 when @p1 is an ancestor of @p2. */
+static struct dentry *kasumi_d_ancestor(struct dentry *p1, struct dentry *p2)
+{
+	struct dentry *p;
+
+	for (p = p2; !IS_ROOT(p); p = p->d_parent) {
+		if (p->d_parent == p1)
+			return p;
+	}
+	return NULL;
+}
+
+/*
+ * Lock two source parent dirs for a delegated rename, mirroring lock_rename()
+ * minus s_vfs_rename_mutex (see the block comment).  @p1 is the new parent, @p2
+ * the old, matching lock_rename(new, old).  Returns the subtree trap (common
+ * ancestor) or NULL so the caller can reject renaming a directory into its own
+ * descendant.
+ */
+static struct dentry *kasumi_lock_src_rename(struct dentry *p1,
+					     struct dentry *p2)
+{
+	struct dentry *p;
+
+	if (p1 == p2) {
+		inode_lock_nested(d_inode(p1), I_MUTEX_PARENT);
+		return NULL;
+	}
+	p = kasumi_d_ancestor(p2, p1);
+	if (p) {
+		inode_lock_nested(d_inode(p2), I_MUTEX_PARENT);
+		inode_lock_nested(d_inode(p1), I_MUTEX_CHILD);
+		return p;
+	}
+	p = kasumi_d_ancestor(p1, p2);
+	if (p) {
+		inode_lock_nested(d_inode(p1), I_MUTEX_PARENT);
+		inode_lock_nested(d_inode(p2), I_MUTEX_CHILD);
+		return p;
+	}
+	inode_lock_nested(d_inode(p1), I_MUTEX_PARENT);
+	inode_lock_nested(d_inode(p2), I_MUTEX_PARENT2);
+	return NULL;
+}
+
+static void kasumi_unlock_src_rename(struct dentry *p1, struct dentry *p2)
+{
+	inode_unlock(d_inode(p1));
+	if (p1 != p2)
+		inode_unlock(d_inode(p2));
+}
+
+/* Issue the delegated rename on the source dentries, building the version-
+ * appropriate call shape.  The source mounts' idmaps govern the two ends. */
+static int KASUMI_NOCFI kasumi_vnode_do_src_rename(
+	struct kasumi_vnode_info *oinfo, struct kasumi_vnode_info *ninfo,
+	struct inode *sodir, struct dentry *src_old,
+	struct inode *sndir, struct dentry *src_new, unsigned int flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	struct renamedata rd = {};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	rd.old_mnt_idmap = mnt_idmap(oinfo->source.mnt);
+	rd.new_mnt_idmap = mnt_idmap(ninfo->source.mnt);
+#else
+	rd.old_mnt_userns = mnt_user_ns(oinfo->source.mnt);
+	rd.new_mnt_userns = mnt_user_ns(ninfo->source.mnt);
+#endif
+	rd.old_dir = sodir;
+	rd.old_dentry = src_old;
+	rd.new_dir = sndir;
+	rd.new_dentry = src_new;
+	rd.delegated_inode = NULL;
+	rd.flags = flags;
+	return kasumi_vfs_rename(&rd);
+#else
+	return kasumi_vfs_rename(sodir, src_old, sndir, src_new, NULL, flags);
+#endif
+}
+
+static int KASUMI_NOCFI kasumi_vnode_dir_rename(KVN_IDMAP_ARG
+						struct inode *old_dir,
+						struct dentry *old_dentry,
+						struct inode *new_dir,
+						struct dentry *new_dentry,
+						unsigned int flags)
+{
+	struct kasumi_vnode_info *oinfo = old_dir->i_private;
+	struct kasumi_vnode_info *ninfo = new_dir->i_private;
+	struct dentry *src_odir, *src_ndir, *src_old = NULL, *src_new = NULL;
+	struct dentry *trap;
+	struct inode *sodir, *sndir;
+	bool two_mnt;
+	int ret;
+
+	if (!oinfo || !ninfo)
+		return -ENOTDIR;
+	/* Rename needs real backing on both ends; a source-less virtual
+	 * container cannot be a rename source or target — report cross-device
+	 * so userspace falls back to copy + unlink. */
+	if (!oinfo->source.dentry || !ninfo->source.dentry)
+		return -EXDEV;
+	if (!kasumi_vfs_rename || !kasumi_lookup_one_len)
+		return -EOPNOTSUPP;
+
+	/* Sleeping op on our static i_op table: hold the module-refcount gate. */
+	if (!try_module_get(THIS_MODULE))
+		return -ENOENT;
+
+	src_odir = oinfo->source.dentry;
+	src_ndir = ninfo->source.dentry;
+	sodir = d_inode(src_odir);
+	sndir = d_inode(src_ndir);
+	if (!sodir || !sndir || !S_ISDIR(sodir->i_mode) ||
+	    !S_ISDIR(sndir->i_mode)) {
+		module_put(THIS_MODULE);
+		return -ENOTDIR;
+	}
+
+	/* Source-mount write protection on both ends (deduped when identical). */
+	two_mnt = oinfo->source.mnt != ninfo->source.mnt;
+	ret = kasumi_vnode_src_want_write(&oinfo->source);
+	if (ret) {
+		module_put(THIS_MODULE);
+		return ret;
+	}
+	if (two_mnt) {
+		ret = kasumi_vnode_src_want_write(&ninfo->source);
+		if (ret) {
+			kasumi_vnode_src_drop_write(&oinfo->source);
+			module_put(THIS_MODULE);
+			return ret;
+		}
+	}
+
+	trap = kasumi_lock_src_rename(src_ndir, src_odir);
+
+	src_old = kasumi_lookup_one_len(old_dentry->d_name.name, src_odir,
+					old_dentry->d_name.len);
+	if (IS_ERR(src_old)) {
+		ret = PTR_ERR(src_old);
+		src_old = NULL;
+		goto unlock;
+	}
+	src_new = kasumi_lookup_one_len(new_dentry->d_name.name, src_ndir,
+					new_dentry->d_name.len);
+	if (IS_ERR(src_new)) {
+		ret = PTR_ERR(src_new);
+		src_new = NULL;
+		goto unlock;
+	}
+
+	if (d_really_is_negative(src_old)) {
+		ret = -ENOENT;			/* source vanished out-of-band */
+		goto unlock;
+	}
+	/* Subtree-loop guards, as do_renameat2 applies against the trap. */
+	if (src_old == trap) {
+		ret = -EINVAL;			/* old is an ancestor of new */
+		goto unlock;
+	}
+	if (src_new == trap) {
+		ret = -ENOTEMPTY;		/* new is an ancestor of old */
+		goto unlock;
+	}
+
+	ret = kasumi_vnode_do_src_rename(oinfo, ninfo, sodir, src_old, sndir,
+					 src_new, flags);
+	/* On success the source dcache is fixed up inside the delegated
+	 * vfs_rename (d_move/d_exchange on the source dentries); the visible
+	 * dentries are moved by the outer vfs_rename after we return, so the
+	 * vnodes (which pin the now-renamed source dentries) stay consistent. */
+
+unlock:
+	kasumi_unlock_src_rename(src_ndir, src_odir);
+	dput(src_old);
+	dput(src_new);
+	if (two_mnt)
+		kasumi_vnode_src_drop_write(&ninfo->source);
+	kasumi_vnode_src_drop_write(&oinfo->source);
+	module_put(THIS_MODULE);
+	return ret;
+}
+
 static const struct inode_operations kasumi_vnode_dir_iops = {
 	.lookup = kasumi_vnode_dir_lookup,
 	.getattr = kasumi_vnode_getattr,
@@ -996,6 +1197,7 @@ static const struct inode_operations kasumi_vnode_dir_iops = {
 	.unlink = kasumi_vnode_dir_unlink,
 	.rmdir = kasumi_vnode_dir_rmdir,
 	.link = kasumi_vnode_dir_link,
+	.rename = kasumi_vnode_dir_rename,
 };
 
 static const struct file_operations kasumi_vnode_dir_fops = {

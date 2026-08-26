@@ -193,6 +193,16 @@ extern int (*kasumi_vfs_unlink)(struct inode *, struct dentry *, struct inode **
 extern int (*kasumi_vfs_rmdir)(struct inode *, struct dentry *);
 extern int (*kasumi_vfs_link)(struct dentry *, struct inode *, struct dentry *, struct inode **);
 #endif
+/*
+ * vfs_rename took a flat argument list before 5.12 and a struct renamedata (from
+ * the kernel's fs.h; the idmap/userns member differs by era but is set by name)
+ * from 5.12 on.  Only the pointer shape is version-guarded here (Final 1c).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int (*kasumi_vfs_rename)(struct renamedata *);
+#else
+extern int (*kasumi_vfs_rename)(struct inode *, struct dentry *, struct inode *, struct dentry *, struct inode **, unsigned int);
+#endif
 /* Public LSM secctx round-trip: copy a source inode's security context onto a
  * synthetic vnode's in-core SID without touching SELinux blob internals.  Both
  * may be NULL when the LSM/symbols are unavailable — callers must check. */

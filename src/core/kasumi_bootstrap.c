@@ -186,6 +186,7 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_vfs_unlink = (void *)kasumi_lookup_callable_quiet("vfs_unlink");
 	kasumi_vfs_rmdir = (void *)kasumi_lookup_callable_quiet("vfs_rmdir");
 	kasumi_vfs_link = (void *)kasumi_lookup_callable_quiet("vfs_link");
+	kasumi_vfs_rename = (void *)kasumi_lookup_callable_quiet("vfs_rename");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
 	/* Public LSM secctx round-trip for cloning a source's SELinux context onto
 	 * a vnode.  Optional: absence only means vnodes fall back to the default
