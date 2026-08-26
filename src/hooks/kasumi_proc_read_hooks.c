@@ -323,7 +323,6 @@ kasumi_proc_proxy_kind_for_file(struct file *file,
 	const struct qstr *name;
 	enum kasumi_policy_scope scope;
 	bool spoof;
-	bool view;
 
 	if (!file || !file->f_path.dentry || !file->f_inode ||
 	    !file->f_inode->i_sb || file->f_inode->i_sb->s_magic != PROC_SUPER_MAGIC)
@@ -333,7 +332,6 @@ kasumi_proc_proxy_kind_for_file(struct file *file,
 	if (scope_out)
 		*scope_out = scope;
 	spoof = scope == KASUMI_POLICY_SCOPE_SPOOF;
-	view = scope == KASUMI_POLICY_SCOPE_VIEW;
 	if (scope == KASUMI_POLICY_SCOPE_NONE)
 		return KASUMI_PROC_PROXY_NONE;
 
@@ -344,8 +342,7 @@ kasumi_proc_proxy_kind_for_file(struct file *file,
 		return name->len == 9 ? KASUMI_PROC_PROXY_MOUNTINFO :
 			KASUMI_PROC_PROXY_MOUNTS;
 	}
-	if (((view && kasumi_policy_view_tsr_demand()) ||
-	     (spoof && (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF))) &&
+	if ((spoof && (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF)) &&
 	    ((name->len == 4 && !memcmp(name->name, "maps", 4)) ||
 	     (name->len == 5 && !memcmp(name->name, "smaps", 5)) ||
 	     (name->len == 12 && !memcmp(name->name, "smaps_rollup", 12))))
@@ -411,10 +408,8 @@ static bool kasumi_mount_proxy_filter_active(
 		active = scope == KASUMI_POLICY_SCOPE_SPOOF &&
 			 (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE);
 	else if (proxy->kind == KASUMI_PROC_PROXY_MAPS)
-		active = (scope == KASUMI_POLICY_SCOPE_VIEW &&
-			  kasumi_policy_view_tsr_demand()) ||
-			 (scope == KASUMI_POLICY_SCOPE_SPOOF &&
-			  (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF));
+		active = scope == KASUMI_POLICY_SCOPE_SPOOF &&
+			 (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF);
 	if (active)
 		return true;
 

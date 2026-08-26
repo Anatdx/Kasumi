@@ -54,9 +54,6 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
-#include "kasumi_syscall_redirect.h"
-#include "kasumi_task_marker.h"
-#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_virtual_file.h"
@@ -420,21 +417,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (copy_from_user(&val, arg, sizeof(val)))
 			return -EFAULT;
 		if (val) {
-			if (kasumi_policy_view_tsr_demand() &&
-			    (!kasumi_tracepoint_hooks_available() ||
-			     !kasumi_task_marker_ready()))
-				return -ENODEV;
 			mutex_lock(&kasumi_config_mutex);
 			if (READ_ONCE(kasumi_enabled)) {
-				if (kasumi_policy_view_tsr_demand()) {
-					if (kasumi_tracepoint_hooks_set_enabled(true)) {
-						mutex_unlock(&kasumi_config_mutex);
-						return -ENODEV;
-					}
-					kasumi_task_marker_refresh_scopes();
-				} else {
-					(void)kasumi_tracepoint_hooks_set_enabled(false);
-				}
 				mutex_unlock(&kasumi_config_mutex);
 				return 0;
 			}
@@ -442,28 +426,19 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				mutex_unlock(&kasumi_config_mutex);
 				return -ENODEV;
 			}
-			if (kasumi_policy_view_tsr_demand() &&
-			    kasumi_tracepoint_hooks_set_enabled(true)) {
-				kasumi_policy_disable_provider_locked();
-				mutex_unlock(&kasumi_config_mutex);
-				return -ENODEV;
-			}
-			/* The lifecycle marker also applies non-TSR scoped spoof state. */
-			kasumi_task_marker_set_enabled(true);
-			/* Publish provider state and completed task scan together. */
+			/* Publish provider state; the path view is served entirely
+			 * through the VFS lookup/vnode layer, with no syscall
+			 * dispatcher or task-scope marker to arm. */
 			smp_store_release(&kasumi_enabled, true);
 			mutex_unlock(&kasumi_config_mutex);
 		} else {
 			mutex_lock(&kasumi_config_mutex);
-			if (!READ_ONCE(kasumi_enabled) &&
-			    !kasumi_task_marker_active()) {
+			if (!READ_ONCE(kasumi_enabled)) {
 				mutex_unlock(&kasumi_config_mutex);
 				return 0;
 			}
 			/* Stop policy readers before provider pointers are withdrawn. */
 			smp_store_release(&kasumi_enabled, false);
-			kasumi_task_marker_set_enabled(false);
-			(void)kasumi_tracepoint_hooks_set_enabled(false);
 			kasumi_policy_disable_provider_locked();
 			mutex_unlock(&kasumi_config_mutex);
 		}
@@ -922,8 +897,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		char *kbuf;
 		size_t buf_size, written = 0;
 		int n;
-		bool path_tsr = false;
-		bool xattr_path_tsr = false;
 
 		if (copy_from_user(&list_arg, arg, sizeof(list_arg)))
 			return -EFAULT;
@@ -944,41 +917,16 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: none\n");
 		written += n;
 
-		/* Path redirect */
-		if (kasumi_tracepoint_hooks_active() &&
-		    kasumi_task_marker_ready() &&
-		    kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_openat))
-			path_tsr = true;
-#ifdef __NR_getxattr
-		if (kasumi_tracepoint_hooks_active() &&
-		    kasumi_task_marker_ready() &&
-		    kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_getxattr))
-			xattr_path_tsr = true;
-#endif
-#ifdef __NR_listxattr
-		if (kasumi_tracepoint_hooks_active() &&
-		    kasumi_task_marker_ready() &&
-		    kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_listxattr))
-			xattr_path_tsr = true;
-#endif
-		if (path_tsr)
-			n = scnprintf(kbuf + written, buf_size - written, "path: TSR\n");
-		else
-			n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
+		/* Path redirect: served entirely through the VFS lookup/vnode
+		 * layer; no syscall dispatcher or sys_enter tracepoint remains. */
+		n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "virtual open: live=%u total=%llu; dir iterate=%llu; virtual access=%llu; legacy path=%llu; file_view=removed\n",
+			      "virtual open: live=%u total=%llu; dir iterate=%llu; file_view=removed\n",
 			      kasumi_virtual_file_live(),
 			      (unsigned long long)kasumi_virtual_file_open_count(),
 			      (unsigned long long)
-				      kasumi_virtual_dir_iterate_count(),
-			      (unsigned long long)
-				      kasumi_syscall_virtual_access_count(),
-			      (unsigned long long)
-				      kasumi_syscall_redirect_fallback_count());
+				      kasumi_virtual_dir_iterate_count());
 		written += n;
 		{
 			dev_t vnode_dev = kasumi_vnode_device();
@@ -991,17 +939,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			written += n;
 		}
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "xattr path: %s; virtual handled=%llu; virtual mutate=%llu\n",
-			      xattr_path_tsr ? "TSR" : "none",
-			      (unsigned long long)
-				      kasumi_syscall_virtual_xattr_count(),
-			      (unsigned long long)
-				      kasumi_syscall_virtual_mutation_count());
-		written += n;
-		n = scnprintf(kbuf + written, buf_size - written,
-			      "task marker: %s%s\n",
-			      kasumi_task_marker_ready() ? "uid lifecycle" : "none",
-			      kasumi_task_marker_active() ? " (active)" : "");
+			      "xattr path: none\n");
 		written += n;
 
 		/* VFS hooks */
@@ -1695,15 +1633,6 @@ static void kasumi_quiesce_stop_new(void)
 
 	/* Stop routed execution before withdrawing any handler-owned state. */
 	smp_store_release(&kasumi_enabled, false);
-	kasumi_task_marker_set_enabled(false);
-	(void)kasumi_tracepoint_hooks_set_enabled(false);
-	kasumi_tracepoint_hooks_exit();
-	kasumi_task_marker_exit();
-
-	/* The dispatcher slot remains installed until every guard created before
-	 * sys_enter unregister has released.  A guard covers both the pre-dispatch
-	 * window and the complete redirected syscall.
-	 */
 
 	/* No new object may acquire module-owned callbacks after this point. */
 	kasumi_virtual_file_stop_new();
@@ -1725,18 +1654,14 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	struct kasumi_quiesce_arg a;
 	unsigned int control_files;
 	unsigned int getfd;
-	unsigned int marker;
-	unsigned int redirect;
 	unsigned int proxies;
 	unsigned int virtual_files;
 	unsigned int iop_active;
 	bool iop_quiesced;
 	unsigned int known_refs;
 	unsigned int module_refs;
-	bool dispatcher_detached;
 	bool unload_pin_held;
 	bool ready;
-	int ret;
 
 	if (copy_from_user(&a, arg, sizeof(a)))
 		return -EFAULT;
@@ -1760,47 +1685,29 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	kasumi_quiesce_stop_new();
 	control_files = (unsigned int)atomic_read(&kasumi_control_files);
 	getfd = kasumi_proc_getfd_pending();
-	marker = kasumi_task_marker_pending_work_count();
-	redirect = kasumi_tracepoint_hooks_pending_guard_count();
-	if (!redirect && !kasumi_quiesce_error) {
-		ret = kasumi_syscall_redirect_stop_new();
-		if (ret)
-			kasumi_quiesce_error = ret;
-	}
-	/* The pending count only decreases after producers have stopped.  If it
-	 * reached zero just after the first sample, this poll remains DRAINING and
-	 * the next one performs the detach.
-	 */
-	redirect = kasumi_tracepoint_hooks_pending_guard_count();
-	dispatcher_detached = kasumi_syscall_redirect_detached();
 	proxies = kasumi_proc_proxy_live();
 	virtual_files = kasumi_virtual_file_live();
 	iop_active = kasumi_iop_override_active();
 	iop_quiesced = kasumi_iop_override_quiesced();
 	unload_pin_held = kasumi_bootstrap_unload_pin_held();
 	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
-	known_refs = control_files + getfd + marker + redirect + proxies +
+	known_refs = control_files + getfd + proxies +
 		virtual_files + (unload_pin_held ? 1U : 0U);
 
 	a.state = KSM_QUIESCE_STATE_DRAINING;
 	a.busy_mask = 0;
 	if (getfd)
 		a.busy_mask |= KSM_QUIESCE_BUSY_GETFD;
-	if (marker)
-		a.busy_mask |= KSM_QUIESCE_BUSY_MARKER;
-	if (redirect)
-		a.busy_mask |= KSM_QUIESCE_BUSY_REDIRECT;
 	if (proxies)
 		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
 	if (control_files != 1)
 		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
 	if (virtual_files || module_refs > known_refs || iop_active ||
-	    !iop_quiesced ||
-	    !dispatcher_detached)
+	    !iop_quiesced)
 		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
 
-	ready = !getfd && !marker && !redirect && !proxies && !virtual_files &&
-		dispatcher_detached && iop_quiesced && control_files == 1 &&
+	ready = !getfd && !proxies && !virtual_files &&
+		iop_quiesced && control_files == 1 &&
 		module_refs == control_files + (unload_pin_held ? 1U : 0U);
 
 	if (kasumi_quiesce_error) {
@@ -1825,8 +1732,8 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	if (a.state != KSM_QUIESCE_STATE_READY)
 		WRITE_ONCE(kasumi_quiesce_state, a.state);
 	a.pending_getfd = getfd;
-	a.pending_marker = marker;
-	a.pending_redirect = redirect;
+	a.pending_marker = 0;
+	a.pending_redirect = 0;
 	a.live_proc_proxy = proxies;
 	a.live_file_view = 0;
 	a.control_files = control_files;
@@ -1834,46 +1741,6 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	if (copy_to_user(arg, &a, sizeof(a)))
 		return -EFAULT;
 	return 0;
-}
-
-static bool kasumi_cmd_changes_view_scope(unsigned int cmd)
-{
-	switch (cmd) {
-	case KSM_IOC_ADD_RULE:
-	case KSM_IOC_DEL_RULE:
-	case KSM_IOC_HIDE_RULE:
-	case KSM_IOC_CLEAR_ALL:
-	case KSM_IOC_ADD_MERGE_RULE:
-	case KSM_IOC_SET_POLICY_OWNER:
-	case KSM_IOC_SET_POLICY_UIDS:
-	case KSM_IOC_CLEAR_POLICY_UIDS:
-	case KSM_IOC_REPLACE_POLICY:
-	case KSM_IOC_RESET_POLICY:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static bool kasumi_cmd_changes_spoof_state(unsigned int cmd)
-{
-	return cmd == KSM_IOC_SET_MOUNT_HIDE ||
-	       cmd == KSM_IOC_SET_MOUNT_HIDE_MODE;
-}
-
-static void kasumi_reconcile_view_tsr(void)
-{
-	if (!READ_ONCE(kasumi_enabled))
-		return;
-	if (!kasumi_policy_view_tsr_demand()) {
-		(void)kasumi_tracepoint_hooks_set_enabled(false);
-		return;
-	}
-	if (kasumi_tracepoint_hooks_set_enabled(true)) {
-		pr_warn("Kasumi: VIEW rules active without TSR transport\n");
-		return;
-	}
-	kasumi_task_marker_refresh_scopes();
 }
 
 static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
@@ -1930,11 +1797,6 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 		ret = -EINVAL;
 		break;
 	}
-	if (!ret && kasumi_cmd_changes_view_scope(cmd))
-		kasumi_reconcile_view_tsr();
-	else if (!ret && kasumi_cmd_changes_spoof_state(cmd) &&
-		 READ_ONCE(kasumi_enabled))
-		kasumi_task_marker_refresh_scopes();
 out:
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
 	mutex_unlock(&kasumi_ioctl_mutex);

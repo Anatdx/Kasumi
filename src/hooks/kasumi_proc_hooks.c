@@ -52,7 +52,6 @@
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_proc_hooks.h"
-#include "kasumi_syscall_redirect.h"
 #include "kasumi_fake_mountinfo.h"
 
 /*

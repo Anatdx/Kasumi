@@ -57,7 +57,6 @@
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
-#include "kasumi_syscall_redirect.h"
 
 #ifndef KASUMI_VFS_KPROBES
 #define KASUMI_VFS_KPROBES 1

@@ -30,9 +30,6 @@
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
-#include "kasumi_syscall_redirect.h"
-#include "kasumi_task_marker.h"
-#include "kasumi_tracepoint_hooks.h"
 
 #ifndef KASUMI_VERSION
 #define KASUMI_VERSION "0.1.0-dev"
@@ -326,30 +323,6 @@ int kasumi_bootstrap_init(void)
 
 	kasumi_resolve_system_dev();
 
-	ret = kasumi_task_marker_init(kasumi_policy_uid_needs_view_tsr);
-	if (ret)
-		pr_warn("Kasumi: task scope lifecycle unavailable: %d\n", ret);
-
-	if (!kasumi_no_tracepoint_param) {
-		ret = kasumi_syscall_redirect_init();
-		if (ret) {
-			pr_warn("Kasumi: TSR dispatcher unavailable: %d; virtual path redirect disabled\n",
-				ret);
-		} else if (!kasumi_task_marker_available()) {
-			pr_warn("Kasumi: task marker unavailable; virtual path redirect disabled\n");
-			kasumi_syscall_redirect_exit();
-		} else {
-			ret = kasumi_tracepoint_hooks_init();
-			if (ret) {
-				pr_warn("Kasumi: TSR tracepoint unavailable: %d; virtual path redirect disabled\n",
-					ret);
-				kasumi_syscall_redirect_exit();
-			}
-		}
-	} else {
-		pr_alert("Kasumi: TSR disabled (kasumi_no_tracepoint=1)\n");
-	}
-
 	ret = kasumi_fake_mi_init();
 	if (ret)
 		pr_warn("Kasumi: fake mountinfo unavailable: %d\n", ret);
@@ -377,7 +350,6 @@ int kasumi_bootstrap_init(void)
 	 * later initialization step non-fatal.
 	 */
 	(void)kasumi_fake_selinuxfs_access_init();
-	kasumi_task_marker_start();
 	if (kasumi_bootstrap_quiesce_supported()) {
 		__module_get(THIS_MODULE);
 		WRITE_ONCE(kasumi_unload_pin_held, true);
@@ -391,16 +363,10 @@ err_fop_bridge:
 	kasumi_iop_override_exit();
 	kasumi_vfs_hooks_exit(0);
 err_active:
-	kasumi_tracepoint_hooks_exit();
-	kasumi_task_marker_exit();
-	kasumi_syscall_redirect_exit();
 	kasumi_proc_hooks_exit();
 	kasumi_fake_mi_exit();
 	goto err_buffers;
 err_redirect:
-	kasumi_tracepoint_hooks_exit();
-	kasumi_task_marker_exit();
-	kasumi_syscall_redirect_exit();
 	kasumi_fake_mi_exit();
 err_buffers:
 	vfree(kasumi_percpu_base);
@@ -423,23 +389,12 @@ void kasumi_bootstrap_exit(void)
 	WARN_ON_ONCE(READ_ONCE(kasumi_unload_pin_held));
 
 	/*
-	 * PHASE 1: Sever every entry point that can drive a syscall hook.
-	 *
-	 *  1. tracepoint_hooks_exit() stops new redirects and waits for callbacks.
-	 *  2. task_marker_exit() stops UID/fork lifecycle callbacks.
-	 *  3. syscall_redirect_exit() restores the single dispatcher slot and
-	 *     waits via SRCU for in-flight dispatchers and handlers to drain.
-	 *
-	 * Ordering matters: relative to KSU's manager_exit, this is the
-	 * tracepoint -> dispatcher -> hooks teardown. Any cleanup that frees
-	 * resources reachable from h_openat/h_statfs/etc. (proc fd proxies,
-	 * fake mountinfo, fop/iop shadows, vfs hooks) MUST run after this phase.
+	 * The path view is served entirely through the VFS lookup/vnode layer and
+	 * the proc/mountinfo kprobes; there is no syscall dispatcher or sys_enter
+	 * tracepoint to sever.  Tear down handler-reachable state directly: free
+	 * the resources those VFS/proc hooks depend on (proc fd proxies, fake
+	 * mountinfo, fop/iop shadows, vfs hooks).
 	 */
-	kasumi_tracepoint_hooks_exit();
-	kasumi_task_marker_exit();
-	kasumi_syscall_redirect_exit();
-
-	/* PHASE 2: handlers can no longer be reached, free their dependencies. */
 	kasumi_virtual_file_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);

@@ -47,8 +47,6 @@
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
-#include "kasumi_task_marker.h"
-#include "kasumi_tracepoint_hooks.h"
 #include "kasumi_fop_override.h"
 
 bool kasumi_enabled;
@@ -994,8 +992,6 @@ void kasumi_cleanup_locked(void)
 
 	/* Pair with policy readers before cleanup withdraws provider state. */
 	smp_store_release(&kasumi_enabled, false);
-	kasumi_task_marker_set_enabled(false);
-	(void)kasumi_tracepoint_hooks_set_enabled(false);
 	kasumi_stealth_enabled = false;
 	kasumi_feature_enabled_mask = 0;
 	kasumi_mount_hide_mode = KSM_MOUNT_HIDE_MODE_NORMAL;

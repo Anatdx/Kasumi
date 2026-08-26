@@ -50,8 +50,6 @@ bool kasumi_policy_prepare_enable_locked(void);
 void kasumi_policy_disable_provider_locked(void);
 bool kasumi_policy_uid_is_view_target(uid_t uid);
 bool kasumi_policy_uid_is_spoof_target(uid_t uid);
-bool kasumi_policy_uid_needs_view_tsr(uid_t uid);
-bool kasumi_policy_view_tsr_demand(void);
 u32 kasumi_policy_configured_owner(void);
 u32 kasumi_policy_effective_owner(void);
 int kasumi_policy_replace(u32 owner, u32 flags,
