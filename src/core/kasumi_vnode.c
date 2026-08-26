@@ -150,19 +150,25 @@ static int KASUMI_NOCFI kasumi_vnode_getattr(KVN_IDMAP_ARG const struct path *pa
 	return ret;
 }
 
+/*
+ * A Kasumi vnode is a synthetic inode on the visible superblock with no xattr
+ * backing.  security.selinux is served by the cloned SID through the LSM, but
+ * arbitrary names (user.*, security.capability, ...) cannot be delegated to the
+ * source without a system-wide hot-path getxattr callback that is not cleanly
+ * unload-safe (getxattr has no quiesce point).  So present NO listed xattrs:
+ * this keeps listxattr consistent with getxattr, which returns -ENODATA for
+ * non-security names on the synthetic inode, and removes the listxattr<->getxattr
+ * mismatch a detector could otherwise use.  security.selinux stays gettable via
+ * the LSM, exactly as on any file whose listxattr does not enumerate the
+ * permission-gated security namespace.
+ */
 static ssize_t KASUMI_NOCFI kasumi_vnode_listxattr(struct dentry *dentry,
 						   char *buffer, size_t size)
 {
-	struct inode *vi = d_inode(dentry);
-	struct kasumi_vnode_info *info = vi ? vi->i_private : NULL;
-	struct inode *r_inode;
-
-	if (!info || !info->source.dentry)
-		return -EOPNOTSUPP;
-	r_inode = d_inode(info->source.dentry);
-	if (!r_inode || !r_inode->i_op || !r_inode->i_op->listxattr)
-		return -EOPNOTSUPP;
-	return r_inode->i_op->listxattr(info->source.dentry, buffer, size);
+	(void)dentry;
+	(void)buffer;
+	(void)size;
+	return 0;
 }
 
 static const char *KASUMI_NOCFI kasumi_vnode_get_link(struct dentry *dentry,
