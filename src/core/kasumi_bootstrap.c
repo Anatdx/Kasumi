@@ -156,6 +156,8 @@ static int kasumi_resolve_runtime_symbols(void)
 		pr_warn("Kasumi: mm_get_unmapped_area not found, virtual mmap uses the arch fallback\n");
 #endif
 	kasumi_vfs_getattr = (void *)kasumi_lookup_callable("vfs_getattr");
+	kasumi_notify_change =
+		(void *)kasumi_lookup_callable_quiet("notify_change");
 	kasumi_vfs_getxattr_addr =
 		(void *)kasumi_lookup_callable_quiet("vfs_getxattr");
 	kasumi_vfs_listxattr_addr =

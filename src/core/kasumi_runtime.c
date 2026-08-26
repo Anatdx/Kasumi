@@ -362,6 +362,15 @@ dev_t kasumi_system_dev;
 
 int (*kasumi_kern_path)(const char *, unsigned int, struct path *);
 int (*kasumi_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+int (*kasumi_notify_change)(struct mnt_idmap *, struct dentry *,
+			    struct iattr *, struct inode **);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int (*kasumi_notify_change)(struct user_namespace *, struct dentry *,
+			    struct iattr *, struct inode **);
+#else
+int (*kasumi_notify_change)(struct dentry *, struct iattr *, struct inode **);
+#endif
 struct file *(*kasumi_dentry_open)(const struct path *, int, const struct cred *);
 int (*kasumi_security_inode_getsecctx)(struct inode *, void **, u32 *);
 int (*kasumi_security_inode_notifysecctx)(struct inode *, void *, u32);

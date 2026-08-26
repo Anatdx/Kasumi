@@ -128,6 +128,17 @@ extern dev_t kasumi_system_dev;
 
 extern int (*kasumi_kern_path)(const char *, unsigned int, struct path *);
 extern int (*kasumi_vfs_getattr)(const struct path *, struct kstat *, u32, unsigned int);
+/* notify_change first arg (idmap/userns) varies across kernel versions. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+extern int (*kasumi_notify_change)(struct mnt_idmap *, struct dentry *,
+				   struct iattr *, struct inode **);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+extern int (*kasumi_notify_change)(struct user_namespace *, struct dentry *,
+				   struct iattr *, struct inode **);
+#else
+extern int (*kasumi_notify_change)(struct dentry *, struct iattr *,
+				   struct inode **);
+#endif
 int kasumi_vfs_getattr_unprojected(const struct path *path,
 				   struct kstat *stat, u32 request_mask,
 				   unsigned int query_flags);

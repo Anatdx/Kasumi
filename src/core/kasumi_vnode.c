@@ -154,6 +154,51 @@ static const char *KASUMI_NOCFI kasumi_vnode_get_link(struct dentry *dentry,
 				       r_inode, done);
 }
 
+/*
+ * Delegate an attribute change (chmod/chown/utimes/truncate) to the pinned
+ * source, so a redirected path is writable-through like a bind mount: the
+ * source's DAC/SELinux govern, evaluated against the caller's creds inside
+ * notify_change.  A pure-virtual directory has no backing store and is
+ * read-only.  Mutation sink (Final Phase 1a).
+ */
+static int KASUMI_NOCFI kasumi_vnode_setattr(KVN_IDMAP_ARG struct dentry *dentry,
+					     struct iattr *attr)
+{
+	struct inode *vi = d_inode(dentry);
+	struct kasumi_vnode_info *info = vi ? vi->i_private : NULL;
+	struct dentry *src_dentry;
+	struct inode *src_inode;
+	struct iattr sattr;
+	int ret;
+
+	if (!info || !info->source.dentry)
+		return -EROFS;
+	if (!kasumi_notify_change)
+		return -EOPNOTSUPP;
+	src_dentry = info->source.dentry;
+	src_inode = d_inode(src_dentry);
+	if (!src_inode)
+		return -ENOENT;
+
+	/* ATTR_FILE points at the virtual file; swap it for the opened source
+	 * file so a truncate reaches the source's fs/driver, not the vnode. */
+	sattr = *attr;
+	if (sattr.ia_valid & ATTR_FILE) {
+		struct file *rf = (sattr.ia_file &&
+				   sattr.ia_file->private_data) ?
+				  sattr.ia_file->private_data : NULL;
+		if (rf)
+			sattr.ia_file = rf;
+		else
+			sattr.ia_valid &= ~ATTR_FILE;
+	}
+
+	inode_lock(src_inode);
+	ret = kasumi_notify_change(KVN_IDMAP_CALL src_dentry, &sattr, NULL);
+	inode_unlock(src_inode);
+	return ret;
+}
+
 /* ---- data plane: delegate to the pinned source ------------------------- */
 
 static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file)
@@ -290,6 +335,7 @@ static int KASUMI_NOCFI kasumi_vnode_fsync(struct file *file, loff_t start,
 
 static const struct inode_operations kasumi_vnode_file_iops = {
 	.getattr = kasumi_vnode_getattr,
+	.setattr = kasumi_vnode_setattr,
 	.listxattr = kasumi_vnode_listxattr,
 	.get_link = kasumi_vnode_get_link,
 };
@@ -561,6 +607,7 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 static const struct inode_operations kasumi_vnode_dir_iops = {
 	.lookup = kasumi_vnode_dir_lookup,
 	.getattr = kasumi_vnode_getattr,
+	.setattr = kasumi_vnode_setattr,
 	.listxattr = kasumi_vnode_listxattr,
 };
 
