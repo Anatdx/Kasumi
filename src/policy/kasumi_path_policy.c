@@ -682,11 +682,18 @@ kasumi_policy_scope_for_uid(uid_t uid, bool require_enabled)
 	bool allow_gate = true;
 	bool denied = false;
 
-	/* Acquire the provider/list state published by SET_ENABLED. */
-	if (unlikely((!kasumi_uid_is_app(uid) &&
-		       !kasumi_uid_is_isolated(uid)) ||
-	    (require_enabled && !smp_load_acquire(&kasumi_enabled))))
+	/* Provider/list state is published by SET_ENABLED; a disabled provider
+	 * projects nothing for anyone. */
+	if (require_enabled && !smp_load_acquire(&kasumi_enabled))
 		return KASUMI_POLICY_SCOPE_NONE;
+	/* Non-app, non-isolated UIDs -- system_server, init, native daemons, root,
+	 * shell -- default to VIEW so the system actually applies the module: PMS
+	 * and the OverlayManager must scan and enable a redirected priv-app / RRO,
+	 * init reads module files at boot, and so on. A detector cannot obtain a
+	 * system/root/shell UID, so there is no concealment need here; app and
+	 * isolated UIDs continue through the per-observer policy below. */
+	if (!kasumi_uid_is_app(uid) && !kasumi_uid_is_isolated(uid))
+		return KASUMI_POLICY_SCOPE_VIEW;
 	/* Isolated app processes always receive concealment, independently of
 	 * their transient UID and of any host-app allow/deny list.
 	 */
