@@ -359,12 +359,8 @@ kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 bool kasumi_debug_enabled;
 bool kasumi_stealth_enabled;
 
-struct kasumi_cmdline_rcu __rcu *kasumi_spoof_cmdline_ptr;
-bool kasumi_cmdline_spoof_active;
-
 pid_t kasumi_daemon_pid;
 
-int kasumi_cmdline_kprobe_registered;
 int kasumi_getxattr_kprobe_registered;
 int kasumi_mount_hide_vfsmnt_registered;
 int kasumi_mount_hide_mountinfo_registered;

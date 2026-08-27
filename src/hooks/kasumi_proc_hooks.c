@@ -168,64 +168,7 @@ static struct kprobe kasumi_kp_reboot = {
 	.pre_handler = kasumi_reboot_pre,
 };
 
-/* ======================================================================
- * cmdline spoofing: kprobe pre_handler on cmdline_proc_show
- * When spoof active, write fake cmdline to seq_file and skip original.
- * ====================================================================== */
-
-static int kasumi_cmdline_pre(struct kprobe *p, struct pt_regs *regs)
-{
-	struct seq_file *m;
-	bool did_spoof = false;
-	pid_t pid;
-
-	if (!READ_ONCE(kasumi_cmdline_spoof_active))
-		return 0;
-	if (!kasumi_policy_current_is_spoof_target())
-		return 0;
-	pid = task_tgid_vnr(current);
-	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
-		return 0;
-
-#if defined(__aarch64__)
-	m = (struct seq_file *)regs->regs[0];
-#elif defined(__x86_64__)
-	m = (struct seq_file *)regs->di;
-#else
-	return 0;
-#endif
-
-	rcu_read_lock();
-	{
-		struct kasumi_cmdline_rcu *c = rcu_dereference(kasumi_spoof_cmdline_ptr);
-		if (c && c->cmdline[0]) {
-			seq_puts(m, c->cmdline);
-			seq_putc(m, '\n');
-			did_spoof = true;
-		}
-	}
-	rcu_read_unlock();
-
-	if (!did_spoof)
-		return 0;
-
-	/* Skip original: set PC to return address, return value 0 */
-#if defined(__aarch64__)
-	instruction_pointer_set(regs, regs->regs[30]);
-	regs->regs[0] = 0;
-#elif defined(__x86_64__)
-	instruction_pointer_set(regs, *(unsigned long *)regs->sp);
-	regs->sp += sizeof(unsigned long);
-	regs->ax = 0;
-#endif
-	return 1;
-}
-
-static struct kprobe kasumi_kp_cmdline = {
-	.pre_handler = kasumi_cmdline_pre,
-};
-
-int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_kprobes)
+int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint)
 {
 	(void)no_tracepoint;
 	atomic_set(&kasumi_getfd_pending, 0);
@@ -265,25 +208,6 @@ int kasumi_proc_hooks_init(bool skip_getfd, bool no_tracepoint, bool skip_extra_
 		pr_alert("Kasumi: skipping GET_FD reboot kprobe\n");
 	}
 
-	if (!skip_extra_kprobes) {
-		int ret;
-		unsigned long cmdline_addr = kasumi_lookup_name("cmdline_proc_show");
-
-		if (cmdline_addr) {
-			kasumi_kp_cmdline.addr = (kprobe_opcode_t *)cmdline_addr;
-			ret = register_kprobe(&kasumi_kp_cmdline);
-			if (ret == 0) {
-				pr_info("Kasumi: cmdline spoofing via cmdline_proc_show\n");
-				kasumi_cmdline_kprobe_registered = 1;
-			} else {
-				pr_warn("Kasumi: register_kprobe(cmdline_proc_show) failed: %d\n",
-					ret);
-			}
-		} else {
-			pr_warn("Kasumi: cmdline_proc_show not found, cmdline spoofing disabled\n");
-		}
-	}
-
 	kasumi_proc_read_hooks_init();
 
 	return 0;
@@ -313,10 +237,6 @@ void kasumi_proc_hooks_stop_new(void)
 	 */
 	atomic_set(&kasumi_getfd_accepting, 0);
 	kasumi_proc_read_hooks_stop_new();
-	if (kasumi_cmdline_kprobe_registered) {
-		unregister_kprobe(&kasumi_kp_cmdline);
-		kasumi_cmdline_kprobe_registered = 0;
-	}
 	if (kasumi_reboot_kprobe_registered) {
 		unregister_kprobe(&kasumi_kp_reboot);
 		kasumi_reboot_kprobe_registered = 0;

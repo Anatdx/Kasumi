@@ -552,36 +552,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return -EOPNOTSUPP;
 	}
 
-	if (cmd == KSM_IOC_SET_CMDLINE) {
-		struct kasumi_spoof_cmdline *c = kmalloc(sizeof(*c), GFP_KERNEL);
-		struct kasumi_cmdline_rcu *new_cmdline, *old_cmdline;
-
-		if (!c)
-			return -ENOMEM;
-		if (copy_from_user(c, arg, sizeof(*c))) {
-			kfree(c);
-			return -EFAULT;
-		}
-		new_cmdline = kmalloc(sizeof(*new_cmdline), GFP_KERNEL);
-		if (!new_cmdline) {
-			kfree(c);
-			return -ENOMEM;
-		}
-		strscpy(new_cmdline->cmdline, c->cmdline, sizeof(new_cmdline->cmdline));
-		mutex_lock(&kasumi_config_mutex);
-		old_cmdline = rcu_dereference_protected(kasumi_spoof_cmdline_ptr,
-							lockdep_is_held(&kasumi_config_mutex));
-		rcu_assign_pointer(kasumi_spoof_cmdline_ptr, new_cmdline);
-		mutex_unlock(&kasumi_config_mutex);
-		if (old_cmdline)
-			kfree_rcu(old_cmdline, rcu);
-		kasumi_cmdline_spoof_active = (c->cmdline[0] != '\0');
-		kfree(c);
-		if (kasumi_cmdline_spoof_active)
-			kasumi_log("cmdline: spoofed\n");
-		return 0;
-	}
-
 	if (cmd == KSM_IOC_ADD_SPOOF_KSTAT || cmd == KSM_IOC_UPDATE_SPOOF_KSTAT) {
 		struct kasumi_spoof_kstat __user *u = (struct kasumi_spoof_kstat __user *)arg;
 		struct kasumi_spoof_kstat *k;
@@ -863,8 +833,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	if (cmd == KSM_IOC_GET_FEATURES) {
 		int features = kasumi_bootstrap_quiesce_supported() ?
 			KSM_FEATURE_QUIESCE : 0;
-		if (kasumi_cmdline_kprobe_registered)
-			features |= KSM_FEATURE_CMDLINE_SPOOF;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
 		features |= KSM_FEATURE_MERGE_DIR;
 		if (kasumi_getxattr_kprobe_registered)
@@ -951,13 +919,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			      kasumi_fake_selinuxfs_status_active() ? "shadow fop" : "none",
 			      kasumi_fake_selinuxfs_proc_attr_active() ?
 				      "proc op kprobe" : "none");
-		written += n;
-
-		/* cmdline */
-		if (kasumi_cmdline_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kprobe (cmdline_proc_show)\n");
-		else
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: none\n");
 		written += n;
 
 		/* mountinfo/mounts hide */
@@ -1768,7 +1729,6 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_HIDE_OVERLAY_XATTRS:
 	case KSM_IOC_ADD_MERGE_RULE:
 	case KSM_IOC_SET_MIRROR_PATH:
-	case KSM_IOC_SET_CMDLINE:
 	case KSM_IOC_GET_HOOKS:
 	case KSM_IOC_ADD_MAPS_RULE:
 	case KSM_IOC_CLEAR_MAPS_RULES:

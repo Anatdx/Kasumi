@@ -25,7 +25,6 @@
 #define KSM_PROTOCOL_VERSION 17
 
 #define KSM_MAX_LEN_PATHNAME 256
-#define KSM_FAKE_CMDLINE_SIZE 4096
 
 /*
  * Kasumi inode marking bits (stored in inode->i_mapping->flags)
@@ -187,19 +186,11 @@ struct kasumi_spoof_kstat {
 };
 
 /*
- * cmdline spoofing structure - spoof /proc/cmdline
- */
-struct kasumi_spoof_cmdline {
-    char cmdline[KSM_FAKE_CMDLINE_SIZE];               /* Fake cmdline content */
-    int err;
-};
-
-/*
  * Feature flags for KSM_CMD_GET_FEATURES
  */
 #define KSM_FEATURE_KSTAT_SPOOF    (1 << 0)
 /* Bit 1 remains reserved for the removed uname feature. */
-#define KSM_FEATURE_CMDLINE_SPOOF  (1 << 2)
+/* Bit 2 remains reserved for the removed cmdline feature. */
 #define KSM_FEATURE_SELINUX_BYPASS (1 << 4)
 #define KSM_FEATURE_MERGE_DIR      (1 << 5)
 #define KSM_FEATURE_MOUNT_HIDE    (1 << 6)  /* hide overlay from /proc/mounts and /proc/pid/mountinfo */
@@ -308,7 +299,7 @@ struct kasumi_statfs_spoof_arg {
 #define KSM_IOC_SET_MIRROR_PATH    _IOW(KSM_IOC_MAGIC, 14, struct kasumi_syscall_arg)
 #define KSM_IOC_ADD_SPOOF_KSTAT    _IOW(KSM_IOC_MAGIC, 15, struct kasumi_spoof_kstat)
 #define KSM_IOC_UPDATE_SPOOF_KSTAT _IOW(KSM_IOC_MAGIC, 16, struct kasumi_spoof_kstat)
-#define KSM_IOC_SET_CMDLINE        _IOW(KSM_IOC_MAGIC, 18, struct kasumi_spoof_cmdline)
+/* Command 18 remains reserved for the removed cmdline operation. */
 #define KSM_IOC_GET_FEATURES       _IOR(KSM_IOC_MAGIC, 19, int)
 #define KSM_IOC_SET_ENABLED        _IOW(KSM_IOC_MAGIC, 20, int)
 #define KSM_IOC_SET_HIDE_UIDS      _IOW(KSM_IOC_MAGIC, 21, struct kasumi_uid_list_arg)

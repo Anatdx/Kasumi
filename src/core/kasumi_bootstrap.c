@@ -325,7 +325,7 @@ int kasumi_bootstrap_init(void)
 	if (ret)
 		pr_warn("Kasumi: fake mountinfo unavailable: %d\n", ret);
 
-	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param, 0);
+	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param);
 	if (ret)
 		goto err_redirect;
 
@@ -381,8 +381,6 @@ err_cache:
 
 void kasumi_bootstrap_exit(void)
 {
-	struct kasumi_cmdline_rcu *old_cmdline;
-
 	pr_info("Kasumi: shutting down\n");
 	WARN_ON_ONCE(READ_ONCE(kasumi_unload_pin_held));
 
@@ -407,13 +405,9 @@ void kasumi_bootstrap_exit(void)
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();
 	kasumi_policy_shutdown_locked();
-	old_cmdline = rcu_dereference_protected(kasumi_spoof_cmdline_ptr,
-						lockdep_is_held(&kasumi_config_mutex));
-	rcu_assign_pointer(kasumi_spoof_cmdline_ptr, NULL);
 	mutex_unlock(&kasumi_config_mutex);
 
 	rcu_barrier();
-	kfree(old_cmdline);
 	if (kasumi_filldir_cache)
 		kmem_cache_destroy(kasumi_filldir_cache);
 	vfree(kasumi_percpu_base);

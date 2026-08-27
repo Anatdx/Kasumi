@@ -104,16 +104,8 @@ extern kasumi_ksu_uid_should_umount_fn kasumi_ksu_uid_should_umount_ptr;
 
 extern bool kasumi_stealth_enabled;
 
-struct kasumi_cmdline_rcu {
-	struct rcu_head rcu;
-	char cmdline[KSM_FAKE_CMDLINE_SIZE];
-};
-
-extern struct kasumi_cmdline_rcu __rcu *kasumi_spoof_cmdline_ptr;
-extern bool kasumi_cmdline_spoof_active;
 extern pid_t kasumi_daemon_pid;
 
-extern int kasumi_cmdline_kprobe_registered;
 extern int kasumi_getxattr_kprobe_registered;
 extern int kasumi_mount_hide_vfsmnt_registered;
 extern int kasumi_mount_hide_mountinfo_registered;
