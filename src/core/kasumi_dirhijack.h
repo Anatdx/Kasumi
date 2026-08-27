@@ -30,13 +30,6 @@ void kasumi_dirhijack_exit(void);
 bool kasumi_dirhijack_enabled(void);
 
 /*
- * True only when dirhijack has registered a child for every active view rule
- * and can therefore serve the whole ruleset through VFS lookup (parity-then-flip
- * safety gate).  When false, TSR must remain the view transport for the residue.
- */
-bool kasumi_dirhijack_is_provider(void);
-
-/*
  * Register a virtual child at @visible_path backed by @source, projected with
  * stable identity @v_ino.  Resolves the visible parent directory, installs the
  * lookup/superblock hijack there if needed, and indexes the child.  Sleepable

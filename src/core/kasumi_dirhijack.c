@@ -62,22 +62,6 @@ MODULE_PARM_DESC(kasumi_dirhijack_force,
 		 "DBG: bypass view-target gating so any observer sees virtual nodes (test only)");
 
 /*
- * Count of registered virtual children across all hijacked dirs.  Used by
- * kasumi_dirhijack_is_provider() to decide whether dirhijack has taken
- * responsibility for every active view rule (parity-then-flip safety gate).
- */
-static atomic_t kasumi_dh_child_count = ATOMIC_INIT(0);
-
-/*
- * Count of deep-virtual rules whose visible path has synthesized intermediate
- * directories (Slice 4c-v2).  Multiple such rules share one F_VIRTUAL_DIR child
- * at the real ancestor, so those children are NOT counted in child_count;
- * instead each covered rule bumps this, and is_provider adds it to the numerator
- * so a shared-prefix virtual subtree still reaches full coverage.
- */
-static atomic_t kasumi_dh_vtopo_rules = ATOMIC_INIT(0);
-
-/*
  * readdir cookie tag.  Virtual children are emitted after the real entries at
  * positions carrying a signature in the high bits.  NOTE: like nomount, this
  * leaves a getdents d_off distinguishable from native cookies — the one
@@ -174,31 +158,6 @@ bool kasumi_dirhijack_enabled(void)
 	return READ_ONCE(kasumi_dh_ready) && READ_ONCE(kasumi_dirhijack_param);
 }
 
-/*
- * True only when dirhijack has registered a child for every active view rule,
- * i.e. it can serve the whole ruleset through VFS lookup so TSR is not needed
- * as the view transport.  Conservative: dirhijack registers at most one child
- * per serviceable redirect (S_ISREG source, real parent) and at most one child
- * per hide (real parent), so child_count can only reach tsr_path_count+hide_count
- * when every redirect AND every hide was registered.  Any uncovered class
- * (non-regular redirect source, overlay-materialized redirect that bypasses
- * dirhijack_add, merge, unresolved parent, failed add) leaves child_count short
- * -> not a provider -> TSR is kept (no regression).
- */
-bool kasumi_dirhijack_is_provider(void)
-{
-	unsigned int view_rules;
-	unsigned int covered;
-
-	if (!kasumi_dirhijack_enabled())
-		return false;
-	view_rules = (unsigned int)atomic_read(&kasumi_tsr_path_count) +
-		     (unsigned int)atomic_read(&kasumi_hide_count);
-	covered = (unsigned int)atomic_read(&kasumi_dh_child_count) +
-		  (unsigned int)atomic_read(&kasumi_dh_vtopo_rules);
-	return view_rules > 0 && covered >= view_rules;
-}
-
 /* ---- meta accessors ---------------------------------------------------- */
 
 static struct kasumi_dh_iop *kasumi_dh_iop_of(const struct inode *inode)
@@ -258,10 +217,8 @@ static bool kasumi_dh_current_sees(void)
 		return false;
 	if (READ_ONCE(kasumi_dirhijack_force))
 		return true;
-	/* Only serve once dirhijack covers the whole ruleset (sole provider);
-	 * while TSR still handles a residue class, do not double-project. */
-	if (!kasumi_dirhijack_is_provider())
-		return false;
+	/* Sole path-view engine, so this is the only serve gate: an unregistered
+	 * rule simply has no child here and falls through to the real entry. */
 	return kasumi_policy_current_is_view_target();
 }
 
@@ -830,10 +787,6 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	spin_unlock(&dir->lock);
 	if (old)
 		call_rcu(&old->rcu, kasumi_dh_child_free_rcu);
-	else if (!(flags & KASUMI_VNODE_F_VIRTUAL_DIR))
-		/* F_VIRTUAL_DIR topology nodes are shared across rules and counted
-		 * via kasumi_dh_vtopo_rules instead of child_count. */
-		atomic_inc(&kasumi_dh_child_count);
 	return 0;
 }
 
@@ -871,8 +824,7 @@ static int kasumi_dh_split_parent(const char *visible_path, char **parent_out,
  * F_VIRTUAL_DIR child (visible path R/s1).  That synthesized directory resolves
  * everything below it — deeper virtual dirs and the leaf — dynamically from the
  * rule table (kasumi_rule_vpath_*), so only the top segment needs registering.
- * The child is shared across all rules under R/s1; each covered rule bumps
- * kasumi_dh_vtopo_rules for the provider gate.
+ * The child is shared across all rules under R/s1.
  */
 static int kasumi_dh_register_vtopo(const char *visible_path)
 {
@@ -965,7 +917,6 @@ static int kasumi_dh_register_vtopo(const char *visible_path)
 				      false, false, vpath);
 	if (ret)
 		goto out;
-	atomic_inc(&kasumi_dh_vtopo_rules);
 	{
 		struct qstr qn;
 		struct dentry *cached;
@@ -1074,8 +1025,8 @@ int kasumi_dirhijack_add(const char *visible_path, const struct path *source,
  * resolves it to a Kasumi vnode (open/stat/readlink), but dirhijack does not
  * touch this dir's readdir — the overlay filldir injection owns emit and dedup
  * for the name.  Used to sink a merge-materialized file's lookup axis onto the
- * VFS layer (Slice 4a) so a merge config can reach is_provider without
- * double-injecting the entry into getdents.  Sleepable context only.
+ * VFS layer (Slice 4a) without double-injecting the entry into getdents.
+ * Sleepable context only.
  */
 int kasumi_dirhijack_add_shadow(const char *visible_path,
 				const struct path *source,
@@ -1115,12 +1066,8 @@ int kasumi_dirhijack_del(const char *visible_path)
 	ret = kasumi_kern_path(parent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &ppath);
 	if (ret) {
 		kfree(parent);
-		/* A deep-virtual rule's parent does not exist as a real dir; it was
-		 * registered via the vtopo path.  Drop its coverage from the provider
-		 * gate.  The shared F_VIRTUAL_DIR child stays (other rules may still
-		 * use it) and empties out via the rule table; clear/unload reclaims it. */
-		if (ret == -ENOENT)
-			atomic_dec_if_positive(&kasumi_dh_vtopo_rules);
+		/* A deep-virtual rule's parent does not exist as a real dir; it
+		 * was registered via the vtopo path, so ENOENT is not an error. */
 		return ret == -ENOENT ? 0 : ret;
 	}
 
@@ -1134,10 +1081,8 @@ int kasumi_dirhijack_del(const char *visible_path)
 		if (c)
 			hlist_del_rcu(&c->node);
 		spin_unlock(&m->dir->lock);
-		if (c) {
+		if (c)
 			call_rcu(&c->rcu, kasumi_dh_child_free_rcu);
-			atomic_dec(&kasumi_dh_child_count);
-		}
 	}
 	if (c) {
 		/* Drop any dentry cached under this name so the next resolution
@@ -1220,10 +1165,6 @@ void kasumi_dirhijack_clear(void)
 
 	/* Cover any per-child call_rcu() still pending from kasumi_dirhijack_del(). */
 	rcu_barrier();
-
-	/* Phase 3 freed every child directly (no per-child dec); reset the count. */
-	atomic_set(&kasumi_dh_child_count, 0);
-	atomic_set(&kasumi_dh_vtopo_rules, 0);
 }
 
 int kasumi_dirhijack_init(void)

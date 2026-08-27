@@ -1278,7 +1278,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			set_bit(h1, kasumi_path_bloom);
 			set_bit(h2, kasumi_path_bloom);
 			atomic_inc(&kasumi_rule_count);
-			atomic_inc(&kasumi_tsr_path_count);
 			new_entry = NULL;
 			kasumi_log("add rule: src=%s, target=%s, type=%d\n",
 				   src, target, req.type);
@@ -1556,7 +1555,6 @@ add_rule_done:
 				hlist_del_rcu(&entry->node);
 				hlist_del_rcu(&entry->target_node);
 				atomic_dec(&kasumi_rule_count);
-				atomic_dec(&kasumi_tsr_path_count);
 				kasumi_log("del rule: src=%s\n", src);
 				call_rcu(&entry->rcu, kasumi_entry_free_rcu);
 				goto del_done;

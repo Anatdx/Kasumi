@@ -35,7 +35,6 @@
 extern bool kasumi_enabled;
 extern atomic_t kasumi_rule_count;
 extern atomic_t kasumi_hide_count;
-extern atomic_t kasumi_tsr_path_count;
 extern atomic_t kasumi_spoof_kstat_count;
 
 struct kasumi_hook_stats {

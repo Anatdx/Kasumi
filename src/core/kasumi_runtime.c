@@ -52,7 +52,6 @@
 bool kasumi_enabled;
 atomic_t kasumi_rule_count = ATOMIC_INIT(0);
 atomic_t kasumi_hide_count = ATOMIC_INIT(0);
-atomic_t kasumi_tsr_path_count = ATOMIC_INIT(0);
 struct kasumi_hook_stats kasumi_hook_stats;
 
 #define KASUMI_INTERNAL_VFS_HASH_BITS 5
@@ -1068,5 +1067,4 @@ void kasumi_cleanup_locked(void)
 	bitmap_zero(kasumi_hide_bloom, KASUMI_BLOOM_SIZE);
 	atomic_set(&kasumi_rule_count, 0);
 	atomic_set(&kasumi_hide_count, 0);
-	atomic_set(&kasumi_tsr_path_count, 0);
 }

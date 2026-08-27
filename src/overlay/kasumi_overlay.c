@@ -408,7 +408,6 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 				set_bit(h1, kasumi_path_bloom);
 				set_bit(h2, kasumi_path_bloom);
 				atomic_inc(&kasumi_rule_count);
-				atomic_inc(&kasumi_tsr_path_count);
 				if (kasumi_kern_path) {
 					struct path p;
 
@@ -419,10 +418,10 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 						kasumi_path_put(&p);
 					}
 				}
-				/* Slice 4a: sink this materialized file's lookup axis
-				 * onto dirhijack as a lookup-only child so a merge
-				 * config can reach is_provider; readdir stays with the
-				 * overlay filldir injection.  Mirror the ADD_RULE gate:
+				/* Slice 4a: sink this materialized file's lookup axis onto
+				 * dirhijack as a lookup-only child so a merge config is
+				 * served through the VFS lookup layer; readdir stays with
+				 * the overlay filldir injection.  Mirror the ADD_RULE gate:
 				 * a symlink target registers a symlink vnode (nofollow),
 				 * otherwise a regular vnode. */
 				if (kasumi_dirhijack_enabled() && kasumi_kern_path) {
