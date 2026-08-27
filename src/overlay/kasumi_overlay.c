@@ -443,6 +443,18 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 						(void)kasumi_dirhijack_add_shadow(
 							src, &dsrc, e->visible_ino, 0);
 						kasumi_path_put(&dsrc);
+					} else if (S_ISDIR(e->source_mode) &&
+						   kasumi_kern_path(tgt, LOOKUP_FOLLOW,
+								    &dsrc) == 0) {
+						/* A module-added directory the target
+						 * lacks: serve it as an enterable
+						 * directory-source vnode so lookup and
+						 * iterate resolve to the source subtree
+						 * (Slice 4c dir vnode). */
+						(void)kasumi_dirhijack_add_shadow(
+							src, &dsrc, e->visible_ino,
+							KASUMI_VNODE_F_DIR);
+						kasumi_path_put(&dsrc);
 					}
 				}
 			} else {
@@ -593,7 +605,25 @@ kasumi_mat_filldir(struct dir_context *ctx, const char *name,
 	 * kasumi_paths so open() of that file routes to the module backing.
 	 */
 	if (d_type == DT_DIR) {
-		if (mc->depth < 8) {
+		/* Two shapes: MERGE into an existing target subdir (keep its real
+		 * siblings) vs ADD a brand-new subdir the target lacks. An existing
+		 * dir keeps the nested-merge injection; a new dir is registered as an
+		 * enterable directory-source redirect -- otherwise the parent readdir
+		 * shows the name but every lookup ENOENTs, and the system cannot scan
+		 * the module's added subtree (e.g. a priv-app / RRO in a new dir). */
+		struct path vpath;
+		bool visible_dir = false;
+
+		if (kasumi_kern_path &&
+		    kasumi_kern_path(src_path, LOOKUP_FOLLOW, &vpath) == 0) {
+			struct inode *vi = d_inode(vpath.dentry);
+
+			visible_dir = vi && S_ISDIR(vi->i_mode);
+			kasumi_path_put(&vpath);
+		}
+		if (!visible_dir) {
+			kasumi_add_path_entry(src_path, tgt_path, d_type);
+		} else if (mc->depth < 8) {
 			kasumi_register_nested_merge(src_path, tgt_path);
 			kasumi_materialize_merge(src_path, tgt_path,
 						 mc->depth + 1);
