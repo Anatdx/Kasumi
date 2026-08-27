@@ -120,7 +120,7 @@ static struct kprobe kasumi_kp_show_mountinfo = {
 #define KASUMI_PROC_STREAM_ALLOCATION (KASUMI_READ_MOUNT_FILTER_BUF + 1)
 #define KASUMI_PROC_STREAM_MAX (1024 * 1024)
 
-static size_t kasumi_filter_overlay_lines(char *kbuf, size_t len);
+static size_t kasumi_filter_mounts_lines(char *kbuf, size_t len);
 static int kasumi_filter_maps_lines(const char *src, size_t len,
 				    char *dst, size_t dst_size, size_t *written,
 				    bool *changed, bool *valid,
@@ -620,7 +620,7 @@ static ssize_t kasumi_mount_proxy_stream_fill(
 				if (ret < 0 || !maps_valid)
 					return ret < 0 ? ret : -EIO;
 			} else if (proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
-				new_len = kasumi_filter_overlay_lines(
+				new_len = kasumi_filter_mounts_lines(
 					proxy->stream_raw, complete_len);
 			} else {
 				return -EIO;
@@ -683,6 +683,8 @@ static ssize_t kasumi_mount_proxy_filtered_read(
 		return -EINVAL;
 	if (!count)
 		return 0;
+	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTS)
+		kasumi_fake_mi_prepare(false);
 	mutex_lock(&proxy->stream_lock);
 	if (proxy->stream_failed || *ppos != proxy->stream_user_pos) {
 		ret = -EIO;
@@ -1059,46 +1061,107 @@ static KASUMI_NOCFI void kasumi_mount_proxy_drain(void)
 	}
 }
 
-static size_t kasumi_filter_overlay_lines(char *kbuf, size_t len)
+
+/* True when a /proc/<pid>/mounts token [s,e) is exactly `pfx` or a path under
+ * it (followed by '/'). Degraded fallback only, used when the fake mountinfo
+ * cache is not yet available for this namespace. */
+static bool kasumi_mounts_tok_under(const char *line, size_t s, size_t e,
+				    const char *pfx)
+{
+	size_t plen = strlen(pfx);
+
+	if (e - s < plen || memcmp(line + s, pfx, plen) != 0)
+		return false;
+	return (e - s == plen) || line[s + plen] == '/';
+}
+
+/* Fallback root-marker heuristic for one mounts line, matching the fake
+ * mountinfo hide rule (source/mountpoint under /adb or /data/adb, or the KSU
+ * pseudo-source). Consulted only when the cache lookup is unavailable. */
+static bool kasumi_mounts_line_is_root_marker(const char *line,
+				      size_t src_s, size_t src_e,
+				      size_t mp_s, size_t mp_e)
+{
+	if (src_e - src_s == 3 && memcmp(line + src_s, "KSU", 3) == 0)
+		return true;
+	return kasumi_mounts_tok_under(line, src_s, src_e, "/data/adb") ||
+	       kasumi_mounts_tok_under(line, src_s, src_e, "/adb") ||
+	       kasumi_mounts_tok_under(line, mp_s, mp_e, "/data/adb") ||
+	       kasumi_mounts_tok_under(line, mp_s, mp_e, "/adb");
+}
+
+/*
+ * Filter /proc/<pid>/mounts in place so it exposes exactly the same visible
+ * mount set as the faked /proc/<pid>/mountinfo. For each line we take the
+ * mountpoint (field 2) and ask the fake mountinfo cache whether that
+ * mountpoint survives the hide (kasumi_fake_mi_lookup_mount_id_cached):
+ * present -> keep; cache-valid-but-absent -> drop. The mounts format carries
+ * no mount-root field, so it cannot by itself recognise a KSU bind mount onto
+ * /apex/...; deferring to the mountinfo-derived visible set is what keeps the
+ * two files symmetric and defeats mountinfo/mounts asymmetry and
+ * "root marker in mounts" detectors. If the cache is momentarily unavailable
+ * fall back to a conservative root-marker heuristic rather than leak markers.
+ */
+static size_t kasumi_filter_mounts_lines(char *kbuf, size_t len)
 {
 	size_t out = 0;
 	size_t i = 0;
 
 	while (i < len) {
 		size_t line_start = i;
+		size_t line_len;
+		bool has_nl;
+		bool drop = false;
 
 		while (i < len && kbuf[i] != '\n')
 			i++;
-		if (i > line_start) {
-			size_t line_len = i - line_start;
-			bool is_overlay = false;
-			size_t j;
+		line_len = i - line_start;
+		has_nl = (i < len);
 
-			for (j = line_start; j + 8 <= line_start + line_len; j++) {
-				if (kbuf[j] == ' ' && kbuf[j + 1] == 'o' &&
-				    kbuf[j + 2] == 'v' && kbuf[j + 3] == 'e' &&
-				    kbuf[j + 4] == 'r' && kbuf[j + 5] == 'l' &&
-				    kbuf[j + 6] == 'a' && kbuf[j + 7] == 'y' &&
-				    (j + 8 == line_start + line_len ||
-				     kbuf[j + 8] == ' ' || kbuf[j + 8] == '\n')) {
-					is_overlay = true;
-					break;
-				}
+		if (line_len > 0) {
+			char *line = kbuf + line_start;
+			size_t p = 0;
+			size_t src_s, src_e, mp_s, mp_e;
+
+			src_s = p;
+			while (p < line_len && line[p] != ' ')
+				p++;
+			src_e = p;
+			while (p < line_len && line[p] == ' ')
+				p++;
+			mp_s = p;
+			while (p < line_len && line[p] != ' ')
+				p++;
+			mp_e = p;
+
+			if (mp_e > mp_s && mp_e < line_len) {
+				char saved = line[mp_e];
+				int vis;
+
+				line[mp_e] = '\0';
+				vis = kasumi_fake_mi_lookup_mount_id_cached(
+					line + mp_s);
+				line[mp_e] = saved;
+
+				if (vis > 0)
+					drop = false;
+				else if (vis == -ENOENT)
+					drop = true;
+				else
+					drop = kasumi_mounts_line_is_root_marker(
+						line, src_s, src_e, mp_s, mp_e);
 			}
-			if (!is_overlay) {
-				if (out != line_start)
-					memmove(kbuf + out, kbuf + line_start, line_len);
-				out += line_len;
-				if (i < len) {
-					kbuf[out++] = '\n';
-					i++;
-				}
-			} else if (i < len) {
-				i++;
-			}
-		} else if (i < len) {
-			i++;
 		}
+
+		if (!drop) {
+			if (out != line_start)
+				memmove(kbuf + out, kbuf + line_start, line_len);
+			out += line_len;
+			if (has_nl)
+				kbuf[out++] = '\n';
+		}
+		if (has_nl)
+			i++;
 	}
 	return out;
 }
