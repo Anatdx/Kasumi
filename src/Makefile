@@ -5,8 +5,9 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
 obj-m += kasumi_lkm.o
-# Do not add kasumi_sop_override.o: super_operations has no owner pin, so a
-# persistent module callback cannot participate in cooperative unload safely.
+# core/kasumi_sop_shadow.o owns the sb->s_op shadow used by dirhijack's virtual
+# inode reclaim callbacks. The dead features/kasumi_sop_override.o stub it
+# supersedes was removed.
 kasumi_lkm-objs := \
 	kasumi_main.o \
 	core/kasumi_bootstrap.o \
@@ -14,6 +15,7 @@ kasumi_lkm-objs := \
 	core/kasumi_fop_bridge.o \
 	core/kasumi_vnode.o \
 	core/kasumi_dirhijack.o \
+	core/kasumi_sop_shadow.o \
 	core/kasumi_root_detection.o \
 	control/kasumi_ioctl.o \
 	policy/kasumi_path_policy.o \

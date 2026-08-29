@@ -24,10 +24,30 @@
 #include <linux/path.h>
 #include <linux/types.h>
 
+struct inode;
+struct super_operations;
+
 int kasumi_dirhijack_init(void);
+void kasumi_dirhijack_stop_new(void);
 void kasumi_dirhijack_exit(void);
 
 bool kasumi_dirhijack_enabled(void);
+
+/*
+ * Virtual-inode reclaim leaf functions, invoked by the unified super_operations
+ * owner (kasumi_sop_shadow) from its destroy/evict/drop_inode trampolines with
+ * @orig already resolved under RCU.  The trampoline owns the active-counter
+ * drain, so these bodies may early-return freely.  Kept here so the load-bearing
+ * kasumi_vnode reclaim branches stay co-located with the rest of dirhijack.
+ */
+void kasumi_dh_reclaim_destroy_inode(struct inode *inode,
+				     const struct super_operations *orig);
+void kasumi_dh_reclaim_free_inode(struct inode *inode,
+				  const struct super_operations *orig);
+void kasumi_dh_reclaim_evict_inode(struct inode *inode,
+				   const struct super_operations *orig);
+int kasumi_dh_reclaim_drop_inode(struct inode *inode,
+				 const struct super_operations *orig);
 
 /*
  * Register a virtual child at @visible_path backed by @source, projected with
@@ -60,7 +80,10 @@ int kasumi_dirhijack_del(const char *visible_path);
  */
 int kasumi_dirhijack_hide(const char *visible_path);
 
-/* Drop every registered child and restore all hijacked dirs/superblocks. */
+/*
+ * Restore every inode/file/dentry operation shadow, invalidate affected
+ * dentries, drain callbacks, and release all dirhijack metadata.  May sleep.
+ */
 void kasumi_dirhijack_clear(void);
 
 #endif /* _KASUMI_DIRHIJACK_H */

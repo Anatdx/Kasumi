@@ -26,6 +26,7 @@
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_dirhijack.h"
+#include "kasumi_sop_shadow.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
@@ -341,6 +342,7 @@ int kasumi_bootstrap_init(void)
 		goto err_fop_bridge;
 	}
 	(void)kasumi_fop_override_init();
+	(void)kasumi_sop_shadow_init();
 	(void)kasumi_dirhijack_init();
 
 	/* On old KMI, the first ingress table published below is the module-init
@@ -394,13 +396,16 @@ void kasumi_bootstrap_exit(void)
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_dirhijack_stop_new();
+	kasumi_sop_shadow_stop_new();
+	kasumi_dirhijack_exit();
 	kasumi_fop_override_stop_new();
 	kasumi_fop_bridge_stop_new();
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
 	kasumi_fop_bridge_exit();
 	kasumi_iop_override_exit();
-	kasumi_dirhijack_exit();
+	kasumi_sop_shadow_exit();
 	kasumi_fake_mi_exit();
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();

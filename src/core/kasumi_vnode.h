@@ -45,6 +45,9 @@ struct kasumi_vnode_info {
 	 * the exec-path get_vfs_caps_from_disk read (which lands on this synthetic
 	 * inode that has no on-disk security.capability).  @has_caps gates it. */
 	bool has_caps;
+	/* Held in the per-superblock reclaim owner until destroy_inode releases
+	 * this actual new_inode() object. */
+	bool sop_vnode_ref;
 	struct cpu_vfs_cap_data caps;
 	/* For a char/blk/fifo source wrapper (KASUMI_VNODE_F_SPECIAL): the vnode
 	 * inode is minted S_IFREG so it passes may_open_dev on a nodev visible

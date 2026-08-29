@@ -29,6 +29,7 @@
 #include "kasumi_base.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
+#include "kasumi_sop_shadow.h"
 #include "kasumi_types.h"
 #include "kasumi_vnode.h"
 
@@ -109,17 +110,21 @@ bool kasumi_vnode_peek_caps(const struct dentry *dentry,
 void kasumi_vnode_free_info(struct inode *inode)
 {
 	struct kasumi_vnode_info *info;
+	bool sop_vnode_ref;
 
 	if (!inode || !kasumi_vnode_is_ours(inode))
 		return;
 	info = inode->i_private;
 	if (!info)
 		return;
+	sop_vnode_ref = info->sop_vnode_ref;
 	if (info->source.dentry)
 		kasumi_path_put(&info->source);
 	kfree(info->visible_path);
 	inode->i_private = NULL;
 	kfree(info);
+	if (sop_vnode_ref)
+		kasumi_sop_vnode_put(inode->i_sb);
 }
 
 /* ---- identity ---------------------------------------------------------- */
@@ -1370,16 +1375,9 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 
 	if (!sb)
 		return NULL;
-	inode = new_inode(sb);
-	if (!inode)
-		return NULL;
-	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info) {
-		iput(inode);
+	if (!info)
 		return NULL;
-	}
-
 	info->v_ino = v_ino;
 	info->flags = flags;
 	if (source && source->dentry && source->mnt) {
@@ -1387,7 +1385,25 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
 		kasumi_path_get(&info->source);
 		r_inode = d_inode(source->dentry);
 	}
-
+	if (!kasumi_sop_vnode_get(sb)) {
+		if (info->source.dentry)
+			kasumi_path_put(&info->source);
+		kfree(info);
+		return NULL;
+	}
+	inode = new_inode(sb);
+	if (!inode) {
+		kasumi_sop_vnode_put(sb);
+		if (info->source.dentry)
+			kasumi_path_put(&info->source);
+		kfree(info);
+		return NULL;
+	}
+	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
+	info->sop_vnode_ref = true;
+	/* Publish the owner marker before any post-new_inode failure/reclaim path
+	 * can drop this inode.  The sop vnode count is released only by the reclaim
+	 * trampoline once i_private has been detached. */
 	inode->i_private = info;
 	inode->i_ino = v_ino;
 	inode->i_uid = r_inode ? r_inode->i_uid : GLOBAL_ROOT_UID;
@@ -1475,23 +1491,30 @@ struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 
 	if (!sb || !visible_path)
 		return NULL;
-	inode = new_inode(sb);
-	if (!inode)
-		return NULL;
-	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info) {
-		iput(inode);
+	if (!info)
 		return NULL;
-	}
 	info->visible_path = kstrdup(visible_path, GFP_KERNEL);
 	if (!info->visible_path) {
 		kfree(info);
-		iput(inode);
 		return NULL;
 	}
 	info->v_ino = v_ino;
 	info->flags = KASUMI_VNODE_F_DIR | KASUMI_VNODE_F_VIRTUAL_DIR;
+	if (!kasumi_sop_vnode_get(sb)) {
+		kfree(info->visible_path);
+		kfree(info);
+		return NULL;
+	}
+	inode = new_inode(sb);
+	if (!inode) {
+		kasumi_sop_vnode_put(sb);
+		kfree(info->visible_path);
+		kfree(info);
+		return NULL;
+	}
+	lockdep_set_class(&inode->i_rwsem, &kasumi_vnode_i_mutex_key);
+	info->sop_vnode_ref = true;
 
 	inode->i_private = info;
 	inode->i_ino = v_ino;

@@ -26,20 +26,33 @@
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
 #include <linux/nsproxy.h>
+#include <linux/fs_struct.h>
+#include <linux/seq_file.h>
 #include <linux/stat.h>
 #include <linux/version.h>
+#include <linux/bitops.h>
 
-/* Cache sizing: mountinfo is typically 20-80KB on Android; cap at 512KB. */
-#define FAKE_MI_BUF_MAX    (512 * 1024)
-#define FAKE_MI_SCRATCH    (512 * 1024)
+/* Match the per-open proc proxy ceiling so a large but accepted mount table
+ * can also supply the statx/statfs identity cache from the exact same bytes. */
+#define FAKE_MI_BUF_MAX    (1024 * 1024)
+#define FAKE_MI_SCRATCH    FAKE_MI_BUF_MAX
 #define FAKE_MI_TTL_MS     500
 #define FAKE_MI_BUF_SLOTS  2
 #define MAX_MOUNTS         4096
+
+typedef int (*fake_mi_mount_show_fn)(struct seq_file *, struct vfsmount *);
+
+struct fake_mi_proc_mounts_prefix {
+	struct mnt_namespace *ns;
+	struct path root;
+	fake_mi_mount_show_fn show;
+};
 
 struct fake_mi_id_entry {
 	int real_id;
 	int fake_id;
 	bool visible;
+	bool projected_mount_root;
 };
 
 /* Per-file cursor table for stateful chunked reads. Size chosen to cover
@@ -54,6 +67,8 @@ struct fake_mi_cache {
         size_t len;
         struct nsproxy *nsproxy;
         struct mnt_namespace *mnt_ns;
+		struct path root;
+		u64 generation;
 		struct fake_mi_id_entry *id_map;
 		int id_count;
     } slots[FAKE_MI_BUF_SLOTS];
@@ -78,7 +93,9 @@ static struct fake_mi_cache g_cache = {
 
 static bool fake_mi_initialized;
 
-static u64 g_cache_gen;  /* bumped every regenerate */
+static u64 g_cache_gen;
+static atomic64_t fake_mi_view_gen = ATOMIC64_INIT(1);
+static DECLARE_WAIT_QUEUE_HEAD(fake_mi_view_wait);
 static int fake_mi_last_error;
 
 static struct fake_mi_cursor g_cursors[FAKE_MI_CURSORS];
@@ -122,14 +139,65 @@ static KASUMI_NOCFI void fake_mi_put_nsproxy(struct nsproxy *nsproxy)
 static void fake_mi_release_slot_owner_locked(int slot)
 {
     struct nsproxy *nsproxy;
+	struct path root;
 
     if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
         return;
 
     nsproxy = g_cache.slots[slot].nsproxy;
+	root = g_cache.slots[slot].root;
     g_cache.slots[slot].nsproxy = NULL;
     g_cache.slots[slot].mnt_ns = NULL;
+	g_cache.slots[slot].root.mnt = NULL;
+	g_cache.slots[slot].root.dentry = NULL;
+	g_cache.slots[slot].generation = 0;
+	if (root.mnt && root.dentry)
+		kasumi_path_put(&root);
     fake_mi_put_nsproxy(nsproxy);
+}
+
+static bool fake_mi_root_matches_current(const struct path *root)
+{
+	struct fs_struct *fs = current->fs;
+	bool matches;
+
+	if (!fs || !root || !root->mnt || !root->dentry)
+		return false;
+	spin_lock(&fs->lock);
+	matches = path_equal(&fs->root, root);
+	spin_unlock(&fs->lock);
+	return matches;
+}
+
+static struct fake_mi_proc_mounts_prefix *
+fake_mi_proc_mounts(struct file *file)
+{
+	struct fake_mi_proc_mounts_prefix *pm;
+	struct seq_file *seq;
+
+	if (!file || !file->private_data)
+		return NULL;
+	seq = file->private_data;
+	pm = seq->private;
+	if (!pm || !pm->ns || !pm->root.mnt || !pm->root.dentry || !pm->show)
+		return NULL;
+	return pm;
+}
+
+/* Cache generations bind legacy cursors to a particular slot publication.
+ * They are intentionally separate from the poll-visible view generation:
+ * refreshing identical bytes or another namespace's cache is not a procfs
+ * mount-change event. Both counters are serialized by g_cache.lock.
+ */
+static u64 fake_mi_advance_cache_generation_locked(void)
+{
+	return ++g_cache_gen;
+}
+
+static void fake_mi_advance_view_generation_locked(void)
+{
+	atomic64_inc(&fake_mi_view_gen);
+	wake_up_all(&fake_mi_view_wait);
 }
 
 static char *fake_mi_active_buf_locked(size_t *len)
@@ -141,6 +209,25 @@ static char *fake_mi_active_buf_locked(size_t *len)
     if (len)
         *len = g_cache.slots[slot].len;
     return g_cache.slots[slot].buf;
+}
+
+/* Active-slot owners, including the root path, are retained until the slot is
+ * inactive and a grace period has elapsed. This identity check is therefore
+ * safe in the atomic cache consumers while they hold rcu_read_lock().
+ */
+static bool fake_mi_slot_matches_current(int slot)
+{
+	struct mnt_namespace *mnt_ns;
+	struct path root;
+
+	if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
+		return false;
+	mnt_ns = fake_mi_current_mnt_ns();
+	if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns)
+		return false;
+	root.mnt = READ_ONCE(g_cache.slots[slot].root.mnt);
+	root.dentry = READ_ONCE(g_cache.slots[slot].root.dentry);
+	return fake_mi_root_matches_current(&root);
 }
 
 bool kasumi_fake_mi_is_internal_read(void)
@@ -247,11 +334,13 @@ static bool token_is_root_owned_mount_path(const char *line, size_t start,
  *   <mnt_id> <parent_id> <major:minor> <root> <mp> <opts> <optional_fields> - <fstype> <source> <sb_opts>
  */
 static bool parse_line(const char *line, size_t len,
-                       int *mnt_id, int *parent_id,
-                       size_t *mi_start, size_t *mi_end,
-                       size_t *pi_start, size_t *pi_end,
-                       struct fake_mi_prop_ref *prop_refs, size_t *prop_count,
-                       bool *is_hidden, bool *is_namespace_root)
+		       int *mnt_id, int *parent_id,
+		       size_t *mi_start, size_t *mi_end,
+		       size_t *pi_start, size_t *pi_end,
+		       struct fake_mi_prop_ref *prop_refs, size_t *prop_count,
+		       bool *is_hidden, bool *is_namespace_root,
+		       size_t *mountpoint_start_out,
+		       size_t *mountpoint_end_out)
 {
     size_t i = 0, token_start, token_end;
     size_t mount_root_start = 0, mount_root_end = 0;
@@ -308,11 +397,15 @@ static bool parse_line(const char *line, size_t len,
             *is_namespace_root = true;
     }
 
-    if (token_is_root_owned_mount_path(line, mount_root_start,
-                                       mount_root_end) ||
-        token_is_root_owned_mount_path(line, mountpoint_start,
-                                       mountpoint_end))
-        *is_hidden = true;
+	if (token_is_root_owned_mount_path(line, mount_root_start,
+				       mount_root_end) ||
+	    token_is_root_owned_mount_path(line, mountpoint_start,
+				       mountpoint_end))
+		*is_hidden = true;
+	if (mountpoint_start_out)
+		*mountpoint_start_out = mountpoint_start;
+	if (mountpoint_end_out)
+		*mountpoint_end_out = mountpoint_end;
 
     while (i < len) {
         int value;
@@ -437,6 +530,8 @@ struct mount_map_entry {
     int parent_id;
     int new_id;
     int resolved_parent_id;
+	size_t mountpoint_start;
+	size_t mountpoint_len;
     unsigned int walk_cookie;
     bool graph_validated;
     bool namespace_root;
@@ -481,9 +576,22 @@ static int mount_map_lookup(const struct mount_map_entry *map, int nmap,
     return -1;
 }
 
+static int mount_map_lookup_new_id(const struct mount_map_entry *map,
+				   int nmap, int new_id)
+{
+	int i;
+
+	for (i = 0; i < nmap; i++) {
+		if (map[i].new_id == new_id)
+			return i;
+	}
+	return -1;
+}
+
 static int mount_map_add(struct mount_map_entry *map, int *nmap,
-                         int old_id, int parent_id, bool visible,
-                         bool namespace_root, int *next_id)
+			 int old_id, int parent_id, bool visible,
+			 bool namespace_root, size_t mountpoint_start,
+			 size_t mountpoint_len, int *next_id)
 {
     if (!map || !nmap || !next_id || old_id <= 0 || parent_id <= 0)
         return -EINVAL;
@@ -496,6 +604,8 @@ static int mount_map_add(struct mount_map_entry *map, int *nmap,
     map[*nmap].parent_id = parent_id;
     map[*nmap].new_id = visible ? (*next_id)++ : -1;
     map[*nmap].resolved_parent_id = 0;
+	map[*nmap].mountpoint_start = mountpoint_start;
+	map[*nmap].mountpoint_len = mountpoint_len;
     map[*nmap].walk_cookie = 0;
     map[*nmap].graph_validated = false;
     map[*nmap].namespace_root = namespace_root;
@@ -626,7 +736,10 @@ static size_t decimal_len(int value)
 static int build_fake_buffer(const char *raw, size_t raw_len,
 			     char *out, size_t out_cap, size_t *out_len,
 			     struct fake_mi_id_entry *id_map,
-			     int *id_count)
+			     int *id_count,
+			     unsigned long *visible_bitmap,
+			     size_t visible_bits,
+			     size_t *raw_line_count)
 {
     struct mount_map_entry *mount_map;
     struct id_map_entry *prop_map;
@@ -642,6 +755,7 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
     int i;
     int ret = 0;
     size_t in = 0, o = 0;
+	size_t ordinal = 0;
 
     mount_map = kvmalloc_array(MAX_MOUNTS, sizeof(*mount_map), GFP_KERNEL);
     if (!mount_map)
@@ -672,17 +786,33 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         size_t prop_count = 0;
         bool hidden;
         bool namespace_root;
+		size_t mountpoint_start;
+		size_t mountpoint_end;
         size_t j;
 
         while (in < raw_len && raw[in] != '\n') in++;
-        if (!parse_line(raw + ls, in - ls, &mi, &pi,
-                        &ms, &me, &ps, &pe,
-                        prop_refs, &prop_count, &hidden, &namespace_root)) {
-            ret = -EINVAL;
-            goto out;
-        }
-        ret = mount_map_add(mount_map, &n_mount_map, mi, pi, !hidden,
-                            namespace_root, &next_mount_id);
+		if (!parse_line(raw + ls, in - ls, &mi, &pi,
+				&ms, &me, &ps, &pe,
+				prop_refs, &prop_count, &hidden, &namespace_root,
+				&mountpoint_start, &mountpoint_end)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (visible_bitmap) {
+			if (ordinal >= visible_bits) {
+				ret = -ENOSPC;
+				goto out;
+			}
+			if (!hidden)
+				__set_bit(ordinal, visible_bitmap);
+			else
+				__clear_bit(ordinal, visible_bitmap);
+		}
+		ordinal++;
+		ret = mount_map_add(mount_map, &n_mount_map, mi, pi, !hidden,
+				    namespace_root, ls + mountpoint_start,
+				    mountpoint_end - mountpoint_start,
+				    &next_mount_id);
         if (ret)
             goto out;
         if (!hidden) {
@@ -736,12 +866,13 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         while (in < raw_len && raw[in] != '\n') in++;
         line_len = in - ls;
 
-        if (!parse_line(raw + ls, line_len, &mi, &pi,
-                        &ms, &me, &ps, &pe,
-                        prop_refs, &prop_count, &hidden, &namespace_root)) {
-            ret = -EINVAL;
-            goto out;
-        }
+		if (!parse_line(raw + ls, line_len, &mi, &pi,
+				&ms, &me, &ps, &pe,
+				prop_refs, &prop_count, &hidden, &namespace_root,
+				NULL, NULL)) {
+			ret = -EINVAL;
+			goto out;
+		}
         if (hidden) {
             if (in < raw_len) in++;
             continue;
@@ -779,7 +910,7 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
             if (in < raw_len)
                 rewritten_len++;
             if (rewritten_len > out_cap - o) {
-                ret = -E2BIG;
+                ret = -ENOSPC;
                 goto out;
             }
         }
@@ -835,35 +966,183 @@ static int build_fake_buffer(const char *raw, size_t raw_len,
         }
     }
 
-	if (!id_map || !id_count) {
-		ret = -EINVAL;
-		goto out;
-	}
-	*id_count = 0;
-	for (i = 0; i < n_mount_map; i++) {
-		int fake_id = mount_map[i].new_id;
+	if (id_map && id_count) {
+		*id_count = 0;
+		for (i = 0; i < n_mount_map; i++) {
+			int fake_id = mount_map[i].new_id;
+			bool projected_mount_root = false;
 
-		if (fake_id <= 0) {
-			parent_walk_cookie++;
-			ret = mount_map_resolve_parent(mount_map, n_mount_map,
-						       external_map, n_external,
-						       mount_map[i].parent_id,
-						       parent_walk_cookie, &fake_id);
-			if (ret)
-				goto out;
+			if (fake_id <= 0) {
+				int ancestor;
+
+				parent_walk_cookie++;
+				ret = mount_map_resolve_parent(mount_map, n_mount_map,
+							       external_map, n_external,
+							       mount_map[i].parent_id,
+							       parent_walk_cookie, &fake_id);
+				if (ret)
+					goto out;
+				/* A path at the hidden mount's root is still a mount root in
+				 * the projected view only when the visible ancestor begins at
+				 * exactly the same namespace mountpoint. Mountinfo path tokens
+				 * use the same escaping, so byte equality is canonical here.
+				 */
+				ancestor = mount_map_lookup_new_id(mount_map,
+								   n_mount_map,
+								   fake_id);
+				if (ancestor >= 0 &&
+				    mount_map[i].mountpoint_len ==
+					mount_map[ancestor].mountpoint_len &&
+				    !memcmp(raw + mount_map[i].mountpoint_start,
+					    raw + mount_map[ancestor].mountpoint_start,
+					    mount_map[i].mountpoint_len))
+					projected_mount_root = true;
+			}
+			id_map[*id_count].real_id = mount_map[i].old_id;
+			id_map[*id_count].fake_id = fake_id;
+			id_map[*id_count].visible = mount_map[i].new_id > 0;
+			id_map[*id_count].projected_mount_root =
+				projected_mount_root;
+			(*id_count)++;
 		}
-		id_map[*id_count].real_id = mount_map[i].old_id;
-		id_map[*id_count].fake_id = fake_id;
-		id_map[*id_count].visible = mount_map[i].new_id > 0;
-		(*id_count)++;
 	}
 
+	if (raw_line_count)
+		*raw_line_count = ordinal;
     *out_len = o;
 out:
     kvfree(external_map);
     kvfree(prop_map);
     kvfree(mount_map);
     return ret;
+}
+
+/* Public: run the classify+renumber transform on a raw mountinfo buffer.
+ * No id_map (the proxy paths do not need real->fake id translation; that feeds
+ * only the reader-ns atomic consumers). */
+int kasumi_fake_mi_build_from_raw(const char *raw, size_t raw_len,
+				  char *out, size_t out_cap, size_t *out_len)
+{
+	return build_fake_buffer(raw, raw_len, out, out_cap, out_len,
+				 NULL, NULL, NULL, 0, NULL);
+}
+
+int kasumi_fake_mi_build_from_raw_visible(const char *raw, size_t raw_len,
+					  char *out, size_t out_cap,
+					  size_t *out_len,
+					  unsigned long *visible_bitmap,
+					  size_t visible_bits,
+					  size_t *raw_line_count)
+{
+	if (!visible_bitmap || !visible_bits || !raw_line_count)
+		return -EINVAL;
+	bitmap_zero(visible_bitmap, visible_bits);
+	*raw_line_count = 0;
+	return build_fake_buffer(raw, raw_len, out, out_cap, out_len,
+				 NULL, NULL, visible_bitmap, visible_bits,
+				 raw_line_count);
+}
+
+static bool fake_mi_snapshot_matches_current(struct mnt_namespace *mnt_ns,
+					     const struct path *root)
+{
+	if (!mnt_ns || !root || !root->dentry || !root->mnt ||
+	    fake_mi_current_mnt_ns() != mnt_ns)
+		return false;
+	return fake_mi_root_matches_current(root);
+}
+
+int kasumi_fake_mi_publish_current_snapshot(
+	const char *raw, size_t raw_len, const char *fake, size_t fake_len,
+	struct mnt_namespace *mnt_ns, const struct path *root,
+	u64 *published_generation)
+{
+	struct nsproxy *owner_nsproxy;
+	struct path owner_root = {};
+	char *new_buf;
+	size_t rebuilt_len = 0;
+	u64 generation;
+	int id_count = 0;
+	int new_slot;
+	int ret = 0;
+
+	if (published_generation)
+		*published_generation = 0;
+	if (!raw || !fake || !raw_len || !fake_len || !mnt_ns || !root)
+		return -EINVAL;
+	if (!READ_ONCE(fake_mi_initialized))
+		return -EOPNOTSUPP;
+	/* /proc/<other>/mountinfo may intentionally carry another root or mount
+	 * namespace. It must never replace the current task's statx map. */
+	if (!fake_mi_snapshot_matches_current(mnt_ns, root))
+		return 0;
+
+	owner_nsproxy = current->nsproxy;
+	if (!owner_nsproxy || owner_nsproxy->mnt_ns != mnt_ns)
+		return -EAGAIN;
+	get_nsproxy(owner_nsproxy);
+	owner_root = *root;
+	kasumi_path_get(&owner_root);
+
+	mutex_lock(&g_cache.lock);
+	new_slot = READ_ONCE(g_cache.active_slot) ^ 1;
+	if (new_slot < 0 || new_slot >= FAKE_MI_BUF_SLOTS ||
+	    !g_cache.slots[new_slot].buf ||
+	    !g_cache.slots[new_slot].id_map) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	/* The inactive slot may still have atomic readers from its previous turn. */
+	synchronize_rcu();
+	fake_mi_release_slot_owner_locked(new_slot);
+	new_buf = g_cache.slots[new_slot].buf;
+	ret = build_fake_buffer(raw, raw_len, new_buf, FAKE_MI_BUF_MAX,
+				&rebuilt_len, g_cache.slots[new_slot].id_map,
+				&id_count, NULL, 0, NULL);
+	if (ret)
+		goto out_unlock;
+	/* A mode/config transition between the proxy transform and this rebuild
+	 * changes the bytes. Ask the producer to retry instead of publishing an
+	 * id map for a different view generation. */
+	if (rebuilt_len != fake_len || memcmp(new_buf, fake, fake_len)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	/* A concurrent chroot in a shared fs_struct can move current away from the
+	 * open-bound root while the rebuild sleeps. The snapshot is still valid for
+	 * the proc fd, just not eligible for the current cache. */
+	if (!fake_mi_snapshot_matches_current(mnt_ns, root)) {
+		ret = 0;
+		goto out_unlock;
+	}
+
+	g_cache.slots[new_slot].len = rebuilt_len;
+	WRITE_ONCE(g_cache.slots[new_slot].id_count, id_count);
+	g_cache.slots[new_slot].nsproxy = owner_nsproxy;
+	g_cache.slots[new_slot].mnt_ns = owner_nsproxy->mnt_ns;
+	g_cache.slots[new_slot].root = owner_root;
+	owner_nsproxy = NULL;
+	owner_root.mnt = NULL;
+	owner_root.dentry = NULL;
+	smp_store_release(&g_cache.active_slot, new_slot);
+	WRITE_ONCE(g_cache.last_jiffies, jiffies);
+	smp_store_release(&g_cache.valid, true);
+	generation = fake_mi_advance_cache_generation_locked();
+	WRITE_ONCE(g_cache.slots[new_slot].generation, generation);
+	if (published_generation)
+		*published_generation =
+			(u64)atomic64_read(&fake_mi_view_gen);
+	fake_mi_last_error = 0;
+	kasumi_log("fake_mi: published open snapshot raw_len=%zu fake_len=%zu gen=%llu\n",
+		   raw_len, fake_len, (unsigned long long)generation);
+
+out_unlock:
+	mutex_unlock(&g_cache.lock);
+	if (owner_root.mnt && owner_root.dentry)
+		kasumi_path_put(&owner_root);
+	fake_mi_put_nsproxy(owner_nsproxy);
+	return ret;
 }
 
 /* Caller must hold g_cache.lock.
@@ -879,26 +1158,32 @@ out:
  */
 static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
 {
-    struct file *f;
-    char *scratch = NULL;
-    char *new_buf;
-    size_t total = 0;
-    size_t new_len = 0;
+	struct fake_mi_proc_mounts_prefix *pm;
+	struct seq_file *seq;
+	struct file *f;
+	struct path owner_root = {};
+	char *scratch = NULL;
+	char *new_buf;
+	size_t total = 0;
+	size_t new_len = 0;
 	int id_count = 0;
-    loff_t pos = 0;
-    ssize_t r;
-    int new_slot;
-    int ret = -EIO;
+	u64 generation;
+	unsigned long event_before;
+	loff_t pos = 0;
+	ssize_t r;
+	int new_slot;
+	int ret = -EIO;
 
-    if (!ptr_filp_open || !ptr_kernel_read || !ptr_filp_close ||
-        !owner_nsproxy || !owner_nsproxy->mnt_ns)
-        return -ENOSYS;
-
-    new_slot = READ_ONCE(g_cache.active_slot) ^ 1;
-    if (new_slot < 0 || new_slot >= FAKE_MI_BUF_SLOTS ||
-        !g_cache.slots[new_slot].buf)
-        return -ENOMEM;
-    new_buf = g_cache.slots[new_slot].buf;
+	if (!ptr_filp_open || !ptr_kernel_read || !ptr_filp_close ||
+	    !owner_nsproxy || !owner_nsproxy->mnt_ns)
+		return -EOPNOTSUPP;
+	new_slot = READ_ONCE(g_cache.active_slot) ^ 1;
+	if (new_slot < 0 || new_slot >= FAKE_MI_BUF_SLOTS ||
+	    !g_cache.slots[new_slot].buf) {
+		ret = -ENOMEM;
+		goto out_put_root;
+	}
+	new_buf = g_cache.slots[new_slot].buf;
 
     /* The inactive slot may have been the previous active cache. Wait for
      * atomic readers to leave before reusing its storage.
@@ -906,15 +1191,27 @@ static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
     synchronize_rcu();
     fake_mi_release_slot_owner_locked(new_slot);
 
-    atomic_set(&fake_mi_reader_pid, task_pid_nr(current));
-    f = ptr_filp_open("/proc/self/mountinfo", O_RDONLY, 0);
-    if (IS_ERR(f)) {
-        ret = PTR_ERR(f);
-        kasumi_log("fake_mi: filp_open(/proc/self/mountinfo) failed pid=%d comm=%s ret=%d\n",
-                 task_pid_nr(current), current->comm, ret);
-        atomic_set(&fake_mi_reader_pid, 0);
-        return ret;
-    }
+	atomic_set(&fake_mi_reader_pid, task_pid_nr(current));
+	f = ptr_filp_open("/proc/self/mountinfo", O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		ret = PTR_ERR(f);
+		kasumi_log(
+			"fake_mi: filp_open(/proc/self/mountinfo) failed pid=%d comm=%s ret=%d\n",
+			task_pid_nr(current), current->comm, ret);
+		atomic_set(&fake_mi_reader_pid, 0);
+		goto out_put_root;
+	}
+	seq = f->private_data;
+	pm = fake_mi_proc_mounts(f);
+	if (!seq || !pm || pm->ns != owner_nsproxy->mnt_ns ||
+	    !f->f_op || !f->f_op->poll) {
+		ret = -EOPNOTSUPP;
+		goto out_close;
+	}
+	owner_root = pm->root;
+	kasumi_path_get(&owner_root);
+	(void)f->f_op->poll(f, NULL);
+	event_before = READ_ONCE(seq->poll_event);
 
     scratch = vmalloc(FAKE_MI_SCRATCH);
     if (!scratch) {
@@ -936,49 +1233,70 @@ static KASUMI_NOCFI int regenerate_cache_locked(struct nsproxy *owner_nsproxy)
         total += r;
     }
 
-    if (total == FAKE_MI_SCRATCH) {
-        char extra;
+	if (total == FAKE_MI_SCRATCH) {
+		char extra;
 
-        r = ptr_kernel_read(f, &extra, 1, &pos);
-        if (r < 0) {
-            ret = r;
-            goto out_free;
-        }
-        if (r > 0) {
-            ret = -E2BIG;
-            kasumi_log("fake_mi: mountinfo exceeds scratch capacity pid=%d comm=%s\n",
-                     task_pid_nr(current), current->comm);
-            goto out_free;
-        }
-    }
+		r = ptr_kernel_read(f, &extra, 1, &pos);
+		if (r < 0) {
+			ret = r;
+			goto out_free;
+		}
+		if (r > 0) {
+			ret = -EFBIG;
+			kasumi_log(
+				"fake_mi: mountinfo exceeds scratch capacity pid=%d comm=%s\n",
+				task_pid_nr(current), current->comm);
+			goto out_free;
+		}
+	}
 
 	ret = build_fake_buffer(scratch, total, new_buf, FAKE_MI_BUF_MAX,
 			    &new_len, g_cache.slots[new_slot].id_map,
-			    &id_count);
-    if (ret != 0) {
-        kasumi_log("fake_mi: rebuild failed pid=%d comm=%s ret=%d raw_len=%zu\n",
-                 task_pid_nr(current), current->comm, ret, total);
-        goto out_free;
-    }
+			    &id_count, NULL, 0, NULL);
+	if (ret != 0) {
+		kasumi_log("fake_mi: rebuild failed pid=%d comm=%s ret=%d raw_len=%zu\n",
+			   task_pid_nr(current), current->comm, ret, total);
+		goto out_free;
+	}
+	(void)f->f_op->poll(f, NULL);
+	if (event_before != READ_ONCE(seq->poll_event)) {
+		ret = -EAGAIN;
+		goto out_free;
+	}
+	/* Another thread sharing current->fs may chroot while the whole seq file
+	 * is being consumed. Never publish those bytes under the new root key.
+	 */
+	if (!fake_mi_root_matches_current(&owner_root) ||
+	    fake_mi_current_mnt_ns() != owner_nsproxy->mnt_ns) {
+		ret = -EAGAIN;
+		goto out_free;
+	}
 
     g_cache.slots[new_slot].len = new_len;
 	WRITE_ONCE(g_cache.slots[new_slot].id_count, id_count);
     g_cache.slots[new_slot].nsproxy = owner_nsproxy;
     g_cache.slots[new_slot].mnt_ns = owner_nsproxy->mnt_ns;
+	g_cache.slots[new_slot].root = owner_root;
+	owner_root.mnt = NULL;
+	owner_root.dentry = NULL;
     smp_store_release(&g_cache.active_slot, new_slot);
     WRITE_ONCE(g_cache.last_jiffies, jiffies);
     smp_store_release(&g_cache.valid, true);
-    g_cache_gen++;
+	generation = fake_mi_advance_cache_generation_locked();
+	WRITE_ONCE(g_cache.slots[new_slot].generation, generation);
     ret = 0;
     kasumi_log("fake_mi: regenerated pid=%d comm=%s raw_len=%zu fake_len=%zu gen=%llu\n",
              task_pid_nr(current), current->comm, total, new_len,
-             (unsigned long long)g_cache_gen);
+	     (unsigned long long)generation);
 
 out_free:
     if (scratch) vfree(scratch);
 out_close:
     ptr_filp_close(f, NULL);
     atomic_set(&fake_mi_reader_pid, 0);
+out_put_root:
+	if (owner_root.mnt && owner_root.dentry)
+		kasumi_path_put(&owner_root);
     return ret;
 }
 
@@ -999,6 +1317,7 @@ static int fake_mi_prepare_locked(bool force)
         if (!force && g_cache.valid &&
             slot >= 0 && slot < FAKE_MI_BUF_SLOTS &&
             g_cache.slots[slot].mnt_ns == mnt_ns &&
+	    fake_mi_root_matches_current(&g_cache.slots[slot].root) &&
             !time_after(jiffies, g_cache.last_jiffies +
                                   msecs_to_jiffies(FAKE_MI_TTL_MS)))
             return 0;
@@ -1094,12 +1413,30 @@ void kasumi_fake_mi_invalidate_all(void)
 
     mutex_lock(&g_cache.lock);
     smp_store_release(&g_cache.valid, false);
+	fake_mi_advance_view_generation_locked();
     fake_mi_last_error = 0;
     g_cache.last_jiffies = 0;
     synchronize_rcu();
     for (i = 0; i < FAKE_MI_BUF_SLOTS; i++)
         fake_mi_release_slot_owner_locked(i);
     mutex_unlock(&g_cache.lock);
+}
+
+u64 kasumi_fake_mi_generation(void)
+{
+	return (u64)atomic64_read(&fake_mi_view_gen);
+}
+
+void kasumi_fake_mi_poll_wait(struct file *file,
+			      struct poll_table_struct *wait)
+{
+	if (file && wait)
+		poll_wait(file, &fake_mi_view_wait, wait);
+}
+
+void kasumi_fake_mi_poll_wake(void)
+{
+	wake_up_all(&fake_mi_view_wait);
 }
 
 int kasumi_fake_mi_prepare(bool force)
@@ -1141,9 +1478,14 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
     bool use_explicit_pos = explicit_pos >= 0;
     char *cache_buf;
     size_t cache_len;
+	size_t not_copied;
+	size_t copied;
+	int slot;
 
-    if (!file || !userbuf)
-        return -EINVAL;
+	if (!file || !userbuf)
+		return -EINVAL;
+	if (!count)
+		return 0;
 
     mutex_lock(&g_cache.lock);
     ret = fake_mi_prepare_locked(false);
@@ -1156,7 +1498,12 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
         mutex_unlock(&g_cache.lock);
         return READ_ONCE(fake_mi_initialized) ? -EAGAIN : 0;
     }
-    gen = g_cache_gen;
+	slot = READ_ONCE(g_cache.active_slot);
+	if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS) {
+		mutex_unlock(&g_cache.lock);
+		return -EAGAIN;
+	}
+	gen = READ_ONCE(g_cache.slots[slot].generation);
 
     if (use_explicit_pos) {
         pos = (size_t)explicit_pos;
@@ -1180,24 +1527,25 @@ ssize_t kasumi_fake_mi_serve(struct file *file, void __user *userbuf,
     avail = cache_len - pos;
     to_copy = count < avail ? count : avail;
 
-    if (copy_to_user(userbuf, cache_buf + pos, to_copy)) {
-        mutex_unlock(&g_cache.lock);
-        return -EFAULT;
-    }
+	not_copied = copy_to_user(userbuf, cache_buf + pos, to_copy);
+	copied = to_copy - not_copied;
+	if (copied && !use_explicit_pos) {
+		spin_lock_irqsave(&g_cursors_lock, flags);
+		/* g_cache.lock keeps this generation active until the cursor is
+		 * advanced, so a concurrent publication cannot reset it mid-copy.
+		 */
+		idx = cursor_locate_locked(file, current->tgid, gen);
+		g_cursors[idx].pos = pos + copied;
+		spin_unlock_irqrestore(&g_cursors_lock, flags);
+	}
     mutex_unlock(&g_cache.lock);
+	if (!copied)
+		return -EFAULT;
 
     /* Unused kernel_ret: we fully replace kernel output. */
     (void)kernel_ret;
 
-    if (!use_explicit_pos) {
-        spin_lock_irqsave(&g_cursors_lock, flags);
-        /* Cursor might have been evicted between unlock/lock; re-locate. */
-        idx = cursor_locate_locked(file, current->tgid, gen);
-        g_cursors[idx].pos = pos + to_copy;
-        spin_unlock_irqrestore(&g_cursors_lock, flags);
-    }
-
-    ret = (ssize_t)to_copy;
+	ret = (ssize_t)copied;
     return ret;
 }
 
@@ -1302,7 +1650,6 @@ int kasumi_fake_mi_lookup_mount_id_cached(const char *path)
     size_t in = 0;
     int ret = -ENOENT;
     int slot;
-    struct mnt_namespace *mnt_ns;
     char *cache_buf;
     size_t cache_len;
 
@@ -1323,11 +1670,10 @@ int kasumi_fake_mi_lookup_mount_id_cached(const char *path)
         goto out_unlock;
     }
 
-    mnt_ns = fake_mi_current_mnt_ns();
-    if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns) {
-        ret = -EAGAIN;
-        goto out_unlock;
-    }
+	if (!fake_mi_slot_matches_current(slot)) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
 
     cache_buf = READ_ONCE(g_cache.slots[slot].buf);
     cache_len = READ_ONCE(g_cache.slots[slot].len);
@@ -1362,15 +1708,21 @@ out_unlock:
     return ret;
 }
 
-int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
+int kasumi_fake_mi_mount_id_state_cached(u64 real_id, int *fake_id,
+					 bool *hidden,
+					 bool *projected_mount_root)
 {
-	struct fake_mi_id_entry *id_map;
-	struct mnt_namespace *mnt_ns;
+	const struct fake_mi_id_entry *id_map;
 	int id_count;
 	int slot;
 	int ret = -ENOENT;
 	int i;
 
+	if (!fake_id || !hidden || !projected_mount_root)
+		return -EINVAL;
+	*fake_id = 0;
+	*hidden = false;
+	*projected_mount_root = false;
 	rcu_read_lock();
 	if (!smp_load_acquire(&g_cache.valid)) {
 		ret = -EAGAIN;
@@ -1381,8 +1733,7 @@ int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
-	mnt_ns = fake_mi_current_mnt_ns();
-	if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns) {
+	if (!fake_mi_slot_matches_current(slot)) {
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
@@ -1390,7 +1741,11 @@ int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
 	id_count = READ_ONCE(g_cache.slots[slot].id_count);
 	for (i = 0; id_map && i < id_count; i++) {
 		if ((u64)id_map[i].real_id == real_id) {
-			ret = id_map[i].fake_id;
+			*fake_id = id_map[i].fake_id;
+			*hidden = !id_map[i].visible;
+			*projected_mount_root =
+				id_map[i].projected_mount_root;
+			ret = 0;
 			break;
 		}
 	}
@@ -1398,51 +1753,6 @@ int kasumi_fake_mi_translate_mount_id_cached(u64 real_id)
 out_unlock:
 	rcu_read_unlock();
 	return ret;
-}
-
-/* This query calls the kallsyms-resolved vfs_getattr pointer. Keep the
- * indirect call outside strict jump-table CFI, like the other runtime
- * symbol bridges in this module. */
-KASUMI_NOCFI bool kasumi_fake_mi_mount_hidden_cached(const struct path *path)
-{
-	const struct fake_mi_id_entry *id_map;
-	struct mnt_namespace *mnt_ns;
-	struct kstat stat = {};
-	u64 real_id;
-	int id_count;
-	int slot;
-	int i;
-	bool hidden = false;
-
-	if (!path || !path->mnt)
-		return false;
-	if (!kasumi_vfs_getattr ||
-	    kasumi_vfs_getattr_unprojected(path, &stat, STATX_MNT_ID, 0) != 0 ||
-	    !(stat.result_mask & STATX_MNT_ID))
-		return false;
-	real_id = READ_ONCE(stat.mnt_id);
-
-	rcu_read_lock();
-	if (!smp_load_acquire(&g_cache.valid))
-		goto out_unlock;
-	slot = smp_load_acquire(&g_cache.active_slot);
-	if (slot < 0 || slot >= FAKE_MI_BUF_SLOTS)
-		goto out_unlock;
-	mnt_ns = fake_mi_current_mnt_ns();
-	if (!mnt_ns || READ_ONCE(g_cache.slots[slot].mnt_ns) != mnt_ns)
-		goto out_unlock;
-	id_map = READ_ONCE(g_cache.slots[slot].id_map);
-	id_count = READ_ONCE(g_cache.slots[slot].id_count);
-	for (i = 0; id_map && i < id_count; i++) {
-		if ((u64)id_map[i].real_id == real_id) {
-			hidden = !id_map[i].visible;
-			break;
-		}
-	}
-
-out_unlock:
-	rcu_read_unlock();
-	return hidden;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1453,19 +1763,22 @@ int kasumi_fake_mi_init(void)
 {
     int i;
 
-    mutex_init(&g_cache.lock);
-    memset(g_cursors, 0, sizeof(g_cursors));
+	mutex_init(&g_cache.lock);
+	memset(g_cursors, 0, sizeof(g_cursors));
+	g_cache_gen = 0;
+	atomic64_set(&fake_mi_view_gen, 1);
 
     ptr_filp_open  = (void *)kasumi_lookup_callable("filp_open");
     ptr_filp_close = (void *)kasumi_lookup_callable("filp_close");
     ptr_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
     ptr_free_nsproxy = (void *)kasumi_lookup_callable("free_nsproxy");
 
-    if (!ptr_filp_open || !ptr_filp_close || !ptr_kernel_read ||
-        !ptr_free_nsproxy) {
-        pr_warn("Kasumi fake_mi: symbol resolution failed (filp_open=%p filp_close=%p kernel_read=%p free_nsproxy=%p); feature disabled\n",
+	if (!ptr_filp_open || !ptr_filp_close || !ptr_kernel_read ||
+	    !ptr_free_nsproxy || !kasumi_path_get_ptr || !kasumi_path_put_ptr) {
+		pr_warn("Kasumi fake_mi: symbol resolution failed (filp_open=%p filp_close=%p kernel_read=%p free_nsproxy=%p path_get=%p path_put=%p); feature disabled\n",
                 ptr_filp_open, ptr_filp_close, ptr_kernel_read,
-                ptr_free_nsproxy);
+				ptr_free_nsproxy, kasumi_path_get_ptr,
+				kasumi_path_put_ptr);
         return -ENOSYS;
     }
 
@@ -1484,6 +1797,9 @@ int kasumi_fake_mi_init(void)
 		g_cache.slots[i].id_count = 0;
         g_cache.slots[i].nsproxy = NULL;
         g_cache.slots[i].mnt_ns = NULL;
+		g_cache.slots[i].root.mnt = NULL;
+		g_cache.slots[i].root.dentry = NULL;
+		g_cache.slots[i].generation = 0;
     }
     g_cache.active_slot = 0;
     smp_store_release(&g_cache.valid, false);
@@ -1502,6 +1818,9 @@ out_free_slots:
 		g_cache.slots[i].id_map = NULL;
 		g_cache.slots[i].id_count = 0;
         g_cache.slots[i].len = 0;
+		g_cache.slots[i].root.mnt = NULL;
+		g_cache.slots[i].root.dentry = NULL;
+		g_cache.slots[i].generation = 0;
     }
     return -ENOMEM;
 }

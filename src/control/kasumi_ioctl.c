@@ -59,6 +59,7 @@
 #include "kasumi_fop_bridge.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
+#include "kasumi_sop_shadow.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
 /* ======================================================================
@@ -366,6 +367,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		kasumi_cleanup_locked();
 		mutex_unlock(&kasumi_config_mutex);
 		kasumi_dirhijack_clear();
+		kasumi_fop_override_clear();
+		kasumi_sop_shadow_reap();
 		kasumi_fake_mi_invalidate_all();
 		rcu_barrier();
 		return 0;
@@ -810,6 +813,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		struct kasumi_statfs_spoof_arg a;
 		if (copy_from_user(&a, arg, sizeof(a)))
 			return -EFAULT;
+		if (a.enable && !kasumi_statfs_kretprobe_registered)
+			return -EOPNOTSUPP;
 		if (a.enable)
 			kasumi_feature_enabled_mask |= KSM_FEATURE_STATFS_SPOOF;
 		else
@@ -963,7 +968,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		written += n;
 		if (kasumi_statfs_kretprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "statfs/fstatfs: kretprobe (vfs_statfs)\n");
+				     "statfs/fstatfs: kretprobe (vfs_statfs entries=%llu spoofs=%llu)\n",
+				     (unsigned long long)atomic64_read(&kasumi_hook_stats.statfs_entries),
+				     (unsigned long long)atomic64_read(&kasumi_hook_stats.statfs_spoofs));
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "statfs: none\n");
 		written += n;
@@ -1601,6 +1608,11 @@ static void kasumi_quiesce_stop_new(void)
 	kasumi_proc_hooks_stop_new();
 	kasumi_vfs_hooks_exit(0);
 	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_dirhijack_stop_new();
+	/* Reject nested vnode creation before withdrawing the lookup/fop/dentry
+	 * clients that keep each superblock owner live. */
+	kasumi_sop_shadow_stop_new();
+	kasumi_dirhijack_clear();
 	kasumi_fop_override_stop_new();
 	kasumi_fop_bridge_stop_new();
 	kasumi_iop_override_stop_new();
@@ -1619,6 +1631,8 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	unsigned int proxies;
 	unsigned int iop_active;
 	bool iop_quiesced;
+	unsigned int sop_active;
+	bool sop_quiesced;
 	unsigned int known_refs;
 	unsigned int module_refs;
 	bool unload_pin_held;
@@ -1649,6 +1663,8 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 	proxies = kasumi_proc_proxy_live();
 	iop_active = kasumi_iop_override_active();
 	iop_quiesced = kasumi_iop_override_quiesced();
+	sop_active = kasumi_sop_shadow_active();
+	sop_quiesced = kasumi_sop_shadow_quiesced();
 	unload_pin_held = kasumi_bootstrap_unload_pin_held();
 	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
 	known_refs = control_files + getfd + proxies +
@@ -1662,12 +1678,13 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
 	if (control_files != 1)
 		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
-	if (module_refs > known_refs || iop_active ||
-	    !iop_quiesced)
+	if (module_refs > known_refs || iop_active || sop_active ||
+	    !iop_quiesced || !sop_quiesced)
 		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
 
 	ready = !getfd && !proxies &&
-		iop_quiesced && control_files == 1 &&
+		iop_quiesced && sop_quiesced && !sop_active &&
+		control_files == 1 &&
 		module_refs == control_files + (unload_pin_held ? 1U : 0U);
 
 	if (kasumi_quiesce_error) {

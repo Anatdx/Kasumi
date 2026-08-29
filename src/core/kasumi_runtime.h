@@ -42,6 +42,8 @@ struct kasumi_hook_stats {
 	atomic64_t vfs_getattr_spoofs;
 	atomic64_t iop_getattr_entries;
 	atomic64_t iop_getattr_spoofs;
+	atomic64_t statfs_entries;
+	atomic64_t statfs_spoofs;
 	atomic64_t d_path_entries;
 	atomic64_t d_path_rewrites;
 	atomic64_t dop_dname_entries;
