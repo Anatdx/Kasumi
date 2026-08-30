@@ -1233,8 +1233,8 @@ static bool kasumi_rule_source_from_path(struct path *resolved,
 	return true;
 }
 
-static int kasumi_read_link_target(const struct path *link, char *target,
-				   size_t target_size)
+static KASUMI_NOCFI int kasumi_read_link_target(const struct path *link,
+					char *target, size_t target_size)
 {
 	struct delayed_call done = {};
 	const char *value;
@@ -1695,7 +1695,7 @@ static bool kasumi_compose_visible_path(const struct kasumi_entry *entry,
 	return true;
 }
 
-static bool kasumi_rule_get_visible_path_canonical(
+static KASUMI_NOCFI bool kasumi_rule_get_visible_path_canonical(
 	const struct path *source, char *visible_path, size_t visible_path_size)
 {
 	struct kasumi_entry *entry;

@@ -234,7 +234,7 @@ int kasumi_ftrace_krp_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-int kasumi_ftrace_try_register(unsigned long addr[4])
+KASUMI_NOCFI int kasumi_ftrace_try_register(unsigned long addr[4])
 {
 	int i, ret;
 	static const char *ft_syms[] = {"vfs_getattr", "d_path", "iterate_dir", "vfs_getxattr"};
@@ -366,7 +366,7 @@ err_put:
 	return ret;
 }
 
-void kasumi_ftrace_unregister(void)
+KASUMI_NOCFI void kasumi_ftrace_unregister(void)
 {
 	if (kasumi_ftrace_unregister_fn)
 		kasumi_ftrace_unregister_fn(&kasumi_ftrace_ops);

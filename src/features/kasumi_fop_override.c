@@ -195,7 +195,7 @@ bool kasumi_fop_file_is_shadowed(const struct file *file)
 	       fop->iterate_shared == kasumi_shadow_iterate_shared;
 }
 
-int kasumi_fop_install(struct inode *inode)
+KASUMI_NOCFI int kasumi_fop_install(struct inode *inode)
 {
 	struct kasumi_fop_template *template, *spare;
 	struct kasumi_fop_meta *m, *existing;

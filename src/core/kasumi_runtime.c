@@ -285,7 +285,7 @@ dev_t kasumi_vnode_device(void)
  * falls back to the captured /system dev, then to the vnode minor, so a valid
  * non-zero device is always published.  Sleepable context only (path lookup).
  */
-dev_t kasumi_vnode_visible_dev(const char *visible_path)
+KASUMI_NOCFI dev_t kasumi_vnode_visible_dev(const char *visible_path)
 {
 	struct path p;
 	dev_t dev = kasumi_system_dev;
@@ -963,7 +963,7 @@ bool kasumi_is_inode_hidden_bit(struct inode *inode)
 	return test_bit(AS_FLAGS_KASUMI_HIDE, &inode->i_mapping->flags);
 }
 
-void kasumi_mark_dir_has_inject(const char *path_str)
+KASUMI_NOCFI void kasumi_mark_dir_has_inject(const char *path_str)
 {
 	struct path p;
 
@@ -980,7 +980,8 @@ void kasumi_mark_dir_has_inject(const char *path_str)
 	kasumi_path_put(&p);
 }
 
-void kasumi_clear_inode_flags_for_path(const char *path_str, unsigned int bit)
+KASUMI_NOCFI void kasumi_clear_inode_flags_for_path(const char *path_str,
+					    unsigned int bit)
 {
 	struct path p;
 

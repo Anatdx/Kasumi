@@ -1183,7 +1183,7 @@ static int kasumi_dh_split_parent(const char *visible_path, char **parent_out,
  * rule table (kasumi_rule_vpath_*), so only the top segment needs registering.
  * The child is shared across all rules under R/s1.
  */
-static int kasumi_dh_register_vtopo(const char *visible_path)
+static KASUMI_NOCFI int kasumi_dh_register_vtopo(const char *visible_path)
 {
 	char *pparent = NULL;
 	char *probe;
@@ -1314,9 +1314,9 @@ out:
 	return ret;
 }
 
-static int kasumi_dh_register(const char *visible_path, const struct path *source,
-			      unsigned long v_ino, u8 flags, bool hide,
-			      bool lookup_only)
+static KASUMI_NOCFI int
+kasumi_dh_register(const char *visible_path, const struct path *source,
+		   unsigned long v_ino, u8 flags, bool hide, bool lookup_only)
 {
 	char *parent = NULL;
 	const char *child = NULL;
@@ -1438,7 +1438,7 @@ int kasumi_dirhijack_hide(const char *visible_path)
 	return kasumi_dh_register(visible_path, NULL, 0, 0, true, false);
 }
 
-int kasumi_dirhijack_del(const char *visible_path)
+KASUMI_NOCFI int kasumi_dirhijack_del(const char *visible_path)
 {
 	char *parent = NULL;
 	const char *child = NULL;

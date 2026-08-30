@@ -94,7 +94,7 @@ static void kasumi_getfd_task_work_func(struct callback_head *cb)
 	call_rcu(&tw->rcu, kasumi_getfd_task_work_release_rcu);
 }
 
-static int kasumi_queue_getfd_task_work(int __user *outp)
+static KASUMI_NOCFI int kasumi_queue_getfd_task_work(int __user *outp)
 {
 	struct kasumi_getfd_task_work *tw;
 

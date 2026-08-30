@@ -370,8 +370,9 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 void kasumi_materialize_merge(const char *src_prefix,
 			      const char *target_dir, int depth);
 
-static void kasumi_add_path_entry(const char *src, const char *tgt,
-				  unsigned char type)
+static KASUMI_NOCFI void kasumi_add_path_entry(const char *src,
+					      const char *tgt,
+					      unsigned char type)
 {
 	struct kasumi_entry *e;
 	u32 hash = full_name_hash(NULL, src, strlen(src));

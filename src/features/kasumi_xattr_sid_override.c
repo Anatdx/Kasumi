@@ -108,7 +108,8 @@ static bool kasumi_selinux_write_sid(struct inode *inode, u32 sid)
 	return true;
 }
 
-static int kasumi_source_sid_from_path(const char *source_path, u32 *sid)
+static KASUMI_NOCFI int kasumi_source_sid_from_path(const char *source_path,
+						    u32 *sid)
 {
 	char *try_path;
 	size_t len;

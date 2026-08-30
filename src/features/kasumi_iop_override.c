@@ -181,7 +181,7 @@ KASUMI_NOCFI static int kasumi_shadow_getattr(const struct path *path,
 /* install / uninstall                                                  */
 /* ------------------------------------------------------------------ */
 
-int kasumi_iop_install(struct inode *inode)
+KASUMI_NOCFI int kasumi_iop_install(struct inode *inode)
 {
 	struct kasumi_iop_meta *m, *existing;
 	const struct inode_operations *orig;

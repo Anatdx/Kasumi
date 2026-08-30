@@ -802,9 +802,9 @@ static void KASUMI_NOCFI kasumi_vnode_src_drop_write(const struct path *src)
  * lockdep from confusing this with the visible parent our VFS caller already
  * holds at I_MUTEX_PARENT.  On error returns ERR_PTR and leaves nothing locked.
  */
-static struct dentry *kasumi_vnode_src_child(struct kasumi_vnode_info *info,
-					     const struct dentry *vis,
-					     struct inode **dir_out)
+static KASUMI_NOCFI struct dentry *
+kasumi_vnode_src_child(struct kasumi_vnode_info *info,
+		       const struct dentry *vis, struct inode **dir_out)
 {
 	struct inode *src_dir;
 	struct dentry *child;
@@ -1390,7 +1390,8 @@ static const struct file_operations kasumi_vnode_dir_fops = {
  * vnode); no SELinux blob offsets or struct layout assumptions, so it stays
  * stable across KMIs.  Best-effort: on any failure or missing symbol the vnode
  * keeps its default label rather than failing creation. */
-static void kasumi_vnode_clone_sid(struct inode *vnode, struct inode *src)
+static KASUMI_NOCFI void kasumi_vnode_clone_sid(struct inode *vnode,
+					       struct inode *src)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
 	void *ctx = NULL;
