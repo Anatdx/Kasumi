@@ -159,13 +159,14 @@ static void fake_mi_release_slot_owner_locked(int slot)
 static bool fake_mi_root_matches_current(const struct path *root)
 {
 	struct fs_struct *fs = current->fs;
+	struct path current_root;
 	bool matches;
 
 	if (!fs || !root || !root->mnt || !root->dentry)
 		return false;
-	spin_lock(&fs->lock);
-	matches = path_equal(&fs->root, root);
-	spin_unlock(&fs->lock);
+	get_fs_root(fs, &current_root);
+	matches = path_equal(&current_root, root);
+	path_put(&current_root);
 	return matches;
 }
 

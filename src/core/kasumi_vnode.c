@@ -863,7 +863,8 @@ static void kasumi_vnode_src_end(struct kasumi_vnode_info *info,
 {
 	inode_unlock(src_dir);
 	kasumi_vnode_src_drop_write(&info->source);
-	dput(child);
+	if (child)
+		dput(child);
 	module_put(THIS_MODULE);
 }
 
@@ -924,9 +925,9 @@ static int KASUMI_NOCFI kasumi_vnode_dir_create(KVN_IDMAP_ARG struct inode *dir,
 	return ret;
 }
 
-static int KASUMI_NOCFI kasumi_vnode_dir_mkdir(KVN_IDMAP_ARG struct inode *dir,
-					       struct dentry *dentry,
-					       umode_t mode)
+static int KASUMI_NOCFI kasumi_vnode_dir_mkdir_common(struct inode *dir,
+					      struct dentry *dentry,
+					      umode_t mode)
 {
 	struct kasumi_vnode_info *info = dir->i_private;
 	struct inode *src_dir = NULL;
@@ -942,14 +943,51 @@ static int KASUMI_NOCFI kasumi_vnode_dir_mkdir(KVN_IDMAP_ARG struct inode *dir,
 	child = kasumi_vnode_src_begin(info, dentry, &src_dir);
 	if (IS_ERR(child))
 		return PTR_ERR(child);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	{
+		struct dentry *created;
+
+		/* vfs_mkdir() consumes @child on error or when it substitutes a
+		 * different dentry, and returns the dentry the caller must release. */
+		created = kasumi_vfs_mkdir(KVN_SRC_IDMAP(info->source.mnt)
+					  src_dir, child, mode);
+		if (IS_ERR(created)) {
+			ret = PTR_ERR(created);
+			child = NULL;
+		} else {
+			child = created;
+			ret = kasumi_vnode_publish_child(dir->i_sb, &info->source,
+						 child, dentry);
+		}
+	}
+#else
 	ret = kasumi_vfs_mkdir(KVN_SRC_IDMAP(info->source.mnt) src_dir, child,
 			       mode);
 	if (ret == 0)
 		ret = kasumi_vnode_publish_child(dir->i_sb, &info->source, child,
 						 dentry);
+#endif
 	kasumi_vnode_src_end(info, src_dir, child);
 	return ret;
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+static struct dentry *KASUMI_NOCFI
+kasumi_vnode_dir_mkdir(KVN_IDMAP_ARG struct inode *dir,
+			struct dentry *dentry, umode_t mode)
+{
+	int ret = kasumi_vnode_dir_mkdir_common(dir, dentry, mode);
+
+	return ret ? ERR_PTR(ret) : NULL;
+}
+#else
+static int KASUMI_NOCFI kasumi_vnode_dir_mkdir(KVN_IDMAP_ARG struct inode *dir,
+					       struct dentry *dentry,
+					       umode_t mode)
+{
+	return kasumi_vnode_dir_mkdir_common(dir, dentry, mode);
+}
+#endif
 
 static int KASUMI_NOCFI kasumi_vnode_dir_mknod(KVN_IDMAP_ARG struct inode *dir,
 					       struct dentry *dentry,
@@ -1174,7 +1212,8 @@ static void kasumi_unlock_src_rename(struct dentry *p1, struct dentry *p2)
 }
 
 /* Issue the delegated rename on the source dentries, building the version-
- * appropriate call shape.  The source mounts' idmaps govern the two ends. */
+ * appropriate call shape. Older kernels carry both source-mount idmaps;
+ * 6.18 requires a single mount/idmap and parent dentries. */
 static int KASUMI_NOCFI kasumi_vnode_do_src_rename(
 	struct kasumi_vnode_info *oinfo, struct kasumi_vnode_info *ninfo,
 	struct inode *sodir, struct dentry *src_old,
@@ -1183,17 +1222,31 @@ static int KASUMI_NOCFI kasumi_vnode_do_src_rename(
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	struct renamedata rd = {};
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	/* 6.18 collapsed renamedata to one mount idmap and parent dentries,
+	 * matching renameat2's same-mount requirement. */
+	if (oinfo->source.mnt != ninfo->source.mnt)
+		return -EXDEV;
+	rd.mnt_idmap = mnt_idmap(oinfo->source.mnt);
+	rd.old_parent = oinfo->source.dentry;
+	rd.old_dentry = src_old;
+	rd.new_parent = ninfo->source.dentry;
+	rd.new_dentry = src_new;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 	rd.old_mnt_idmap = mnt_idmap(oinfo->source.mnt);
 	rd.new_mnt_idmap = mnt_idmap(ninfo->source.mnt);
-#else
-	rd.old_mnt_userns = mnt_user_ns(oinfo->source.mnt);
-	rd.new_mnt_userns = mnt_user_ns(ninfo->source.mnt);
-#endif
 	rd.old_dir = sodir;
 	rd.old_dentry = src_old;
 	rd.new_dir = sndir;
 	rd.new_dentry = src_new;
+#else
+	rd.old_mnt_userns = mnt_user_ns(oinfo->source.mnt);
+	rd.new_mnt_userns = mnt_user_ns(ninfo->source.mnt);
+	rd.old_dir = sodir;
+	rd.old_dentry = src_old;
+	rd.new_dir = sndir;
+	rd.new_dentry = src_new;
+#endif
 	rd.delegated_inode = NULL;
 	rd.flags = flags;
 	return kasumi_vfs_rename(&rd);

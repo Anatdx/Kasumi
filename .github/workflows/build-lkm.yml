@@ -27,12 +27,12 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
+          - android17-6.18
     uses: ./.github/workflows/ddk-lkm.yml
     secrets: inherit
     with:
       arch: ${{ matrix.arch }}
       kmi: ${{ matrix.kmi }}
-      ddk_release: "20251104"
 
   merge-lkm:
     name: Merge all LKM artifacts

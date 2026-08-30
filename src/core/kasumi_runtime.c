@@ -424,7 +424,12 @@ const char *(*kasumi_vfs_get_link)(struct dentry *, struct delayed_call *);
 struct dentry *(*kasumi_lookup_one_len)(const char *, struct dentry *, int);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 int (*kasumi_vfs_create)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, bool);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+struct dentry *(*kasumi_vfs_mkdir)(struct mnt_idmap *, struct inode *,
+				   struct dentry *, umode_t);
+#else
 int (*kasumi_vfs_mkdir)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
+#endif
 int (*kasumi_vfs_mknod)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, dev_t);
 int (*kasumi_vfs_symlink)(struct mnt_idmap *, struct inode *, struct dentry *, const char *);
 int (*kasumi_vfs_unlink)(struct mnt_idmap *, struct inode *, struct dentry *, struct inode **);
