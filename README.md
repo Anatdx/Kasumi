@@ -1,58 +1,35 @@
-> [!CAUTION]
-> # ⚠️ 重要警告 / IMPORTANT WARNING ⚠️
->
-> **本项目目前存在已知或潜在的检测问题，无法保证能够规避检测。作者近期处于消极维护、低活跃开发状态，相关问题可能无法得到及时修复。继续使用本项目所造成的一切后果均由用户自行承担。在作者恢复积极维护并另行通知前，我不建议任何用户继续使用本项目。**
->
-> **This project currently has known or potential detection issues and cannot be assumed to evade detection. The author has recently been maintaining and developing it at a low level of activity, so related problems may not be fixed promptly. You are solely responsible for any consequences resulting from continued use. I do not recommend that anyone continue using this project until the author resumes active maintenance and announces otherwise.**
-
----
-
 # Kasumi
 
 Kasumi is an out-of-tree Linux kernel module (`kasumi_lkm.ko`) for Android GKI/Linux path control in root/SU environments.
 
-It provides redirection, hiding, merge/injection, and spoofing behavior through an anonymous-fd + `ioctl` control plane.
+It provides path redirection, hiding, directory merge/injection, and scoped proc/mount presentation through a root-only anonymous-fd + `ioctl` control plane. Kasumi was previously developed as HymoFS; Kasumi/KSM is the current project and ABI name.
 
-Kasumi was previously developed as HymoFS. The project name, module name, userspace ABI, and public symbols now use Kasumi/KSM naming; HymoFS should be treated as a historical name.
+中文版本：[README.zh-CN.md](./README.zh-CN.md)
 
-中文版本: [README.zh-CN.md](./README.zh-CN.md)
+## Status
 
-## Scope and Status
+- Repository type: LKM, not an in-tree kernel patch set
+- Implementation: `src/`
+- Userspace ABI: `src/include/kasumi_uapi.h`
+- Protocol: `KSM_PROTOCOL_VERSION = 17`
+- Path view: VFS lookup/vnode based; there is no syscall-table dispatcher or `sys_enter` redirect engine
+- Control entry: root-only `reboot` GET_FD command, followed by fd-based ioctls
 
-- Repository type: LKM (not an in-tree kernel patch set)
-- Main code: `src/`
-- Control protocol: `src/include/kasumi_uapi.h`
-- Current protocol version: `KSM_PROTOCOL_VERSION = 17`
-- Hook strategy: operation-level fop/iop/VFS hooks first; TSR is limited to virtual-path lookups that cannot yet be represented by the current LKM inode model
-- 6.6+ compatibility for `arch_ftrace_get_regs` is included in current code
+## Capabilities
 
-## Core Capabilities
+- Redirect a visible path to a regular file, symlink, directory, character device, block device, or FIFO source
+- Hide paths and merge/inject directory trees, including newly created virtual directory levels
+- Preserve visible path, inode/device identity, SELinux context, and exec-time file capabilities where supported
+- Forward file and directory mutations to directory-backed sources
+- Apply policy by detected root provider or explicit allow/deny UID lists
+- Present scoped `/proc/<pid>/maps`, `mountinfo`, `mounts`, mount namespace links, and statfs/statx mount identity
+- Configure kstat, maps, mount-hide, statfs, overlay-xattr, and SELinux-oracle filtering features
 
-- Path redirect: `src -> target`, including `openat`, `statfs`, `statx`, `newfstatat`, `faccessat`, and xattr path syscalls
-- Reverse mapping for path presentation (`d_path` related flow)
-- Directory entry hiding (`iterate_dir` filtering)
-- Directory merge/injection behavior
-- `kstat` spoofing (ino/dev/size/time, etc.)
-- Overlay/xattr related filtering and SELinux label presentation for injected files
-- `/proc/cmdline` spoofing
-- `/proc/<pid>/maps` spoofing rules (ino/dev/pathname)
-- Mount-hide and statfs spoof features
-
-Use in controlled environments only. This module hooks selected VFS operations and path syscalls.
-
-## Hook Overview
-
-- TSR: `sys_enter` redirects registered syscall numbers to one shared dispatcher installed in an unused `ni_syscall` table slot; target syscall-table entries are never patched
-- GET_FD path: a root-only `reboot` kprobe queues fd installation through task work; `reboot` and `prctl` are not TSR routes
-- Path syscalls: TSR covers `openat/openat2`, `statfs`, `statx`, `newfstatat`, `faccessat`, `getxattr/lgetxattr`, and `listxattr/llistxattr`
-- Data-plane syscalls: `read`, `write`, `getdents64`, and `fstatfs` are not TSR routes; cmdline, proc attr, directory iteration, and statfs spoofing run at their producer/VFS operation layers
-- KernelSU coexistence: Kasumi selects a different unused dispatcher slot and does not overwrite a syscall number already redirected by another TSR consumer
-- VFS path: iop/fop shadows handle `getattr` and `readdir`; statfs spoofing is attached to `vfs_statfs` and limited to mounts omitted by the current fake mountinfo view
-- Symbol resolution: prefer `kallsyms_lookup_name`, fallback to per-symbol kprobe resolution
+Socket sources are not supported. Source-less virtual directories are read-only.
 
 ## CI KMI Targets
 
-Current workflow builds:
+The default DDK release is `20260828`. Current workflows build:
 
 - `android12-5.10`
 - `android13-5.10`
@@ -61,97 +38,219 @@ Current workflow builds:
 - `android14-6.1`
 - `android15-6.6`
 - `android16-6.12`
+- `android17-6.18`
 
 See `.github/workflows/build-lkm.yml` and `.github/workflows/ddk-lkm.yml`.
 
 ## Build
 
-### Option A: DDK (recommended)
+### DDK
 
 ```bash
 ddk build
 ddk build android14-6.1
 ddk build android15-6.6
+ddk build android17-6.18
 ```
 
-### Option B: Kernel tree local build
+### Kernel tree
 
-Run against a prepared kernel tree (`modules_prepare` done):
+Run against a prepared kernel tree after `modules_prepare`:
 
 ```bash
 make -C /path/to/kernel ARCH=arm64 M=$(pwd)/src modules
 ```
 
-## Load and Debug Parameters
+## Load and Module Parameters
 
 ```sh
 insmod kasumi_lkm.ko
 ```
 
-If symbol export limitations prevent loading, and you are using newer KernelSU or its forks, you can also try:
+If required symbols are not exported and the installed KernelSU implementation supports it:
 
 ```sh
 ksud insmod kasumi_lkm.ko
 ```
 
-Common module parameters in `src/core/kasumi_bootstrap.c`:
+Useful parameters:
 
-- `kasumi_no_tracepoint=1` (disable TSR; virtual path redirection is unavailable, while independent operation-level features may remain active)
-- `kasumi_tsr_basic=1` (debug: keep only the `openat/openat2` TSR routes)
-- `kasumi_skip_kallsyms=1`
-- `kasumi_dummy_mode=1`
+- `kasumi_skip_kallsyms=1`: resolve symbols individually through kprobes
+- `kasumi_fscaps=0|1`: disable/enable exec-time source file-capability replay; default `1`
+- `kasumi_device_sources=0|1`: disable/enable char/block/FIFO source wrappers; default `1`
+- `kasumi_dummy_mode=1`: stop after early initialization for load testing
+- `kasumi_dirhijack=0`: debug only; disables the VFS path-view provider and has no TSR fallback
+- `kasumi_dirhijack_force=1`: test only; bypasses per-observer visibility policy
 
-## Userspace Control Plane
+`kasumi_no_tracepoint` is retained as a legacy module parameter, but API 17 no longer has a syscall-redirect path engine.
 
-1. Userspace obtains an anonymous fd through the root-only `reboot` GET_FD command.
-2. Userspace sends `ioctl` on that fd to manage rules/features.
+## Userspace API
 
-Main ioctls (see `src/include/kasumi_uapi.h` for full ABI):
+The shared ABI is defined by [`src/include/kasumi_uapi.h`](./src/include/kasumi_uapi.h). Userspace should include the matching header, zero-initialize all ABI structs, and keep all reserved fields zero.
 
-- `KSM_IOC_ADD_RULE`, `KSM_IOC_DEL_RULE`, `KSM_IOC_HIDE_RULE`
-- `KSM_IOC_ADD_MERGE_RULE`, `KSM_IOC_CLEAR_ALL`, `KSM_IOC_SET_ENABLED`
-- `KSM_IOC_GET_FEATURES`, `KSM_IOC_GET_HOOKS`, `KSM_IOC_LIST_RULES`
-- `KSM_IOC_ADD_SPOOF_KSTAT`, `KSM_IOC_UPDATE_SPOOF_KSTAT`
-- `KSM_IOC_SET_CMDLINE`
-- `KSM_IOC_ADD_MAPS_RULE`, `KSM_IOC_CLEAR_MAPS_RULES`
-- `KSM_IOC_SET_MOUNT_HIDE`, `KSM_IOC_SET_MOUNT_HIDE_MODE`, `KSM_IOC_SET_MAPS_SPOOF`, `KSM_IOC_SET_STATFS_SPOOF`
-- `KSM_IOC_REPLACE_POLICY`, `KSM_IOC_GET_POLICY`, `KSM_IOC_GET_POLICY_UIDS`
-- `KSM_IOC_RESET_POLICY` (policy reset is explicit; `KSM_IOC_CLEAR_ALL` preserves policy)
+### 1. Obtain the control fd
 
-API 17 publishes owner, flags, and both UID lists as one RCU snapshot. Readers
-never observe a partially rebuilt list, and a failed replacement leaves the
-previous policy active. `MANUAL` requires an explicit allow list; deny entries
-always win. Userspace should prefer `KSM_IOC_REPLACE_POLICY` over incremental
-policy updates and use the returned generation when combining state and UID
-list queries. The generation covers configured owner, flags, and lists;
-provider detection and `effective_owner` are live status fields.
-Policy mutations are accepted only while Kasumi is disabled. Userspace must
-issue `KSM_IOC_SET_ENABLED(0)` before SET/REPLACE/CLEAR/RESET, then explicitly
-enable the completed configuration.
+GET_FD is available only to UID 0. The fourth syscall argument points to an `int` that receives the new fd:
 
-Mount hide defaults to normal mode: root-owned mounts are removed from proc
-mount views without changing the real propagation state or mount namespace
-link. Aggressive mode additionally projects a zygote_next shared root as a
-private slave and returns a synthetic `/proc/*/ns/mnt` link to selected tasks.
-Userspace can request it only when `KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE` is set.
+```c
+#include <linux/types.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
-You can use [YukiSU](https://github.com/Anatdx/YukiSU) (C++) for KernelSU-integrated flows.
-In addition, the [hybrid-mount](https://github.com/Hybrid-Mount/meta-hybrid_mount) meta-module includes Kasumi support with a Rust userspace implementation.
+#include "src/include/kasumi_uapi.h"
 
-> Given mount logic quality and update cadence, hybrid-mount is generally the preferred meta-module choice.
+static int kasumi_get_fd(void)
+{
+    int fd = -1;
 
-## Quick Troubleshooting
+    (void)syscall(SYS_reboot,
+                  KSM_MAGIC1, KSM_MAGIC2, KSM_CMD_GET_FD, &fd);
+    return fd;
+}
+```
 
-- If TSR initialization reports that `sys_enter` is unavailable, `kasumi_no_tracepoint=1` can be used for operation-level diagnostics only; it does not provide a global path-hook fallback
-- Builds but cannot load: check `vermagic`, module signature policy, and `dmesg`
-- Hook/ABI changes: validate with `KSM_IOC_GET_HOOKS` and `KSM_IOC_GET_FEATURES`
-- Merge/injection regressions: compare `ls`, `ls -l`, `ls -Z`, and `getfattr -n security.selinux` on both canonical and symlinked paths
+The underlying `reboot` syscall normally returns an error because these are not Linux reboot magic values. Ignore that syscall return and check the value written to `fd`. The pointer must remain valid until the syscall returns.
+
+### 2. Check protocol and capabilities
+
+Do this before sending configuration commands:
+
+```c
+int version = 0;
+int features = 0;
+
+if (ioctl(fd, KSM_IOC_GET_VERSION, &version) < 0 ||
+    version != KSM_PROTOCOL_VERSION) {
+    /* incompatible userspace/kernel ABI */
+}
+
+if (ioctl(fd, KSM_IOC_GET_FEATURES, &features) < 0) {
+    /* feature query failed */
+}
+```
+
+Use the feature mask before requesting optional behavior, especially `KSM_FEATURE_QUIESCE` and `KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE`.
+
+### 3. Configure and enable
+
+The recommended controller sequence is:
+
+1. Obtain the fd and verify `KSM_PROTOCOL_VERSION`.
+2. Query `KSM_IOC_GET_FEATURES`.
+3. Call `KSM_IOC_SET_ENABLED` with `0` before replacing policy. Policy mutations return `-EBUSY` while Kasumi is enabled.
+4. Replace policy with `KSM_IOC_REPLACE_POLICY`.
+5. Add path/merge/hide rules and configure optional features.
+6. Call `KSM_IOC_SET_ENABLED` with `1`.
+
+A minimal redirect looks like this:
+
+```c
+int disabled = 0;
+int enabled = 1;
+struct kasumi_policy_replace_arg policy = {
+    .version = KSM_POLICY_API_VERSION,
+    .size = sizeof(policy),
+    .owner = KSM_POLICY_OWNER_AUTO,
+};
+struct kasumi_syscall_arg rule = {
+    .src = "/system/etc/example.conf",              /* visible path */
+    .target = "/data/adb/modules/example/system/etc/example.conf",
+    .type = 0,
+};
+
+ioctl(fd, KSM_IOC_SET_ENABLED, &disabled);
+ioctl(fd, KSM_IOC_REPLACE_POLICY, &policy);
+ioctl(fd, KSM_IOC_ADD_RULE, &rule);
+ioctl(fd, KSM_IOC_SET_ENABLED, &enabled);
+```
+
+For `struct kasumi_syscall_arg`:
+
+- `src` is the visible path controlled by Kasumi.
+- `target` is the real backing source path.
+- `type` is a legacy/fallback dirent type; controllers normally pass `0` because Kasumi captures the source type.
+
+### Rule ioctls
+
+| ioctl | Argument | Meaning |
+| --- | --- | --- |
+| `KSM_IOC_ADD_RULE` | `struct kasumi_syscall_arg *` | Redirect visible `src` to backing `target`; replaces an existing rule for the same `src` |
+| `KSM_IOC_ADD_MERGE_RULE` | `struct kasumi_syscall_arg *` | Merge backing directory `target` into visible directory `src` |
+| `KSM_IOC_HIDE_RULE` | `struct kasumi_syscall_arg *` | Hide `src`; `target` is unused |
+| `KSM_IOC_DEL_RULE` | `struct kasumi_syscall_arg *` | Delete the redirect/hide identified by `src` |
+| `KSM_IOC_CLEAR_ALL` | no argument | Clear rules and feature state; configured policy is preserved |
+| `KSM_IOC_LIST_RULES` | `struct kasumi_syscall_list_arg *` | Write the active rule listing to the caller-provided buffer |
+
+All strings and buffers referenced by an ioctl argument must remain valid until that ioctl returns.
+
+### Policy ioctls
+
+`KSM_IOC_REPLACE_POLICY` is preferred over incremental updates. Set `version = KSM_POLICY_API_VERSION`, `size = sizeof(struct)`, and pass userspace UID arrays through `allow_uids`/`deny_uids` with their counts.
+
+- `AUTO` selects a detected KernelSU or APatch provider.
+- `MANUAL` uses explicit UID lists and requires an allow list.
+- `MAGISK` is diagnostic-only; use `MANUAL` for Magisk environments.
+- Deny entries win over allow entries; isolated UIDs always receive the concealment scope.
+- `KSM_IOC_RESET_POLICY` resets policy explicitly. `KSM_IOC_CLEAR_ALL` does not.
+
+To read a consistent snapshot, call `KSM_IOC_GET_POLICY`, then `KSM_IOC_GET_POLICY_UIDS` for the required lists, and retry if the returned `generation` values do not match.
+
+### Feature and status ioctls
+
+| ioctl | Argument |
+| --- | --- |
+| `KSM_IOC_GET_FEATURES` | `int *` feature mask |
+| `KSM_IOC_GET_HOOKS` | `struct kasumi_syscall_list_arg *` output buffer |
+| `KSM_IOC_SET_MOUNT_HIDE_MODE` | `int *` containing `KSM_MOUNT_HIDE_MODE_NORMAL` or `KSM_MOUNT_HIDE_MODE_AGGRESSIVE` |
+| `KSM_IOC_SET_MOUNT_HIDE` | `struct kasumi_mount_hide_arg *` |
+| `KSM_IOC_ADD_MAPS_RULE` / `KSM_IOC_CLEAR_MAPS_RULES` | `struct kasumi_maps_rule *` / no argument |
+| `KSM_IOC_SET_MAPS_SPOOF` | `struct kasumi_maps_spoof_arg *` |
+| `KSM_IOC_SET_STATFS_SPOOF` | `struct kasumi_statfs_spoof_arg *` |
+| `KSM_IOC_ADD_SPOOF_KSTAT` / `KSM_IOC_UPDATE_SPOOF_KSTAT` | `struct kasumi_spoof_kstat *` |
+| `KSM_IOC_HIDE_OVERLAY_XATTRS` | `struct kasumi_syscall_arg *`, using `src` |
+| `KSM_IOC_SELINUX_FIX` | `int *` enable value |
+
+For ioctls whose argument struct contains `err`, check both the `ioctl()` return value and `arg.err`.
+
+### Unload handshake
+
+If `KSM_FEATURE_QUIESCE` is available, keep exactly one control fd and initialize:
+
+```c
+struct kasumi_quiesce_arg q = {
+    .version = KSM_QUIESCE_API_VERSION,
+    .size = sizeof(q),
+};
+
+ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
+```
+
+`KSM_IOC_PREPARE_UNLOAD` is an idempotent terminal transition. Repeat it on the same fd while `q.state == KSM_QUIESCE_STATE_DRAINING`. When it reports `READY`, close the fd and invoke `delete_module`; the module-removal result remains the final liveness check. Do not use this command unless the controller is committed to unloading, because new GET_FD requests and ordinary control commands are rejected after draining starts.
+
+### Removed or unsupported ABI slots
+
+- uname and `/proc/cmdline` spoofing have been removed; their old command/feature numbers remain reserved.
+- `KSM_IOC_SET_MIRROR_PATH` is retained for ABI numbering and returns `-EOPNOTSUPP`.
+- `KSM_IOC_REORDER_MNT_ID` is not supported by the LKM build and returns `-EOPNOTSUPP`.
+
+## Standard Userspace Controller
+
+[Kagami](https://github.com/Rouyashiki/Kagami) is the only standard userspace controller implementation for the current Kasumi ABI. Use its Kasumi client and matching UAPI definitions as the reference when integrating API 17.
+
+## Troubleshooting
+
+- Cannot load: check `vermagic`, module signature policy, symbol availability, and `dmesg`.
+- API mismatch: query `KSM_IOC_GET_VERSION` before any configuration command.
+- Optional command returns `EOPNOTSUPP`: check `KSM_IOC_GET_FEATURES` and the ABI notes above.
+- Inspect active routes and rules with `KSM_IOC_GET_HOOKS` and `KSM_IOC_LIST_RULES`.
+- For merge/injection regressions, compare `ls`, `ls -l`, `ls -Z`, and `getfattr -n security.selinux` on canonical and symlinked paths.
 
 ## Repository Layout
 
-- `src/`: LKM implementation
-- `docs/`: design and notes
+- `src/`: LKM implementation and shared UAPI
 - `scripts/`: automation scripts
+- `tools/`: diagnostic tools
 - `.github/workflows/`: multi-KMI build/release pipeline
 
 ## License
