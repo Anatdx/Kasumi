@@ -14,7 +14,10 @@
 
 /* Module init/exit. Returns 0 on success. */
 int kasumi_iop_override_init(void);
+void kasumi_iop_override_stop_new(void);
 void kasumi_iop_override_exit(void);
+unsigned int kasumi_iop_override_active(void);
+bool kasumi_iop_override_quiesced(void);
 
 /*
  * Install shadow inode_operations on `inode`. Idempotent: safe to call on an

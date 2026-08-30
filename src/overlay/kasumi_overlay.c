@@ -37,7 +37,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -48,10 +47,11 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
 #include "kasumi_iop_override.h"
+#include "kasumi_dirhijack.h"
+#include "kasumi_vnode.h"
 /* ======================================================================
  * Part 10: Inject Rule Helper
  * ====================================================================== */
@@ -95,7 +95,28 @@ struct kasumi_merge_ctx {
 	struct dir_context ctx;
 	struct list_head *head;
 	const char *dir_path;
+	dev_t dir_dev;
 };
+
+static const char *kasumi_direct_child_name(const char *path,
+					    const char *dir, size_t dir_len)
+{
+	const char *name;
+
+	if (!path || !dir || !dir_len)
+		return NULL;
+	if (dir_len == 1 && dir[0] == '/') {
+		if (path[0] != '/' || !path[1])
+			return NULL;
+		name = path + 1;
+	} else {
+		if (strncmp(path, dir, dir_len) != 0 || path[dir_len] != '/' ||
+		    !path[dir_len + 1])
+			return NULL;
+		name = path + dir_len + 1;
+	}
+	return strchr(name, '/') ? NULL : name;
+}
 
 static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_context *ctx, const char *name,
 					int namlen, loff_t offset, u64 ino,
@@ -118,7 +139,9 @@ static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_cont
 			struct path p;
 			if (kasumi_kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
 				struct kstat stat;
-				if (kasumi_vfs_getattr(&p, &stat, STATX_TYPE, AT_STATX_SYNC_AS_STAT) == 0 &&
+				if (kasumi_vfs_getattr_unprojected(
+					    &p, &stat, STATX_TYPE,
+					    AT_STATX_SYNC_AS_STAT) == 0 &&
 				    S_ISCHR(stat.mode) && stat.rdev == 0) {
 					kasumi_path_put(&p);
 					kfree(path);
@@ -143,6 +166,11 @@ static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_cont
 	item = kmalloc(sizeof(*item), GFP_KERNEL);
 	if (item) {
 		item->name = kstrndup(name, namlen, GFP_KERNEL);
+		/* Publish the same vnode identity stat() returns for this file, so a
+		 * merge-injected entry's getdents d_ino matches its later st_ino
+		 * instead of leaking the merge target's raw inode number. */
+		item->ino = mctx->dir_dev ?
+			kasumi_vnode_source_ino(mctx->dir_dev, ino) : ino;
 		item->type = (unsigned char)d_type;
 		if (item->name)
 			list_add(&item->list, mctx->head);
@@ -161,8 +189,6 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 	struct kasumi_name_list *item;
 	struct kasumi_merge_target_node *target_node, *tmp_node;
 	struct list_head merge_targets;
-	const char *match_src = NULL;
-	size_t match_src_len = 0;
 	u32 hash;
 	int bkt;
 	bool should_inject = false;
@@ -176,7 +202,8 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 	size_t dpath_dir_len = 0;
 	u32 dpath_hash = 0;
 
-	if (unlikely(!kasumi_enabled || !dir_path))
+	if (unlikely(!kasumi_enabled || !dir_path ||
+		     !kasumi_policy_current_is_view_target()))
 		return;
 	if (atomic_read(&kasumi_rule_count) == 0)
 		return;
@@ -236,10 +263,6 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 		    (dpath_dir && strcmp(merge_entry->src, dpath_dir) == 0) ||
 		    (dpath_dir && merge_entry->resolved_src &&
 		     strcmp(merge_entry->resolved_src, dpath_dir) == 0)) {
-			if (!match_src) {
-				match_src = merge_entry->src;
-				match_src_len = strlen(match_src);
-			}
 			target_node = kmalloc(sizeof(*target_node), GFP_ATOMIC);
 			if (target_node) {
 				target_node->target = kstrdup(merge_entry->target, GFP_ATOMIC);
@@ -253,42 +276,42 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 		}
 	}
 
-	if (should_inject && match_src) {
-		/* Only scan kasumi_paths when a merge rule matched. For simple
-		 * ADD_RULE redirects the source is hidden and getname_flags
-		 * handles the redirect transparently — no injection needed. */
-		const char *pfx = match_src;
-		size_t pfx_len = match_src_len;
-
+	if (should_inject) {
+		/* Exact rules are virtual directory entries even when the visible
+		 * pathname has no backing dentry.  Match both absolute-path forms used
+		 * by iterate_dir and rule installation. */
 		hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
-			if (strncmp(entry->src, pfx, pfx_len) != 0)
-				continue;
-			{
-				char *name = NULL;
-				if (pfx_len == 1 && pfx[0] == '/')
-					name = (char *)entry->src + 1;
-				else if (entry->src[pfx_len] == '/')
-					name = (char *)entry->src + pfx_len + 1;
+			const char *name;
+			struct kasumi_name_list *pos;
+			bool duplicate = false;
 
-				if (name && *name && !strchr(name, '/')) {
-					struct kasumi_name_list *pos;
-					list_for_each_entry(pos, head, list) {
-						if (strcmp(pos->name, name) == 0)
-							goto next_entry;
-					}
-					item = kmalloc(sizeof(*item), GFP_ATOMIC);
-					if (item) {
-						item->name = kstrdup(name, GFP_ATOMIC);
-						item->type = entry->type;
-						if (item->name)
-							list_add(&item->list, head);
-						else
-							kfree(item);
-					}
+			name = kasumi_direct_child_name(entry->src, dir_path,
+							dir_len);
+			if (!name && dpath_dir)
+				name = kasumi_direct_child_name(entry->src, dpath_dir,
+								dpath_dir_len);
+			if (!name)
+				continue;
+			list_for_each_entry(pos, head, list) {
+				if (strcmp(pos->name, name) == 0) {
+					duplicate = true;
+					break;
 				}
 			}
-next_entry:
-			;
+			if (duplicate)
+				continue;
+			item = kmalloc(sizeof(*item), GFP_ATOMIC);
+			if (!item)
+				continue;
+			item->name = kstrdup(name, GFP_ATOMIC);
+			item->ino = entry->visible_ino;
+			item->type = entry->source_stat_valid ?
+				(unsigned char)((entry->source_mode & S_IFMT) >> 12) :
+				entry->type;
+			if (item->name)
+				list_add(&item->list, head);
+			else
+				kfree(item);
 		}
 	}
 	rcu_read_unlock();
@@ -315,6 +338,9 @@ next_entry:
 						.ctx.actor = kasumi_merge_filldir,
 						.head = head,
 						.dir_path = target_node->target,
+						.dir_dev = file_inode(f) &&
+							   file_inode(f)->i_sb ?
+							   file_inode(f)->i_sb->s_dev : 0,
 					};
 					kasumi_this_cpu()->in_populate_inject = 1;
 					iterate_dir(f, &mctx.ctx);
@@ -338,7 +364,7 @@ next_entry:
  *
  * Called from KSM_IOC_ADD_MERGE_RULE ioctl (process context, can sleep).
  * Recursively scans the merge target directory and creates exact-match
- * redirect rules so getname_flags works without blind trie redirect.
+ * redirect rules for the exact path TSR routes.
  * ====================================================================== */
 
 void kasumi_materialize_merge(const char *src_prefix,
@@ -350,6 +376,7 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 	struct kasumi_entry *e;
 	u32 hash = full_name_hash(NULL, src, strlen(src));
 	bool found = false;
+	int ret = -ENOMEM;
 
 	hlist_for_each_entry(e, &kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 		if (e->src_hash == hash && strcmp(e->src, src) == 0) {
@@ -358,13 +385,15 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 		}
 	}
 	if (!found) {
-		e = kmalloc(sizeof(*e), GFP_KERNEL);
+		e = kzalloc(sizeof(*e), GFP_KERNEL);
 		if (e) {
 			e->src = kstrdup(src, GFP_KERNEL);
 			e->target = kstrdup(tgt, GFP_KERNEL);
 			e->type = type;
 			e->src_hash = hash;
-			if (e->src && e->target) {
+			if (e->src && e->target)
+				ret = kasumi_entry_capture_source(e, tgt);
+			if (!ret) {
 				unsigned long h1, h2;
 
 				hlist_add_head_rcu(&e->node,
@@ -384,18 +413,57 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
 
 					if (kasumi_kern_path(tgt, LOOKUP_FOLLOW, &p) == 0) {
 						if (p.dentry && d_inode(p.dentry)) {
-							(void)kasumi_clone_source_attrs_from_path(d_inode(p.dentry),
-												    src);
 							(void)kasumi_iop_mark_spoof(d_inode(p.dentry));
-							(void)kasumi_dop_install(p.dentry, src);
-							(void)kasumi_xattr_sid_install_path_ancestors(tgt, src);
 						}
 						kasumi_path_put(&p);
 					}
 				}
+				/* Slice 4a: sink this materialized file's lookup axis onto
+				 * dirhijack as a lookup-only child so a merge config is
+				 * served through the VFS lookup layer; readdir stays with
+				 * the overlay filldir injection.  Mirror the ADD_RULE gate:
+				 * a symlink target registers a symlink vnode (nofollow),
+				 * otherwise a regular vnode. */
+				if (kasumi_dirhijack_enabled() && kasumi_kern_path) {
+					struct path dsrc;
+
+					if (e->source_nofollow_path_valid &&
+					    kasumi_kern_path(tgt, 0, &dsrc) == 0) {
+						struct inode *di = d_inode(dsrc.dentry);
+
+						if (di && S_ISLNK(di->i_mode))
+							(void)kasumi_dirhijack_add_shadow(
+								src, &dsrc,
+								e->nofollow_visible_ino,
+								KASUMI_VNODE_F_LNK);
+						kasumi_path_put(&dsrc);
+					} else if (S_ISREG(e->source_mode) &&
+						   kasumi_kern_path(tgt, LOOKUP_FOLLOW,
+								    &dsrc) == 0) {
+						(void)kasumi_dirhijack_add_shadow(
+							src, &dsrc, e->visible_ino, 0);
+						kasumi_path_put(&dsrc);
+					} else if (S_ISDIR(e->source_mode) &&
+						   kasumi_kern_path(tgt, LOOKUP_FOLLOW,
+								    &dsrc) == 0) {
+						/* A module-added directory the target
+						 * lacks: serve it as an enterable
+						 * directory-source vnode so lookup and
+						 * iterate resolve to the source subtree
+						 * (Slice 4c dir vnode). */
+						(void)kasumi_dirhijack_add_shadow(
+							src, &dsrc, e->visible_ino,
+							KASUMI_VNODE_F_DIR);
+						kasumi_path_put(&dsrc);
+					}
+				}
 			} else {
+				kasumi_log("skip materialized rule: source=%s err=%d\n",
+					   tgt, ret);
+				kasumi_entry_release_source(e);
 				kfree(e->src);
 				kfree(e->target);
+				kfree(e->source_canonical);
 				kfree(e);
 			}
 		}
@@ -408,7 +476,7 @@ static void kasumi_add_path_entry(const char *src, const char *tgt,
  *
  * Used so that DT_DIR children discovered while materializing a parent merge
  * become their own merge rules, instead of being registered as DT_DIR
- * entries in kasumi_paths. The latter would cause getname_flags to
+ * entries in kasumi_paths. The latter would cause exact path redirect to
  * wholesale-redirect any lookup of that subdir to the module's (typically
  * incomplete) copy, destroying real subdir content. A nested merge rule, by
  * contrast, keeps the real subdir intact and only performs iterate_dir-time
@@ -526,8 +594,7 @@ kasumi_mat_filldir(struct dir_context *ctx, const char *name,
 	}
 
 	/* For DT_DIR: register a nested merge_entry and recurse. Do NOT add a
-	 * DT_DIR entry to kasumi_paths — kasumi_resolve_target() matches it by
-	 * exact strcmp in getname_flags, which would wholesale-redirect every
+	 * DT_DIR entry to kasumi_paths — exact path redirect would redirect every
 	 * lookup of this subdir (e.g. an open of /product/overlay/foo would
 	 * resolve against the module's incomplete foo, hiding all real
 	 * siblings). The nested merge_entry gives this subdir its own
@@ -538,7 +605,25 @@ kasumi_mat_filldir(struct dir_context *ctx, const char *name,
 	 * kasumi_paths so open() of that file routes to the module backing.
 	 */
 	if (d_type == DT_DIR) {
-		if (mc->depth < 8) {
+		/* Two shapes: MERGE into an existing target subdir (keep its real
+		 * siblings) vs ADD a brand-new subdir the target lacks. An existing
+		 * dir keeps the nested-merge injection; a new dir is registered as an
+		 * enterable directory-source redirect -- otherwise the parent readdir
+		 * shows the name but every lookup ENOENTs, and the system cannot scan
+		 * the module's added subtree (e.g. a priv-app / RRO in a new dir). */
+		struct path vpath;
+		bool visible_dir = false;
+
+		if (kasumi_kern_path &&
+		    kasumi_kern_path(src_path, LOOKUP_FOLLOW, &vpath) == 0) {
+			struct inode *vi = d_inode(vpath.dentry);
+
+			visible_dir = vi && S_ISDIR(vi->i_mode);
+			kasumi_path_put(&vpath);
+		}
+		if (!visible_dir) {
+			kasumi_add_path_entry(src_path, tgt_path, d_type);
+		} else if (mc->depth < 8) {
 			kasumi_register_nested_merge(src_path, tgt_path);
 			kasumi_materialize_merge(src_path, tgt_path,
 						 mc->depth + 1);

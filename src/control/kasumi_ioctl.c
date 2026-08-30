@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/jhash.h>
+#include <linux/kdev_t.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
@@ -37,7 +38,6 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
@@ -47,21 +47,309 @@
 #endif
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
+#include "kasumi_dirhijack.h"
+#include "kasumi_vnode.h"
+#include "kasumi_bootstrap.h"
 #include "kasumi_store.h"
+#include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_overlay.h"
-#include "kasumi_syscall_redirect.h"
-#include "kasumi_uname.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
+#include "kasumi_proc_hooks.h"
+#include "kasumi_vfs_hooks.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_fop_override.h"
+#include "kasumi_sop_shadow.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
 /* ======================================================================
  * Part 15: Dispatch Handler (ioctl only; all commands use KSM_IOC_* from kasumi_uapi.h)
- * GET_FD is syscall-only -> kasumi_get_anon_fd()
+ * GET_FD is delivered by reboot task_work -> kasumi_install_anon_fd()
  * ====================================================================== */
+
+static bool kasumi_policy_header_valid(u32 version, u32 size, size_t min_size)
+{
+	return version == KSM_POLICY_API_VERSION && size >= min_size;
+}
+
+static bool kasumi_u32_reserved_zero(const u32 *reserved, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		if (reserved[i])
+			return false;
+	return true;
+}
+
+static int kasumi_ioctl_set_policy(void __user *arg)
+{
+	struct kasumi_policy_config_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_set_policy_owner(a.owner, a.flags);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy(void __user *arg)
+{
+	struct kasumi_policy_state_arg input;
+	struct kasumi_policy_state_arg a = { };
+	int ret = 0;
+
+	if (copy_from_user(&input, arg, sizeof(input)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(input.version, input.size,
+					sizeof(input)) ||
+	    input.enabled ||
+	    !kasumi_u32_reserved_zero(input.reserved,
+				      ARRAY_SIZE(input.reserved)))
+		ret = -EINVAL;
+	else
+		kasumi_policy_get_state(&a);
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_set_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	u32 *uids = NULL;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.reserved || a.generation || a.total ||
+	    (!a.count && a.uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if (a.count) {
+		if (!a.uids) {
+			ret = -EINVAL;
+			goto out;
+		}
+		uids = kmalloc_array(a.count, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(uids,
+				   (const void __user *)(unsigned long)a.uids,
+				   a.count * sizeof(*uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = kasumi_replace_policy_uid_list(a.list, uids, a.count);
+	if (!ret) {
+		u32 copied;
+
+		ret = kasumi_policy_copy_uids(a.list, NULL, 0, &copied,
+					      &a.total, &a.generation);
+	}
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		ret = -EFAULT;
+	kfree(uids);
+	return ret;
+}
+
+static int kasumi_ioctl_clear_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.reserved || a.generation || a.count || a.total || a.uids)
+		ret = -EINVAL;
+	else
+		ret = kasumi_clear_policy_uid_list(a.list);
+	a.count = 0;
+	a.total = 0;
+	if (!ret) {
+		struct kasumi_policy_state_arg state = { };
+
+		kasumi_policy_get_state(&state);
+		a.generation = state.generation;
+	}
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_get_policy_uids(void __user *arg)
+{
+	struct kasumi_policy_uid_list_arg input;
+	struct kasumi_policy_uid_list_arg a = { };
+	u32 *uids = NULL;
+	u32 copied = 0;
+	u32 total = 0;
+	u64 generation = 0;
+	int ret = 0;
+
+	if (copy_from_user(&input, arg, sizeof(input)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(input.version, input.size,
+					sizeof(input)) || input.reserved ||
+	    input.generation || input.total || (!input.count && input.uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (input.count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if (input.count && !input.uids) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (input.count) {
+		uids = kmalloc_array(input.count, sizeof(*uids), GFP_KERNEL);
+		if (!uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	ret = kasumi_policy_copy_uids(input.list, uids, input.count,
+				      &copied, &total, &generation);
+	if (!ret && copied &&
+	    copy_to_user((void __user *)(unsigned long)input.uids, uids,
+			 copied * sizeof(*uids)))
+		ret = -EFAULT;
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.list = input.list;
+	a.count = copied;
+	a.total = total;
+	a.uids = input.uids;
+	a.generation = generation;
+	a.err = ret;
+	kfree(uids);
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
+
+static int kasumi_ioctl_replace_policy(void __user *arg)
+{
+	struct kasumi_policy_replace_arg a;
+	u32 *allow_uids = NULL;
+	u32 *deny_uids = NULL;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.allow_count > KASUMI_ALLOWLIST_UID_MAX ||
+	    a.deny_count > KASUMI_ALLOWLIST_UID_MAX) {
+		ret = -E2BIG;
+		goto out;
+	}
+	if ((a.allow_count && !a.allow_uids) ||
+	    (a.deny_count && !a.deny_uids) ||
+	    (!a.allow_count && a.allow_uids) ||
+	    (!a.deny_count && a.deny_uids)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a.allow_count) {
+		allow_uids = kmalloc_array(a.allow_count, sizeof(*allow_uids),
+					   GFP_KERNEL);
+		if (!allow_uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(allow_uids,
+				   (const void __user *)(unsigned long)a.allow_uids,
+				   a.allow_count * sizeof(*allow_uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	if (a.deny_count) {
+		deny_uids = kmalloc_array(a.deny_count, sizeof(*deny_uids),
+					  GFP_KERNEL);
+		if (!deny_uids) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (copy_from_user(deny_uids,
+				   (const void __user *)(unsigned long)a.deny_uids,
+				   a.deny_count * sizeof(*deny_uids))) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = kasumi_policy_replace(a.owner, a.flags, allow_uids, a.allow_count,
+				    deny_uids, a.deny_count);
+
+out:
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		ret = -EFAULT;
+	kfree(allow_uids);
+	kfree(deny_uids);
+	return ret;
+}
+
+static int kasumi_ioctl_reset_policy(void __user *arg)
+{
+	struct kasumi_policy_config_arg a;
+	int ret;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (!kasumi_policy_header_valid(a.version, a.size, sizeof(a)) ||
+	    a.owner || a.flags ||
+	    !kasumi_u32_reserved_zero(a.reserved, ARRAY_SIZE(a.reserved)))
+		ret = -EINVAL;
+	else
+		ret = kasumi_policy_reset();
+	a.owner = KSM_POLICY_OWNER_AUTO;
+	a.flags = 0;
+	a.version = KSM_POLICY_API_VERSION;
+	a.size = sizeof(a);
+	a.err = ret;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return ret;
+}
 
 static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 {
@@ -77,11 +365,10 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	if (cmd == KSM_IOC_CLEAR_ALL) {
 		mutex_lock(&kasumi_config_mutex);
 		kasumi_cleanup_locked();
-		strscpy(kasumi_mirror_path_buf, KASUMI_DEFAULT_MIRROR_PATH, PATH_MAX);
-		strscpy(kasumi_mirror_name_buf, KASUMI_DEFAULT_MIRROR_NAME, NAME_MAX);
-		kasumi_current_mirror_path = kasumi_mirror_path_buf;
-		kasumi_current_mirror_name = kasumi_mirror_name_buf;
 		mutex_unlock(&kasumi_config_mutex);
+		kasumi_dirhijack_clear();
+		kasumi_fop_override_clear();
+		kasumi_sop_shadow_reap();
 		kasumi_fake_mi_invalidate_all();
 		rcu_barrier();
 		return 0;
@@ -93,6 +380,21 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			return -EFAULT;
 		return 0;
 	}
+
+	if (cmd == KSM_IOC_SET_POLICY)
+		return kasumi_ioctl_set_policy(arg);
+	if (cmd == KSM_IOC_GET_POLICY)
+		return kasumi_ioctl_get_policy(arg);
+	if (cmd == KSM_IOC_SET_POLICY_UIDS)
+		return kasumi_ioctl_set_policy_uids(arg);
+	if (cmd == KSM_IOC_CLEAR_POLICY_UIDS)
+		return kasumi_ioctl_clear_policy_uids(arg);
+	if (cmd == KSM_IOC_GET_POLICY_UIDS)
+		return kasumi_ioctl_get_policy_uids(arg);
+	if (cmd == KSM_IOC_REPLACE_POLICY)
+		return kasumi_ioctl_replace_policy(arg);
+	if (cmd == KSM_IOC_RESET_POLICY)
+		return kasumi_ioctl_reset_policy(arg);
 
 	if (cmd == KSM_IOC_SET_DEBUG) {
 		int val;
@@ -116,12 +418,34 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		int val;
 		if (copy_from_user(&val, arg, sizeof(val)))
 			return -EFAULT;
-		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = !!val;
-		mutex_unlock(&kasumi_config_mutex);
-		kasumi_log("Kasumi %s\n", kasumi_enabled ? "enabled" : "disabled");
-		if (kasumi_enabled)
-			kasumi_reload_ksu_allowlist();
+		if (val) {
+			mutex_lock(&kasumi_config_mutex);
+			if (READ_ONCE(kasumi_enabled)) {
+				mutex_unlock(&kasumi_config_mutex);
+				return 0;
+			}
+			if (!kasumi_policy_prepare_enable_locked()) {
+				mutex_unlock(&kasumi_config_mutex);
+				return -ENODEV;
+			}
+			/* Publish provider state; the path view is served entirely
+			 * through the VFS lookup/vnode layer, with no syscall
+			 * dispatcher or task-scope marker to arm. */
+			smp_store_release(&kasumi_enabled, true);
+			mutex_unlock(&kasumi_config_mutex);
+		} else {
+			mutex_lock(&kasumi_config_mutex);
+			if (!READ_ONCE(kasumi_enabled)) {
+				mutex_unlock(&kasumi_config_mutex);
+				return 0;
+			}
+			/* Stop policy readers before provider pointers are withdrawn. */
+			smp_store_release(&kasumi_enabled, false);
+			kasumi_policy_disable_provider_locked();
+			mutex_unlock(&kasumi_config_mutex);
+		}
+		kasumi_log("Kasumi %s\n", READ_ONCE(kasumi_enabled) ?
+			   "enabled" : "disabled");
 		return 0;
 	}
 
@@ -185,7 +509,10 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) {
 			if (written < buf_size)
 				written += scnprintf(kbuf + written, buf_size - written,
-						     "mount_hide enabled\n");
+						     "mount_hide enabled mode=%s\n",
+						     READ_ONCE(kasumi_mount_hide_mode) ==
+							     KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
+							     "aggressive" : "normal");
 		}
 		if (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF) {
 			if (written < buf_size)
@@ -223,93 +550,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == KSM_IOC_SET_MIRROR_PATH) {
-		char *new_path, *new_name, *slash;
-		size_t len;
-
-		if (copy_from_user(&req, arg, sizeof(req)))
-			return -EFAULT;
-		if (!req.src)
-			return -EINVAL;
-		new_path = kasumi_strndup_user(req.src, PATH_MAX);
-		if (IS_ERR(new_path))
-			return PTR_ERR(new_path);
-
-		len = strlen(new_path);
-		if (len > 1 && new_path[len - 1] == '/')
-			new_path[len - 1] = '\0';
-
-		slash = strrchr(new_path, '/');
-		new_name = kstrdup(slash ? slash + 1 : new_path, GFP_KERNEL);
-		if (!new_name) {
-			kfree(new_path);
-			return -ENOMEM;
-		}
-
-		mutex_lock(&kasumi_config_mutex);
-		strscpy(kasumi_mirror_path_buf, new_path, PATH_MAX);
-		strscpy(kasumi_mirror_name_buf, new_name, NAME_MAX);
-		kasumi_current_mirror_path = kasumi_mirror_path_buf;
-		kasumi_current_mirror_name = kasumi_mirror_name_buf;
-		mutex_unlock(&kasumi_config_mutex);
-
-		kasumi_log("setting mirror path to: %s\n", kasumi_mirror_path_buf);
-		kfree(new_path);
-		kfree(new_name);
-		return 0;
-	}
-
-	if (cmd == KSM_IOC_SET_UNAME) {
-		/* Scoped mode: stored config is applied per-task on first syscall
-		 * from a hidden-uid process by unsharing CLONE_NEWUTS and writing
-		 * the fake fields into the task's private uts_ns. */
-		struct kasumi_spoof_uname u;
-
-		if (copy_from_user(&u, arg, sizeof(u)))
-			return -EFAULT;
-		return kasumi_uname_set_scoped_config(&u);
-	}
-
-	if (cmd == KSM_IOC_SET_UNAME_GLOBAL) {
-		/* Global mode: rewrite init_uts_ns in place. All-empty struct
-		 * restores originals. */
-		struct kasumi_spoof_uname u;
-
-		if (copy_from_user(&u, arg, sizeof(u)))
-			return -EFAULT;
-		if (u.sysname[0] || u.nodename[0] || u.release[0] ||
-		    u.version[0] || u.machine[0] || u.domainname[0])
-			return kasumi_uname_apply_global(&u);
-		return kasumi_uname_restore_global();
-	}
-
-	if (cmd == KSM_IOC_SET_CMDLINE) {
-		struct kasumi_spoof_cmdline *c = kmalloc(sizeof(*c), GFP_KERNEL);
-		struct kasumi_cmdline_rcu *new_cmdline, *old_cmdline;
-
-		if (!c)
-			return -ENOMEM;
-		if (copy_from_user(c, arg, sizeof(*c))) {
-			kfree(c);
-			return -EFAULT;
-		}
-		new_cmdline = kmalloc(sizeof(*new_cmdline), GFP_KERNEL);
-		if (!new_cmdline) {
-			kfree(c);
-			return -ENOMEM;
-		}
-		strscpy(new_cmdline->cmdline, c->cmdline, sizeof(new_cmdline->cmdline));
-		mutex_lock(&kasumi_config_mutex);
-		old_cmdline = rcu_dereference_protected(kasumi_spoof_cmdline_ptr,
-							lockdep_is_held(&kasumi_config_mutex));
-		rcu_assign_pointer(kasumi_spoof_cmdline_ptr, new_cmdline);
-		mutex_unlock(&kasumi_config_mutex);
-		if (old_cmdline)
-			kfree_rcu(old_cmdline, rcu);
-		kasumi_cmdline_spoof_active = (c->cmdline[0] != '\0');
-		kfree(c);
-		if (kasumi_cmdline_spoof_active)
-			kasumi_log("cmdline: spoofed\n");
-		return 0;
+		/* ABI slot 14 is intentionally retained, but pure virtual mode no
+		 * longer owns or consumes a mirror/workdir path. */
+		return -EOPNOTSUPP;
 	}
 
 	if (cmd == KSM_IOC_ADD_SPOOF_KSTAT || cmd == KSM_IOC_UPDATE_SPOOF_KSTAT) {
@@ -470,7 +713,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				 existing->target_ino, existing->spoofed_ino);
 		}
 
-		kasumi_enabled = true;
 		mutex_unlock(&kasumi_config_mutex);
 
 		k->err = 0;
@@ -537,6 +779,24 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
+	if (cmd == KSM_IOC_SET_MOUNT_HIDE_MODE) {
+		int mode;
+
+		if (copy_from_user(&mode, arg, sizeof(mode)))
+			return -EFAULT;
+		if (mode != KSM_MOUNT_HIDE_MODE_NORMAL &&
+		    mode != KSM_MOUNT_HIDE_MODE_AGGRESSIVE)
+			return -EINVAL;
+		if (mode == KSM_MOUNT_HIDE_MODE_AGGRESSIVE &&
+		    (!kasumi_proc_proxy_registered ||
+		     !kasumi_proc_ns_readlink_registered ||
+		     !kasumi_fake_mi_active()))
+			return -EOPNOTSUPP;
+		WRITE_ONCE(kasumi_mount_hide_mode, mode);
+		kasumi_fake_mi_invalidate_all();
+		return 0;
+	}
+
 	if (cmd == KSM_IOC_SET_MAPS_SPOOF) {
 		struct kasumi_maps_spoof_arg a;
 		if (copy_from_user(&a, arg, sizeof(a)))
@@ -553,6 +813,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		struct kasumi_statfs_spoof_arg a;
 		if (copy_from_user(&a, arg, sizeof(a)))
 			return -EFAULT;
+		if (a.enable && !kasumi_statfs_kretprobe_registered)
+			return -EOPNOTSUPP;
 		if (a.enable)
 			kasumi_feature_enabled_mask |= KSM_FEATURE_STATFS_SPOOF;
 		else
@@ -574,33 +836,28 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	}
 
 	if (cmd == KSM_IOC_GET_FEATURES) {
-		int features = 0;
-		if (kasumi_uname_capable())
-			features |= KSM_FEATURE_UNAME_SPOOF;
-		if (kasumi_cmdline_kprobe_registered || kasumi_cmdline_kretprobe_registered ||
-		    (kasumi_syscall_dispatcher_nr >= 0 &&
-		     kasumi_has_syscall_hook(__NR_read)))
-			features |= KSM_FEATURE_CMDLINE_SPOOF;
+		int features = kasumi_bootstrap_quiesce_supported() ?
+			KSM_FEATURE_QUIESCE : 0;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
 		features |= KSM_FEATURE_MERGE_DIR;
 		if (kasumi_getxattr_kprobe_registered)
 			features |= KSM_FEATURE_SELINUX_BYPASS;
 		if (kasumi_proc_proxy_registered ||
-		    kasumi_mount_hide_vfsmnt_registered || kasumi_mount_hide_mountinfo_registered ||
-		    kasumi_mount_hide_vfs_read_registered ||
-		    kasumi_mount_hide_read_fallback_registered ||
-		    kasumi_mount_hide_pread_fallback_registered)
+		    kasumi_mount_hide_vfsmnt_registered ||
+		    kasumi_mount_hide_mountinfo_registered)
 			features |= KSM_FEATURE_MOUNT_HIDE;
-		if (kasumi_proc_proxy_registered ||
-		    kasumi_mount_hide_vfs_read_registered ||
-		    kasumi_mount_hide_read_fallback_registered ||
-		    kasumi_mount_hide_pread_fallback_registered ||
-		    kasumi_maps_seq_read_registered)
+		if (kasumi_proc_proxy_registered && kasumi_fake_mi_active())
+			features |= KSM_FEATURE_FAKE_MOUNTINFO;
+		if (kasumi_proc_proxy_registered &&
+		    kasumi_proc_ns_readlink_registered &&
+		    kasumi_fake_mi_active())
+			features |= KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE;
+		if (kasumi_proc_proxy_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
-		if (kasumi_statfs_kretprobe_registered ||
-		    kasumi_statfs_tracepoint_registered)
+		if (kasumi_statfs_kretprobe_registered)
 			features |= KSM_FEATURE_STATFS_SPOOF;
-		if (kasumi_fake_selinuxfs_access_active())
+		if (kasumi_fake_selinuxfs_access_active() ||
+		    kasumi_fake_selinuxfs_proc_attr_active())
 			features |= KSM_FEATURE_SELINUX_FIX;
 		if (copy_to_user(arg, &features, sizeof(features)))
 			return -EFAULT;
@@ -612,8 +869,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		char *kbuf;
 		size_t buf_size, written = 0;
 		int n;
-		bool path_tsr = false;
-		bool xattr_path_tsr = false;
 
 		if (copy_from_user(&list_arg, arg, sizeof(list_arg)))
 			return -EFAULT;
@@ -627,43 +882,29 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			return -ENOMEM;
 
 		/* GET_FD */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    (kasumi_has_syscall_hook(__NR_reboot) ||
-		     kasumi_has_syscall_hook(__NR_prctl)))
-			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: TSR\n");
-		else if (kasumi_ni_kprobe_registered)
+		if (kasumi_reboot_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "GET_FD: kprobe (ni_syscall nr=%d)\n", kasumi_syscall_nr_param);
-		else if (kasumi_reboot_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "GET_FD: kprobe (reboot nr=%d)\n", kasumi_syscall_nr_param);
+				     "GET_FD: kprobe (reboot nr=%d)\n", __NR_reboot);
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "GET_FD: none\n");
 		written += n;
 
-		/* Path redirect */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_openat))
-			path_tsr = true;
-#ifdef __NR_getxattr
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_getxattr))
-			xattr_path_tsr = true;
-#endif
-#ifdef __NR_listxattr
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_listxattr))
-			xattr_path_tsr = true;
-#endif
-		if (path_tsr)
-			n = scnprintf(kbuf + written, buf_size - written, "path: TSR\n");
-		else if (kasumi_getname_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "path: kprobe (getname_flags)\n");
-		else
-			n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
+		/* Path redirect: served entirely through the VFS lookup/vnode
+		 * layer; no syscall dispatcher or sys_enter tracepoint remains. */
+		n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
 		written += n;
-		n = scnprintf(kbuf + written, buf_size - written, "xattr path: %s\n",
-			      xattr_path_tsr ? "TSR" : "none");
+		{
+			dev_t vnode_dev = kasumi_vnode_device();
+
+			n = scnprintf(kbuf + written, buf_size - written,
+				      "vnode: live=%u allocated=%llu dev=%u:%u\n",
+				      kasumi_vnode_live(),
+				      (unsigned long long)kasumi_vnode_allocated(),
+				      MAJOR(vnode_dev), MINOR(vnode_dev));
+			written += n;
+		}
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "xattr path: none\n");
 		written += n;
 
 		/* VFS hooks */
@@ -678,40 +919,17 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				     "vfs: getattr=iop readdir=fop d_path=none getxattr=none\n");
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "selinuxfs/access,context,status,proc_attr_current: access=%s status=%s\n",
+			      "selinuxfs: access=%s status=%s attr/current=%s\n",
 			      kasumi_fake_selinuxfs_access_active() ? "shadow fop" : "none",
-			      kasumi_fake_selinuxfs_status_active() ? "shadow fop" : "none");
-		written += n;
-
-		/* uname */
-		{
-			const char *mode = "none";
-			bool g = kasumi_uname_global_active();
-			bool s = kasumi_uname_scoped_active();
-			if (g && s)       mode = "utsname (global+scoped)";
-			else if (g)        mode = "utsname (global)";
-			else if (s)        mode = "utsname (scoped/uts_ns)";
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "uname: %s\n", mode);
-			written += n;
-		}
-
-		/* cmdline */
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_read))
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: TSR\n");
-		else if (kasumi_cmdline_kretprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kretprobe (read)\n");
-		else if (kasumi_cmdline_kprobe_registered)
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: kprobe (cmdline_proc_show)\n");
-		else
-			n = scnprintf(kbuf + written, buf_size - written, "cmdline: none\n");
+			      kasumi_fake_selinuxfs_status_active() ? "shadow fop" : "none",
+			      kasumi_fake_selinuxfs_proc_attr_active() ?
+				      "proc op kprobe" : "none");
 		written += n;
 
 		/* mountinfo/mounts hide */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: proxy (open fd read filter)\n");
+				     "mountinfo/mounts: fd_install fop proxy\n");
 		else if (kasumi_mount_hide_vfsmnt_registered && kasumi_mount_hide_mountinfo_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "mountinfo/mounts: kprobe (show_mountinfo, show_vfsmnt)\n");
@@ -721,52 +939,38 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		else if (kasumi_mount_hide_mountinfo_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "mountinfo: kprobe (show_mountinfo)\n");
-		else if (kasumi_mount_hide_vfs_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (vfs_read buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered &&
-			 kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (read/pread64 syscall buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (read syscall buffer filter)\n");
-		else if (kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kretprobe (pread64 syscall buffer filter)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "mountinfo/mounts: none\n");
 		written += n;
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "fake mountinfo: %s (mode=%s)\n",
+			      kasumi_proc_proxy_registered &&
+			      kasumi_fake_mi_active() ?
+				      "root-owned mounts hidden, compact ids" : "none",
+			      READ_ONCE(kasumi_mount_hide_mode) ==
+				      KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
+				      "aggressive" : "normal");
+		written += n;
+		n = scnprintf(kbuf + written, buf_size - written,
+			      "mount namespace links: %s\n",
+			      kasumi_proc_ns_readlink_registered ?
+				      (READ_ONCE(kasumi_mount_hide_mode) ==
+				       KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
+				       "projected" : "available") : "none");
+		written += n;
 
-		/* maps spoof (read kretprobe or seq_read fallback) */
+		/* maps spoof */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: proxy (open fd read filter)\n");
-		else if (kasumi_maps_seq_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (seq_read fallback)\n");
-		else if (kasumi_mount_hide_vfs_read_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (vfs_read buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered &&
-		    kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (read/pread64 buffer filter)\n");
-		else if (kasumi_mount_hide_read_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (read buffer filter)\n");
-		else if (kasumi_mount_hide_pread_fallback_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: kretprobe (pread64 buffer filter)\n");
+				     "maps: fd_install fop proxy\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;
-		if (kasumi_syscall_dispatcher_nr >= 0 &&
-		    kasumi_has_syscall_hook(__NR_statfs))
-			n = scnprintf(kbuf + written, buf_size - written, "statfs: TSR\n");
-		else if (kasumi_statfs_kretprobe_registered)
+		if (kasumi_statfs_kretprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "statfs: kretprobe (f_type spoof for INCONSISTENT_MOUNT)\n");
+				     "statfs/fstatfs: kretprobe (vfs_statfs entries=%llu spoofs=%llu)\n",
+				     (unsigned long long)atomic64_read(&kasumi_hook_stats.statfs_entries),
+				     (unsigned long long)atomic64_read(&kasumi_hook_stats.statfs_spoofs));
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "statfs: none\n");
 		written += n;
@@ -883,20 +1087,22 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			kfree(mat_src);
 			kfree(mat_tgt);
 		}
-		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = true;
-		mutex_unlock(&kasumi_config_mutex);
 		break;
 	}
 
 	case KSM_IOC_ADD_RULE: {
 		char *parent_dir = NULL;
 		char *resolved_src = NULL;
+		struct kasumi_entry *new_entry = NULL;
 		struct path path;
-		struct inode *src_inode = NULL;
-		struct inode *parent_inode = NULL;
 		struct inode *target_inode = NULL;
+		bool install_side_effects = true;
 		char *tmp_buf;
+		unsigned long dh_v_ino = 0;
+		umode_t dh_src_mode = 0;
+		bool dh_want = false;
+		unsigned long dh_nofollow_ino = 0;
+		bool dh_nofollow_valid = false;
 
 		if (!src || !target) { ret = -EINVAL; break; }
 
@@ -924,32 +1130,38 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 					}
 				}
 			}
-			if (d_inode(path.dentry)) {
-				src_inode = d_inode(path.dentry);
-				kasumi_ihold(src_inode);
-			}
-			if (path.dentry->d_parent && d_inode(path.dentry->d_parent)) {
-				parent_inode = d_inode(path.dentry->d_parent);
-				kasumi_ihold(parent_inode);
-			}
 			kasumi_path_put(&path);
 		} else {
 			char *ls = strrchr(src, '/');
-			if (ls && ls != src) {
+			if (ls) {
 				size_t l = ls - src;
-				char *p_str = kmalloc(l + 1, GFP_KERNEL);
+				char *p_str;
+
+				if (ls == src) {
+					p_str = kstrdup("/", GFP_KERNEL);
+				} else {
+					p_str = kmalloc(l + 1, GFP_KERNEL);
+					if (p_str) {
+						memcpy(p_str, src, l);
+						p_str[l] = '\0';
+					}
+				}
 				if (p_str) {
-					memcpy(p_str, src, l);
-					p_str[l] = '\0';
 					if (kasumi_kern_path(p_str, LOOKUP_FOLLOW, &path) == 0) {
 						char *res = kasumi_d_path ? kasumi_d_path(&path, tmp_buf, PATH_MAX) : ERR_PTR(-ENOENT);
 						if (!IS_ERR(res)) {
-							size_t rl = strlen(res);
-							size_t nl = strlen(ls);
-							resolved_src = kmalloc(rl + nl + 1, GFP_KERNEL);
-							if (resolved_src) {
-								strcpy(resolved_src, res);
-								strcat(resolved_src, ls);
+							if (!strcmp(res, "/")) {
+								resolved_src = kstrdup(ls, GFP_KERNEL);
+							} else {
+								size_t rl = strlen(res);
+								size_t nl = strlen(ls);
+
+								resolved_src = kmalloc(rl + nl + 1,
+										      GFP_KERNEL);
+								if (resolved_src) {
+									strcpy(resolved_src, res);
+									strcat(resolved_src, ls);
+								}
 							}
 							parent_dir = kstrdup(res, GFP_KERNEL);
 						}
@@ -967,72 +1179,89 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 
 		hash = full_name_hash(NULL, src, strlen(src));
+		new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+		if (!new_entry) {
+			ret = -ENOMEM;
+			goto add_rule_done;
+		}
+		new_entry->src = kstrdup(src, GFP_KERNEL);
+		new_entry->target = kstrdup(target, GFP_KERNEL);
+		new_entry->type = req.type;
+		new_entry->src_hash = hash;
+		if (!new_entry->src || !new_entry->target) {
+			ret = -ENOMEM;
+			goto add_rule_done;
+		}
+		ret = kasumi_entry_capture_source(new_entry, target);
+		if (ret)
+			goto add_rule_done;
+		dh_v_ino = new_entry->visible_ino;
+		dh_src_mode = new_entry->source_mode;
+		dh_want = true;
+		/* Captured before the config_mutex section because new_entry is set to
+		 * NULL once it is inserted; these feed the symlink dirhijack branch. */
+		dh_nofollow_valid = new_entry->source_nofollow_path_valid;
+		dh_nofollow_ino = new_entry->nofollow_visible_ino;
+
 		mutex_lock(&kasumi_config_mutex);
 
 		hlist_for_each_entry(entry,
 			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 			if (entry->src_hash == hash && strcmp(entry->src, src) == 0) {
-				char *old_t = entry->target;
-				char *new_t = kstrdup(target, GFP_KERNEL);
-				if (new_t) {
-					hlist_del_rcu(&entry->target_node);
-					rcu_assign_pointer(entry->target, new_t);
-					entry->type = req.type;
-					hlist_add_head_rcu(&entry->target_node,
-						&kasumi_targets[hash_min(
-							full_name_hash(NULL, new_t, strlen(new_t)),
-							KASUMI_HASH_BITS)]);
-					kfree(old_t);
+				hlist_add_head_rcu(&new_entry->node,
+					&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+				hlist_add_head_rcu(&new_entry->target_node,
+					&kasumi_targets[hash_min(
+						full_name_hash(NULL, new_entry->target,
+							       strlen(new_entry->target)),
+						KASUMI_HASH_BITS)]);
+				hlist_del_rcu(&entry->node);
+				hlist_del_rcu(&entry->target_node);
+				install_side_effects =
+					strcmp(entry->target, new_entry->target) != 0;
+				if (install_side_effects) {
+					kasumi_clear_inode_flags_for_path(
+						entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
 				}
+				call_rcu(&entry->rcu, kasumi_entry_free_rcu);
+				new_entry = NULL;
 				found = true;
+				kasumi_log("replace rule: src=%s, target=%s, type=%d\n",
+					   src, target, req.type);
 				break;
 			}
 		}
 		if (!found) {
-			entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-			if (entry) {
-				entry->src = kstrdup(src, GFP_KERNEL);
-				entry->target = kstrdup(target, GFP_KERNEL);
-				entry->type = req.type;
-				entry->src_hash = hash;
-				if (entry->src && entry->target) {
-					unsigned long h1, h2;
-					hlist_add_head_rcu(&entry->node,
-						&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
-					hlist_add_head_rcu(&entry->target_node,
-						&kasumi_targets[hash_min(
-							full_name_hash(NULL, entry->target,
-								strlen(entry->target)),
-							KASUMI_HASH_BITS)]);
-					h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
-					h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
-					set_bit(h1, kasumi_path_bloom);
-					set_bit(h2, kasumi_path_bloom);
-					atomic_inc(&kasumi_rule_count);
-					kasumi_log("add rule: src=%s, target=%s, type=%d\n", src, target, req.type);
-				} else {
-					kfree(entry->src);
-					kfree(entry->target);
-					kfree(entry);
-				}
-			}
+			unsigned long h1, h2;
+
+			hlist_add_head_rcu(&new_entry->node,
+				&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+			hlist_add_head_rcu(&new_entry->target_node,
+				&kasumi_targets[hash_min(
+					full_name_hash(NULL, new_entry->target,
+						       strlen(new_entry->target)),
+					KASUMI_HASH_BITS)]);
+			h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
+			h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
+			set_bit(h1, kasumi_path_bloom);
+			set_bit(h2, kasumi_path_bloom);
+			atomic_inc(&kasumi_rule_count);
+			new_entry = NULL;
+			kasumi_log("add rule: src=%s, target=%s, type=%d\n",
+				   src, target, req.type);
 		}
 		mutex_unlock(&kasumi_config_mutex);
 
-		if (parent_dir) {
+		if (install_side_effects && parent_dir) {
 			kasumi_mark_dir_has_inject(parent_dir);
 			kasumi_add_inject_rule(parent_dir);
+			parent_dir = NULL;
 		}
-		if (target && kasumi_kern_path &&
+		if (install_side_effects && target && kasumi_kern_path &&
 		    kasumi_kern_path(target, LOOKUP_FOLLOW, &path) == 0) {
 			if (path.dentry && d_inode(path.dentry)) {
 				target_inode = d_inode(path.dentry);
 				kasumi_ihold(target_inode);
-				if (src_inode)
-					(void)kasumi_clone_source_inode_attrs(target_inode,
-									       src_inode);
-				(void)kasumi_dop_install(path.dentry, src);
-				(void)kasumi_xattr_sid_install_path_ancestors(target, src);
 			}
 			kasumi_path_put(&path);
 		}
@@ -1041,17 +1270,64 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			iput(target_inode);
 		}
 
-		/* Do not mark redirect source as hidden: we do not inject a virtual
-		 * entry for simple ADD_RULE, so hiding would make the file disappear
-		 * from the listing. Open of the path is still redirected via getname. */
-		if (src_inode)
-			iput(src_inode);
-		if (parent_inode)
-			iput(parent_inode);
+		/* Tier 3: when the lookup hijack is enabled, also register this rule's
+		 * visible child so VFS lookup resolves it to a Kasumi virtual inode.
+		 * v1 handled regular-file sources; Slice 3 adds symlink sources, which
+		 * are registered as a symlink vnode pinned to the link itself (nofollow)
+		 * so lstat/readlink see the link and the kernel follows it natively. */
+		if (dh_want && kasumi_dirhijack_enabled() && kasumi_kern_path) {
+			struct path dsrc;
 
-		mutex_lock(&kasumi_config_mutex);
-		kasumi_enabled = true;
-		mutex_unlock(&kasumi_config_mutex);
+			if (dh_nofollow_valid &&
+			    kasumi_kern_path(target, 0, &dsrc) == 0) {
+				struct inode *di = d_inode(dsrc.dentry);
+
+				if (di && S_ISLNK(di->i_mode))
+					(void)kasumi_dirhijack_add(src, &dsrc,
+								   dh_nofollow_ino,
+								   KASUMI_VNODE_F_LNK);
+				kasumi_path_put(&dsrc);
+			} else if (S_ISREG(dh_src_mode) &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino, 0);
+				kasumi_path_put(&dsrc);
+			} else if (S_ISDIR(dh_src_mode) &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
+				/* Slice 4c: a directory-source redirect resolves
+				 * to a Kasumi directory vnode whose lookup/iterate
+				 * delegate to the pinned source dir. */
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino,
+							   KASUMI_VNODE_F_DIR);
+				kasumi_path_put(&dsrc);
+			} else if ((S_ISCHR(dh_src_mode) || S_ISBLK(dh_src_mode) ||
+				    S_ISFIFO(dh_src_mode)) &&
+				   kasumi_device_sources_enabled &&
+				   kasumi_kern_path(target, LOOKUP_FOLLOW,
+						    &dsrc) == 0) {
+				/* char/blk/fifo source: resolves to a special vnode
+				 * wrapper (S_IFREG inode to clear may_open_dev on the
+				 * nodev visible mount; .open delegates to the real
+				 * device/fifo, getattr projects the source type+rdev). */
+				(void)kasumi_dirhijack_add(src, &dsrc, dh_v_ino,
+							   KASUMI_VNODE_F_SPECIAL);
+				kasumi_path_put(&dsrc);
+			}
+		}
+
+		/* Exact rules are injected when the visible dentry is absent.  Existing
+		 * real names are de-duplicated by the directory view, so no hide marker
+		 * is needed for either form. */
+add_rule_done:
+		if (new_entry) {
+			kasumi_entry_release_source(new_entry);
+			kfree(new_entry->src);
+			kfree(new_entry->target);
+			kfree(new_entry->source_canonical);
+			kfree(new_entry);
+		}
+		kfree(parent_dir);
 		break;
 	}
 
@@ -1148,12 +1424,20 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				}
 			}
 		}
-		kasumi_enabled = true;
 		mutex_unlock(&kasumi_config_mutex);
 		if (parent_dir) {
 			kasumi_mark_dir_has_inject(parent_dir);
 			kasumi_add_inject_rule(parent_dir);
 		}
+
+		/* Tier 3: when the lookup hijack is enabled, register this hidden
+		 * path so VFS lookup returns a negative dentry and readdir omits it
+		 * for view observers — sinking the hide off the TSR path routes.
+		 * Called regardless of the "already present" fast path so a hide
+		 * issued before dirhijack was enabled re-syncs its child; add_child
+		 * is idempotent. */
+		if (kasumi_dirhijack_enabled())
+			(void)kasumi_dirhijack_hide(src);
 		break;
 	}
 
@@ -1185,7 +1469,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 					kasumi_log("hide xattrs for sb %p (path: %s)\n", sb, src);
 				}
 			}
-			kasumi_enabled = true;
 			mutex_unlock(&kasumi_config_mutex);
 			kasumi_path_put(&path);
 		} else {
@@ -1237,8 +1520,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			if (entry->src_hash == hash && strcmp(entry->src, src) == 0) {
 				kasumi_clear_inode_flags_for_path(entry->target,
 								AS_FLAGS_KASUMI_SPOOF_KSTAT);
-				(void)kasumi_dop_uninstall_path(entry->target);
-				(void)kasumi_xattr_sid_uninstall_path_ancestors(entry->target);
 				hlist_del_rcu(&entry->node);
 				hlist_del_rcu(&entry->target_node);
 				atomic_dec(&kasumi_rule_count);
@@ -1270,6 +1551,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 del_done:
 		mutex_unlock(&kasumi_config_mutex);
+		if (kasumi_dirhijack_enabled())
+			(void)kasumi_dirhijack_del(src);
 		if (del_inode) {
 			if (del_inode->i_mapping)
 				clear_bit(AS_FLAGS_KASUMI_HIDE,
@@ -1296,12 +1579,159 @@ del_done:
  * Part 16: Ioctl Handler
  * ====================================================================== */
 
+/*
+ * Rule updates have side effects outside kasumi_config_mutex (inode/dentry
+ * overrides and injected-directory state). Serialize the control plane so a
+ * concurrent CLEAR_ALL cannot return while an older update is still applying
+ * those side effects or re-enable the module afterwards.
+ */
+static DEFINE_MUTEX(kasumi_ioctl_mutex);
+static atomic_t kasumi_control_files = ATOMIC_INIT(0);
+static u32 kasumi_quiesce_state = KSM_QUIESCE_STATE_ACTIVE;
+static int kasumi_quiesce_error;
+
+static bool kasumi_control_accepting(void)
+{
+	return READ_ONCE(kasumi_quiesce_state) == KSM_QUIESCE_STATE_ACTIVE;
+}
+
+static void kasumi_quiesce_stop_new(void)
+{
+	if (READ_ONCE(kasumi_quiesce_state) != KSM_QUIESCE_STATE_ACTIVE)
+		return;
+	WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_DRAINING);
+
+	/* Stop routed execution before withdrawing any handler-owned state. */
+	smp_store_release(&kasumi_enabled, false);
+
+	/* No new object may acquire module-owned callbacks after this point. */
+	kasumi_proc_hooks_stop_new();
+	kasumi_vfs_hooks_exit(0);
+	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_dirhijack_stop_new();
+	/* Reject nested vnode creation before withdrawing the lookup/fop/dentry
+	 * clients that keep each superblock owner live. */
+	kasumi_sop_shadow_stop_new();
+	kasumi_dirhijack_clear();
+	kasumi_fop_override_stop_new();
+	kasumi_fop_bridge_stop_new();
+	kasumi_iop_override_stop_new();
+
+	mutex_lock(&kasumi_config_mutex);
+	kasumi_cleanup_locked();
+	mutex_unlock(&kasumi_config_mutex);
+	kasumi_fake_mi_invalidate_all();
+}
+
+static int kasumi_ioctl_prepare_unload(void __user *arg)
+{
+	struct kasumi_quiesce_arg a;
+	unsigned int control_files;
+	unsigned int getfd;
+	unsigned int proxies;
+	unsigned int iop_active;
+	bool iop_quiesced;
+	unsigned int sop_active;
+	bool sop_quiesced;
+	unsigned int known_refs;
+	unsigned int module_refs;
+	bool unload_pin_held;
+	bool ready;
+
+	if (copy_from_user(&a, arg, sizeof(a)))
+		return -EFAULT;
+	if (a.version != KSM_QUIESCE_API_VERSION || a.size < sizeof(a) ||
+	    a.flags || !kasumi_u32_reserved_zero(a.reserved,
+						 ARRAY_SIZE(a.reserved))) {
+		a.err = -EINVAL;
+		if (copy_to_user(arg, &a, sizeof(a)))
+			return -EFAULT;
+		return -EINVAL;
+	}
+	if (!kasumi_bootstrap_quiesce_supported()) {
+		a.state = KSM_QUIESCE_STATE_ACTIVE;
+		a.busy_mask = 0;
+		a.err = -EOPNOTSUPP;
+		if (copy_to_user(arg, &a, sizeof(a)))
+			return -EFAULT;
+		return -EOPNOTSUPP;
+	}
+
+	kasumi_quiesce_stop_new();
+	control_files = (unsigned int)atomic_read(&kasumi_control_files);
+	getfd = kasumi_proc_getfd_pending();
+	proxies = kasumi_proc_proxy_live();
+	iop_active = kasumi_iop_override_active();
+	iop_quiesced = kasumi_iop_override_quiesced();
+	sop_active = kasumi_sop_shadow_active();
+	sop_quiesced = kasumi_sop_shadow_quiesced();
+	unload_pin_held = kasumi_bootstrap_unload_pin_held();
+	module_refs = (unsigned int)kasumi_module_refcount(THIS_MODULE);
+	known_refs = control_files + getfd + proxies +
+		(unload_pin_held ? 1U : 0U);
+
+	a.state = KSM_QUIESCE_STATE_DRAINING;
+	a.busy_mask = 0;
+	if (getfd)
+		a.busy_mask |= KSM_QUIESCE_BUSY_GETFD;
+	if (proxies)
+		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
+	if (control_files != 1)
+		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
+	if (module_refs > known_refs || iop_active || sop_active ||
+	    !iop_quiesced || !sop_quiesced)
+		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
+
+	ready = !getfd && !proxies &&
+		iop_quiesced && sop_quiesced && !sop_active &&
+		control_files == 1 &&
+		module_refs == control_files + (unload_pin_held ? 1U : 0U);
+
+	if (kasumi_quiesce_error) {
+		a.state = KSM_QUIESCE_STATE_FAILED;
+		a.err = kasumi_quiesce_error;
+	} else if (ready) {
+		/* Publish READY before releasing the lifecycle pin.  This ioctl is
+		 * serialized with all control operations, and its own anon file keeps
+		 * module text alive through copy_to_user and return to VFS.
+		 */
+		WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_READY);
+		if (unload_pin_held) {
+			kasumi_bootstrap_release_unload_pin();
+			module_refs--;
+		}
+		a.state = KSM_QUIESCE_STATE_READY;
+		a.busy_mask = 0;
+		a.err = 0;
+	} else {
+		a.err = 0;
+	}
+	if (a.state != KSM_QUIESCE_STATE_READY)
+		WRITE_ONCE(kasumi_quiesce_state, a.state);
+	a.pending_getfd = getfd;
+	a.pending_marker = 0;
+	a.pending_redirect = 0;
+	a.live_proc_proxy = proxies;
+	a.live_file_view = 0;
+	a.control_files = control_files;
+	a.module_refs = module_refs;
+	if (copy_to_user(arg, &a, sizeof(a)))
+		return -EFAULT;
+	return 0;
+}
+
 static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 					unsigned long arg)
 {
 	long ret;
 
+	mutex_lock(&kasumi_ioctl_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
+	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
+	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
 	switch (cmd) {
 	case KSM_IOC_GET_VERSION:
 	case KSM_IOC_SET_ENABLED:
@@ -1317,55 +1747,101 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_ADD_MERGE_RULE:
 	case KSM_IOC_SET_MIRROR_PATH:
 	case KSM_IOC_GET_HOOKS:
-	case KSM_IOC_SET_UNAME:
-	case KSM_IOC_SET_UNAME_GLOBAL:
 	case KSM_IOC_ADD_MAPS_RULE:
 	case KSM_IOC_CLEAR_MAPS_RULES:
 	case KSM_IOC_GET_FEATURES:
 	case KSM_IOC_SET_MOUNT_HIDE:
+	case KSM_IOC_SET_MOUNT_HIDE_MODE:
 	case KSM_IOC_SET_MAPS_SPOOF:
 	case KSM_IOC_SET_STATFS_SPOOF:
 	case KSM_IOC_SELINUX_FIX:
+	case KSM_IOC_SET_POLICY_OWNER:
+	case KSM_IOC_SET_POLICY_UIDS:
+	case KSM_IOC_CLEAR_POLICY_UIDS:
+	case KSM_IOC_GET_POLICY:
+	case KSM_IOC_GET_POLICY_UIDS:
+	case KSM_IOC_REPLACE_POLICY:
+	case KSM_IOC_RESET_POLICY:
 	case KSM_IOC_ADD_SPOOF_KSTAT:
 	case KSM_IOC_UPDATE_SPOOF_KSTAT:
 		ret = kasumi_dispatch_cmd(cmd, (void __user *)arg);
+		break;
+	case KSM_IOC_PREPARE_UNLOAD:
+		ret = kasumi_ioctl_prepare_unload((void __user *)arg);
 		break;
 	default:
 		ret = -EINVAL;
 		break;
 	}
+out:
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
+	mutex_unlock(&kasumi_ioctl_mutex);
 	return ret;
 }
 
 /* ======================================================================
- * Part 17: Anonymous fd (no device node; syscall returns this fd)
+ * Part 17: Anonymous fd (no device node; reboot task_work installs it)
  * ====================================================================== */
+
+static int kasumi_anon_release(struct inode *inode, struct file *file)
+{
+	(void)inode;
+	(void)file;
+	if (atomic_dec_and_test(&kasumi_control_files))
+		WRITE_ONCE(kasumi_daemon_pid, 0);
+	return 0;
+}
 
 static const struct file_operations kasumi_anon_fops = {
 	.owner          = THIS_MODULE,
 	.unlocked_ioctl = kasumi_dev_ioctl,
 	.compat_ioctl   = kasumi_dev_ioctl,
+	.release        = kasumi_anon_release,
 	.llseek         = noop_llseek,
 };
 
 /**
- * kasumi_get_anon_fd - Create and return anonymous fd for Kasumi.
+ * kasumi_install_anon_fd - Install a Kasumi fd and publish its number.
+ * @outp: userspace pointer receiving the new fd
+ *
+ * The fd number is copied before fd_install(), so a failed userspace write can
+ * release both the reserved descriptor and file without requiring close_fd().
  * Returns fd on success, negative errno on failure.
  */
-int kasumi_get_anon_fd(void)
+int kasumi_install_anon_fd(int __user *outp)
 {
+	struct file *file;
 	int fd;
 	pid_t pid;
 
 	if (!uid_eq(current_uid(), GLOBAL_ROOT_UID))
 		return -EPERM;
-	fd = anon_inode_getfd("kasumi", &kasumi_anon_fops, NULL, O_RDWR | O_CLOEXEC);
+	if (!kasumi_control_accepting())
+		return -ESHUTDOWN;
+	if (!outp)
+		return -EINVAL;
+
+	file = anon_inode_getfile("kasumi", &kasumi_anon_fops, NULL, O_RDWR);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	atomic_inc(&kasumi_control_files);
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0)
-		return fd;
+		goto err_file;
+	if (put_user(fd, outp)) {
+		put_unused_fd(fd);
+		fd = -EFAULT;
+		goto err_file;
+	}
+
+	fd_install(fd, file);
 	pid = task_tgid_vnr(current);
 	WRITE_ONCE(kasumi_daemon_pid, pid);
-	kasumi_log("Daemon PID auto-registered: %d\n", pid);
+	kasumi_log("Controller PID auto-registered: %d\n", pid);
+	return fd;
+
+err_file:
+	fput(file);
 	return fd;
 }
-EXPORT_SYMBOL_GPL(kasumi_get_anon_fd);

@@ -9,12 +9,13 @@
  */
 #include "kasumi_fake_selinuxfs_access.h"
 #include "kasumi_entrypoints.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_runtime.h"
-#include "kasumi_sop_override.h"
 
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/kprobes.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/namei.h>
@@ -55,6 +56,7 @@ struct kasumi_selinux_kernel_status {
 struct kasumi_selinuxfs_fake_txn {
 	u64 magic;
 	size_t len;
+	void *orig_private_data;
 	char decision[sizeof(KASUMI_SELINUXFS_DENY_DECISION)];
 };
 
@@ -74,16 +76,98 @@ struct kasumi_selinuxfs_txn_meta {
 	struct inode *inode;
 	enum kasumi_selinuxfs_txn_kind kind;
 	const struct file_operations *orig_fop;
+	struct file_operations ingress_fop;
 	struct file_operations shadow_fop;
-	struct rcu_head rcu;
+	struct kasumi_fop_bridge_entry bridge;
 };
 
 static struct kasumi_selinuxfs_txn_meta __rcu *kasumi_selinuxfs_access_meta;
 static struct kasumi_selinuxfs_txn_meta __rcu *kasumi_selinuxfs_context_meta;
 static struct kasumi_selinuxfs_txn_meta __rcu *kasumi_selinuxfs_status_meta;
 static DEFINE_SPINLOCK(kasumi_selinuxfs_lock);
+static DEFINE_MUTEX(kasumi_selinuxfs_status_io_lock);
+static bool kasumi_selinuxfs_install_gate;
 static bool kasumi_selinuxfs_ready;
 static struct page *kasumi_selinuxfs_status_page;
+static bool kasumi_proc_attr_write_registered;
+static bool kasumi_selinuxfs_sensitive_context(char *context);
+
+static KASUMI_NOCFI int kasumi_proc_attr_write_pre(struct kprobe *p,
+						   struct pt_regs *regs)
+{
+	struct file *file;
+	struct dentry *dentry, *parent;
+	const char __user *buf;
+	size_t count;
+	char context[KASUMI_SELINUX_CTX_MAX];
+
+	(void)p;
+	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
+	    !kasumi_current_is_selinux_guard_target() ||
+	    !kasumi_copy_from_user_nofault)
+		return 0;
+
+#if defined(__aarch64__)
+	file = (struct file *)regs->regs[0];
+	buf = (const char __user *)(uintptr_t)regs->regs[1];
+	count = (size_t)regs->regs[2];
+#elif defined(__x86_64__)
+	file = (struct file *)regs->di;
+	buf = (const char __user *)(uintptr_t)regs->si;
+	count = (size_t)regs->dx;
+#else
+	return 0;
+#endif
+	if (!file || !buf || count == 0 || count >= sizeof(context))
+		return 0;
+
+	dentry = file->f_path.dentry;
+	parent = dentry ? dentry->d_parent : NULL;
+	if (!dentry || !parent ||
+	    dentry->d_name.len != 7 ||
+	    memcmp(dentry->d_name.name, "current", 7) != 0 ||
+	    parent->d_name.len != 4 ||
+	    memcmp(parent->d_name.name, "attr", 4) != 0)
+		return 0;
+	if (kasumi_copy_from_user_nofault(context, buf, count) != 0)
+		return 0;
+	context[count] = '\0';
+	if (!kasumi_selinuxfs_sensitive_context(context))
+		return 0;
+
+	kasumi_log("fake_selinuxfs: rejected attr/current write pid=%d uid=%u comm=%s\n",
+		   task_tgid_vnr(current), __kuid_val(current_uid()), current->comm);
+#if defined(__aarch64__)
+	instruction_pointer_set(regs, regs->regs[30]);
+	regs->regs[0] = (unsigned long)-EINVAL;
+#elif defined(__x86_64__)
+	instruction_pointer_set(regs, *(unsigned long *)regs->sp);
+	regs->sp += sizeof(unsigned long);
+	regs->ax = (unsigned long)-EINVAL;
+#endif
+	return 1;
+}
+
+static struct kprobe kasumi_kp_proc_attr_write = {
+	.pre_handler = kasumi_proc_attr_write_pre,
+};
+
+static int kasumi_fake_selinuxfs_proc_attr_init(void)
+{
+	unsigned long addr;
+	int ret;
+
+	addr = kasumi_lookup_name("proc_pid_attr_write");
+	if (!addr)
+		return -ENOENT;
+	kasumi_kp_proc_attr_write.addr = (kprobe_opcode_t *)addr;
+	ret = register_kprobe(&kasumi_kp_proc_attr_write);
+	if (ret)
+		return ret;
+	WRITE_ONCE(kasumi_proc_attr_write_registered, true);
+	pr_info("Kasumi: fake_selinuxfs attr/current filter via proc_pid_attr_write\n");
+	return 0;
+}
 
 static int kasumi_selinuxfs_init_status_page(void)
 {
@@ -246,6 +330,12 @@ static void kasumi_selinuxfs_lookup(struct inode *inode,
 	rcu_read_unlock();
 }
 
+static const struct file_operations *kasumi_selinuxfs_installed_table(
+	const struct kasumi_selinuxfs_txn_meta *m)
+{
+	return m->bridge.registered ? &m->ingress_fop : &m->shadow_fop;
+}
+
 static ssize_t kasumi_selinuxfs_sanitize_access_read(char __user *buf,
 						      size_t count,
 						      ssize_t ret)
@@ -348,6 +438,9 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_write(struct file *file,
 		return -ENOMEM;
 
 	txn->magic = KASUMI_SELINUXFS_MAGIC;
+	txn->orig_private_data = old_priv && kasumi_selinuxfs_fake_txn(old_priv) ?
+		((struct kasumi_selinuxfs_fake_txn *)old_priv)->orig_private_data :
+		old_priv;
 	memcpy(txn->decision, KASUMI_SELINUXFS_DENY_DECISION,
 	       sizeof(KASUMI_SELINUXFS_DENY_DECISION));
 	txn->len = strlen(txn->decision);
@@ -374,8 +467,20 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_read(struct file *file,
 	size_t left;
 	ssize_t ret;
 
+	kasumi_selinuxfs_lookup(file_inode(file), &orig, &kind);
+	if (!orig || !orig->read)
+		return -EIO;
+
 	txn = READ_ONCE(file->private_data);
 	if (kasumi_selinuxfs_fake_txn(txn)) {
+		if (!(READ_ONCE(kasumi_feature_enabled_mask) &
+		      KSM_FEATURE_SELINUX_FIX) ||
+		    !kasumi_current_is_selinux_guard_target()) {
+			WRITE_ONCE(file->private_data, txn->orig_private_data);
+			WRITE_ONCE(txn->magic, 0);
+			kfree(txn);
+			return orig->read(file, buf, count, ppos);
+		}
 		pos = ppos ? *ppos : file->f_pos;
 		if (pos < 0)
 			return -EINVAL;
@@ -394,10 +499,6 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_read(struct file *file,
 		return count;
 	}
 
-	kasumi_selinuxfs_lookup(file_inode(file), &orig, &kind);
-	if (!orig || !orig->read)
-		return -EIO;
-
 	ret = orig->read(file, buf, count, ppos);
 	if (kind != KASUMI_SELINUXFS_ACCESS ||
 	    !(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
@@ -407,29 +508,64 @@ KASUMI_NOCFI static ssize_t kasumi_selinuxfs_access_read(struct file *file,
 	return kasumi_selinuxfs_sanitize_access_read(buf, count, ret);
 }
 
-KASUMI_NOCFI static int kasumi_selinuxfs_status_open(struct inode *inode,
-						      struct file *file)
+static bool kasumi_selinuxfs_status_should_fake(void)
+{
+	return (READ_ONCE(kasumi_feature_enabled_mask) &
+		KSM_FEATURE_SELINUX_FIX) &&
+	       kasumi_current_is_selinux_guard_target() &&
+	       READ_ONCE(kasumi_selinuxfs_status_page);
+}
+
+KASUMI_NOCFI static ssize_t kasumi_selinuxfs_status_read(struct file *file,
+							 char __user *buf,
+							 size_t count,
+							 loff_t *ppos)
 {
 	const struct file_operations *orig;
-	int ret;
+	void *orig_priv;
+	ssize_t ret;
+	bool fake;
 
-	kasumi_selinuxfs_lookup(inode, &orig, NULL);
-	if (!orig || !orig->open)
+	kasumi_selinuxfs_lookup(file_inode(file), &orig, NULL);
+	if (!orig || !orig->read)
 		return -EIO;
+	fake = kasumi_selinuxfs_status_should_fake();
+	mutex_lock(&kasumi_selinuxfs_status_io_lock);
+	orig_priv = READ_ONCE(file->private_data);
+	if (fake)
+		WRITE_ONCE(file->private_data, kasumi_selinuxfs_status_page);
+	ret = orig->read(file, buf, count, ppos);
+	if (fake)
+		WRITE_ONCE(file->private_data, orig_priv);
+	mutex_unlock(&kasumi_selinuxfs_status_io_lock);
+	if (fake)
+		atomic64_inc(&kasumi_hook_stats.selinuxfs_status_spoofs);
+	return ret;
+}
 
-	ret = orig->open(inode, file);
-	if (ret)
-		return ret;
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_SELINUX_FIX) ||
-	    !kasumi_current_is_selinux_guard_target() ||
-	    !kasumi_selinuxfs_status_page)
-		return 0;
+KASUMI_NOCFI static int kasumi_selinuxfs_status_mmap(struct file *file,
+						      struct vm_area_struct *vma)
+{
+	const struct file_operations *orig;
+	void *orig_priv;
+	int ret;
+	bool fake;
 
-	WRITE_ONCE(file->private_data, kasumi_selinuxfs_status_page);
-	atomic64_inc(&kasumi_hook_stats.selinuxfs_status_spoofs);
-	kasumi_log("fake_selinuxfs: clean status page pid=%d uid=%u comm=%s\n",
-		   task_tgid_vnr(current), __kuid_val(current_uid()), current->comm);
-	return 0;
+	kasumi_selinuxfs_lookup(file_inode(file), &orig, NULL);
+	if (!orig || !orig->mmap)
+		return -ENODEV;
+	fake = kasumi_selinuxfs_status_should_fake();
+	mutex_lock(&kasumi_selinuxfs_status_io_lock);
+	orig_priv = READ_ONCE(file->private_data);
+	if (fake)
+		WRITE_ONCE(file->private_data, kasumi_selinuxfs_status_page);
+	ret = orig->mmap(file, vma);
+	if (fake)
+		WRITE_ONCE(file->private_data, orig_priv);
+	mutex_unlock(&kasumi_selinuxfs_status_io_lock);
+	if (fake && !ret)
+		atomic64_inc(&kasumi_hook_stats.selinuxfs_status_spoofs);
+	return ret;
 }
 
 KASUMI_NOCFI static int kasumi_selinuxfs_access_release(struct inode *inode,
@@ -440,10 +576,9 @@ KASUMI_NOCFI static int kasumi_selinuxfs_access_release(struct inode *inode,
 
 	txn = READ_ONCE(file->private_data);
 	if (kasumi_selinuxfs_fake_txn(txn)) {
-		WRITE_ONCE(file->private_data, NULL);
+		WRITE_ONCE(file->private_data, txn->orig_private_data);
 		WRITE_ONCE(txn->magic, 0);
 		kfree(txn);
-		return 0;
 	}
 
 	kasumi_selinuxfs_lookup(file_inode(file), &orig, NULL);
@@ -452,11 +587,12 @@ KASUMI_NOCFI static int kasumi_selinuxfs_access_release(struct inode *inode,
 	return 0;
 }
 
-static void kasumi_selinuxfs_meta_free_rcu(struct rcu_head *rcu)
+static void kasumi_selinuxfs_meta_free(struct kasumi_selinuxfs_txn_meta *m)
 {
-	struct kasumi_selinuxfs_txn_meta *m =
-		container_of(rcu, struct kasumi_selinuxfs_txn_meta, rcu);
-
+	if (!m)
+		return;
+	if (m->inode)
+		iput(m->inode);
 	if (m->orig_fop && m->orig_fop->owner)
 		module_put(m->orig_fop->owner);
 	kfree(m);
@@ -472,7 +608,11 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 	struct inode *inode;
 	int ret;
 
+	if (!READ_ONCE(kasumi_selinuxfs_install_gate))
+		return -EOPNOTSUPP;
 	if (!kasumi_kern_path)
+		return -EOPNOTSUPP;
+	if (!kasumi_ihold)
 		return -EOPNOTSUPP;
 
 	switch (kind) {
@@ -498,10 +638,6 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 		ret = -EINVAL;
 		goto out_path;
 	}
-	if (kasumi_sop_install(inode->i_sb)) {
-		ret = -EOPNOTSUPP;
-		goto out_path;
-	}
 
 	orig = READ_ONCE(inode->i_fop);
 	if (!orig || (kind == KASUMI_SELINUXFS_STATUS ? !orig->open :
@@ -523,12 +659,17 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 	}
 
 	m->inode = inode;
+	kasumi_ihold(inode);
 	m->kind = kind;
 	m->orig_fop = orig;
+	memcpy(&m->ingress_fop, orig, sizeof(m->ingress_fop));
 	memcpy(&m->shadow_fop, orig, sizeof(m->shadow_fop));
 	m->shadow_fop.owner = THIS_MODULE;
 	if (kind == KASUMI_SELINUXFS_STATUS) {
-		m->shadow_fop.open = kasumi_selinuxfs_status_open;
+		if (orig->read)
+			m->shadow_fop.read = kasumi_selinuxfs_status_read;
+		if (orig->mmap)
+			m->shadow_fop.mmap = kasumi_selinuxfs_status_mmap;
 	} else {
 		m->shadow_fop.write = kasumi_selinuxfs_access_write;
 		m->shadow_fop.read = kasumi_selinuxfs_access_read;
@@ -536,27 +677,31 @@ static KASUMI_NOCFI int kasumi_fake_selinuxfs_install_path(const char *path,
 	}
 
 	spin_lock(&kasumi_selinuxfs_lock);
+	if (!READ_ONCE(kasumi_selinuxfs_install_gate)) {
+		spin_unlock(&kasumi_selinuxfs_lock);
+		kasumi_selinuxfs_meta_free(m);
+		ret = -EOPNOTSUPP;
+		goto out_path;
+	}
 	if (rcu_dereference_protected(*slot,
 				      lockdep_is_held(&kasumi_selinuxfs_lock))) {
 		spin_unlock(&kasumi_selinuxfs_lock);
-		if (orig->owner)
-			module_put(orig->owner);
-		kfree(m);
+		kasumi_selinuxfs_meta_free(m);
 		ret = 0;
 		goto out_path;
 	}
 	if (READ_ONCE(inode->i_fop) != orig) {
 		spin_unlock(&kasumi_selinuxfs_lock);
-		if (orig->owner)
-			module_put(orig->owner);
-		kfree(m);
+		kasumi_selinuxfs_meta_free(m);
 		ret = -EAGAIN;
 		goto out_path;
 	}
 
 	rcu_assign_pointer(*slot, m);
+	(void)kasumi_fop_bridge_register(&m->bridge, &m->ingress_fop,
+					 &m->shadow_fop, m->orig_fop);
 	smp_wmb();
-	WRITE_ONCE(inode->i_fop, &m->shadow_fop);
+	WRITE_ONCE(inode->i_fop, kasumi_selinuxfs_installed_table(m));
 	WRITE_ONCE(kasumi_selinuxfs_ready, true);
 	spin_unlock(&kasumi_selinuxfs_lock);
 
@@ -581,9 +726,19 @@ bool kasumi_fake_selinuxfs_status_active(void)
 	       rcu_access_pointer(kasumi_selinuxfs_status_meta) != NULL;
 }
 
+bool kasumi_fake_selinuxfs_proc_attr_active(void)
+{
+	return READ_ONCE(kasumi_proc_attr_write_registered);
+}
+
 int kasumi_fake_selinuxfs_access_init(void)
 {
-	int access_ret, context_ret, status_ret;
+	int access_ret, context_ret, status_ret, attr_ret;
+
+	WRITE_ONCE(kasumi_selinuxfs_install_gate, true);
+	attr_ret = kasumi_fake_selinuxfs_proc_attr_init();
+	if (attr_ret)
+		pr_warn("Kasumi: proc attr/current filter unavailable: %d\n", attr_ret);
 
 	status_ret = kasumi_selinuxfs_init_status_page();
 	if (status_ret)
@@ -610,14 +765,17 @@ int kasumi_fake_selinuxfs_access_init(void)
 									KASUMI_SELINUXFS_STATUS);
 	}
 
-	if (access_ret || context_ret || status_ret)
-		pr_warn("Kasumi: fake_selinuxfs partial install (access=%d context=%d status=%d)\n",
-			access_ret, context_ret, status_ret);
-	return kasumi_fake_selinuxfs_access_active() ? 0 :
-	       (access_ret ? access_ret : (context_ret ? context_ret : status_ret));
+	if (access_ret || context_ret || status_ret || attr_ret)
+		pr_warn("Kasumi: fake_selinuxfs partial install (access=%d context=%d status=%d attr=%d)\n",
+			access_ret, context_ret, status_ret, attr_ret);
+	return (kasumi_fake_selinuxfs_access_active() ||
+		kasumi_fake_selinuxfs_proc_attr_active()) ? 0 :
+	       (access_ret ? access_ret : (context_ret ? context_ret :
+		(status_ret ? status_ret : attr_ret)));
 }
 
-static void kasumi_fake_selinuxfs_uninstall_slot(struct kasumi_selinuxfs_txn_meta __rcu **slot)
+static void kasumi_fake_selinuxfs_restore_slot(
+	struct kasumi_selinuxfs_txn_meta __rcu **slot)
 {
 	struct kasumi_selinuxfs_txn_meta *m;
 
@@ -625,23 +783,73 @@ static void kasumi_fake_selinuxfs_uninstall_slot(struct kasumi_selinuxfs_txn_met
 	if (!m)
 		return;
 
-	if (m->inode && READ_ONCE(m->inode->i_fop) == &m->shadow_fop)
+	if (m->inode && READ_ONCE(m->inode->i_fop) ==
+					kasumi_selinuxfs_installed_table(m))
 		WRITE_ONCE(m->inode->i_fop, m->orig_fop);
-	RCU_INIT_POINTER(*slot, NULL);
-	call_rcu(&m->rcu, kasumi_selinuxfs_meta_free_rcu);
+}
+
+void kasumi_fake_selinuxfs_access_stop_new(void)
+{
+	bool had_meta;
+
+	WRITE_ONCE(kasumi_selinuxfs_install_gate, false);
+	WRITE_ONCE(kasumi_selinuxfs_ready, false);
+	if (kasumi_proc_attr_write_registered) {
+		WRITE_ONCE(kasumi_proc_attr_write_registered, false);
+		unregister_kprobe(&kasumi_kp_proc_attr_write);
+	}
+
+	spin_lock(&kasumi_selinuxfs_lock);
+	had_meta = rcu_access_pointer(kasumi_selinuxfs_access_meta) ||
+		rcu_access_pointer(kasumi_selinuxfs_context_meta) ||
+		rcu_access_pointer(kasumi_selinuxfs_status_meta);
+	kasumi_fake_selinuxfs_restore_slot(&kasumi_selinuxfs_access_meta);
+	kasumi_fake_selinuxfs_restore_slot(&kasumi_selinuxfs_context_meta);
+	kasumi_fake_selinuxfs_restore_slot(&kasumi_selinuxfs_status_meta);
+	spin_unlock(&kasumi_selinuxfs_lock);
+	/* Close the inode->i_fop load to fops_get(owner) dispatch window before
+	 * module_refcount is used as the unload readiness oracle.
+	 */
+	if (had_meta)
+		kasumi_synchronize_rcu_tasks();
+}
+
+static struct kasumi_selinuxfs_txn_meta *
+kasumi_fake_selinuxfs_detach_slot(
+	struct kasumi_selinuxfs_txn_meta __rcu **slot)
+{
+	struct kasumi_selinuxfs_txn_meta *m;
+
+	m = rcu_dereference_protected(*slot,
+				      lockdep_is_held(&kasumi_selinuxfs_lock));
+	if (m)
+		RCU_INIT_POINTER(*slot, NULL);
+	return m;
 }
 
 void kasumi_fake_selinuxfs_access_exit(void)
 {
-	WRITE_ONCE(kasumi_selinuxfs_ready, false);
+	struct kasumi_selinuxfs_txn_meta *retired[3];
+	unsigned int i;
+
+	kasumi_fake_selinuxfs_access_stop_new();
 
 	spin_lock(&kasumi_selinuxfs_lock);
-	kasumi_fake_selinuxfs_uninstall_slot(&kasumi_selinuxfs_access_meta);
-	kasumi_fake_selinuxfs_uninstall_slot(&kasumi_selinuxfs_context_meta);
-	kasumi_fake_selinuxfs_uninstall_slot(&kasumi_selinuxfs_status_meta);
+	retired[0] = kasumi_fake_selinuxfs_detach_slot(
+		&kasumi_selinuxfs_access_meta);
+	retired[1] = kasumi_fake_selinuxfs_detach_slot(
+		&kasumi_selinuxfs_context_meta);
+	retired[2] = kasumi_fake_selinuxfs_detach_slot(
+		&kasumi_selinuxfs_status_meta);
 	spin_unlock(&kasumi_selinuxfs_lock);
 
-	rcu_barrier();
+	for (i = 0; i < ARRAY_SIZE(retired); i++) {
+		if (retired[i])
+			kasumi_fop_bridge_unregister(&retired[i]->bridge);
+	}
+	synchronize_rcu();
+	for (i = 0; i < ARRAY_SIZE(retired); i++)
+		kasumi_selinuxfs_meta_free(retired[i]);
 	if (kasumi_selinuxfs_status_page)
 		__free_page(kasumi_selinuxfs_status_page);
 	kasumi_selinuxfs_status_page = NULL;

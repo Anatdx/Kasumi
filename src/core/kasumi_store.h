@@ -50,7 +50,6 @@ struct kasumi_maps_rule_entry {
 extern struct hlist_head kasumi_paths[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_targets[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_hide_paths[1 << KASUMI_HASH_BITS];
-extern struct xarray kasumi_allow_uids_xa;
 extern struct hlist_head kasumi_inject_dirs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_xattr_sbs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_merge_dirs[1 << KASUMI_HASH_BITS];
@@ -61,7 +60,6 @@ extern struct list_head kasumi_maps_rules;
 extern struct mutex kasumi_config_mutex;
 extern struct mutex kasumi_maps_mutex;
 
-extern bool kasumi_allowlist_loaded;
 extern unsigned long kasumi_path_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 extern unsigned long kasumi_hide_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 
@@ -75,6 +73,9 @@ void kasumi_mark_dir_has_inject(const char *path_str);
 void kasumi_clear_inode_flags_for_path(const char *path_str, unsigned int bit);
 void kasumi_cleanup_locked(void);
 
+int kasumi_entry_capture_source(struct kasumi_entry *entry,
+				const char *source_path);
+void kasumi_entry_release_source(struct kasumi_entry *entry);
 void kasumi_entry_free_rcu(struct rcu_head *head);
 void kasumi_hide_entry_free_rcu(struct rcu_head *head);
 void kasumi_inject_entry_free_rcu(struct rcu_head *head);

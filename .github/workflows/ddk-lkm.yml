@@ -14,7 +14,7 @@ on:
       ddk_release:
         description: "DDK release version"
         required: false
-        default: "20251104"
+        default: "20260828"
         type: string
 
 jobs:

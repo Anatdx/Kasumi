@@ -43,9 +43,6 @@
 #define KASUMI_KSU_MAX_GROUPS         32
 #define KASUMI_KSU_SELINUX_DOMAIN     64
 
-#define KASUMI_DEFAULT_MIRROR_NAME    "kasumi_mirror"
-#define KASUMI_DEFAULT_MIRROR_PATH    "/dev/" KASUMI_DEFAULT_MIRROR_NAME
-
 #define KASUMI_PATH_BUF               512
 #define KASUMI_ITERATE_PATH_BUF       512
 

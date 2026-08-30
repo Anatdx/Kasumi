@@ -22,6 +22,7 @@
 
 #include "kasumi_root_detection.h"
 #include "kasumi_runtime.h"
+#include "kasumi_path_policy.h"
 
 #define KASUMI_KP_SYMBOL_NAME_LEN 32
 #define KASUMI_KP_SYMBOL_SIZE 48
@@ -76,7 +77,9 @@ struct kasumi_kp_vmap_node {
 
 int kasumi_root_mask;
 int kasumi_ksu_dispatcher_nr = -1;
+int kasumi_root_policy_owner = KSM_POLICY_OWNER_DISABLED;
 bool kasumi_root_spoof_allowed;
+bool kasumi_ksu_policy_available;
 const char *(*kasumi_ap_su_get_path)(void);
 int (*kasumi_ap_is_su_allow_uid)(uid_t uid);
 int (*kasumi_ap_su_allow_uid_nums)(void);
@@ -89,6 +92,7 @@ int (*kasumi_ap_read_kstorage)(int gid, long did, void *data, int offset,
 			       int len, bool data_is_user);
 int (*kasumi_ap_list_kstorage_ids)(int gid, long *ids, int idslen,
 				   bool data_is_user);
+bool kasumi_apatch_policy_lifetime_stable;
 
 static long (*kasumi_copy_from_kernel_nofault_fn)(void *dst, const void *src,
 						  size_t size);
@@ -115,6 +119,7 @@ static KASUMI_NOCFI void kasumi_close_file(struct file *file)
 
 static void kasumi_ap_clear_symbols(void)
 {
+	kasumi_apatch_policy_lifetime_stable = false;
 	kasumi_ap_su_get_path = NULL;
 	kasumi_ap_is_su_allow_uid = NULL;
 	kasumi_ap_su_allow_uid_nums = NULL;
@@ -201,6 +206,7 @@ static bool kasumi_kp_parse_table(unsigned long su_name_addr)
 	if (!a)
 		return false;
 	kasumi_ap_get_mod_exclude = (void *)a;
+	kasumi_apatch_policy_lifetime_stable = true;
 
 	kasumi_ap_su_get_path = (void *)(unsigned long)sym.addr;
 	kasumi_ap_is_su_allow_uid =
@@ -397,12 +403,18 @@ static bool kasumi_apatch_detect(void)
 	kasumi_ap_clear_symbols();
 
 	a = kasumi_lookup_callable_quiet("su_get_path");
+	if (!a)
+		a = kasumi_lookup_callable_quiet("kp_su_get_path");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_ap_su_get_path = (void *)a;
 		kasumi_ap_su_allow_uid_profile =
 			(void *)kasumi_lookup_callable_quiet("su_allow_uid_profile");
 		kasumi_ap_get_mod_exclude =
 			(void *)kasumi_lookup_callable_quiet("get_ap_mod_exclude");
+		if (!kasumi_ap_get_mod_exclude)
+			kasumi_ap_get_mod_exclude =
+				(void *)kasumi_lookup_callable_quiet(
+					"kp_su_get_ap_mod_exclude");
 		pr_info("Kasumi: APatch sucompat detected via kallsyms\n");
 		return true;
 	}
@@ -413,6 +425,30 @@ static bool kasumi_apatch_detect(void)
 	}
 
 	return false;
+}
+
+bool kasumi_refresh_apatch_policy(void)
+{
+	bool detected = kasumi_apatch_detect();
+
+	if (detected)
+		kasumi_root_mask |= KASUMI_ROOT_APATCH;
+	return detected && kasumi_ap_get_mod_exclude;
+}
+
+bool kasumi_probe_apatch_policy(unsigned long *addr, bool *lifetime_stable)
+{
+	bool available = kasumi_refresh_apatch_policy();
+
+	if (addr)
+		*addr = available ? (unsigned long)kasumi_ap_get_mod_exclude : 0;
+	if (lifetime_stable)
+		*lifetime_stable = available &&
+			kasumi_apatch_policy_lifetime_stable;
+	/* The caller decides when the probed provider becomes visible. */
+	WRITE_ONCE(kasumi_ap_get_mod_exclude, NULL);
+	kasumi_apatch_policy_lifetime_stable = false;
+	return available;
 }
 
 static bool kasumi_path_exists(const char *path)
@@ -453,34 +489,13 @@ static bool kasumi_ksu_detect(void)
 	a = kasumi_lookup_callable_quiet("ksu_uid_should_umount");
 	if (a && kasumi_valid_kernel_addr(a)) {
 		kasumi_root_mask |= KASUMI_ROOT_KSU;
-		kasumi_ksu_uid_should_umount_ptr = (void *)a;
 		seen = true;
 		has_policy = true;
-	}
-
-	a = kasumi_lookup_callable_quiet("ksu_get_allow_list");
-	if (a && kasumi_valid_kernel_addr(a)) {
-		kasumi_root_mask |= KASUMI_ROOT_KSU;
-		kasumi_ksu_get_allow_list_ptr = (void *)a;
-		seen = true;
-		has_policy = true;
-	}
-
-	if (seen) {
-		a = kasumi_lookup_callable_quiet("__ksu_is_allow_uid_for_current");
-		if (a && kasumi_valid_kernel_addr(a))
-			kasumi_ksu_is_allow_uid_ptr = (void *)a;
-		if (!kasumi_ksu_is_allow_uid_ptr) {
-			a = kasumi_lookup_callable_quiet("__ksu_is_allow_uid");
-			if (a && kasumi_valid_kernel_addr(a))
-				kasumi_ksu_is_allow_uid_ptr = (void *)a;
-		}
 	}
 
 	if (kasumi_path_exists(KASUMI_KSU_ALLOWLIST_PATH)) {
 		kasumi_root_mask |= KASUMI_ROOT_KSU;
 		seen = true;
-		has_policy = true;
 	}
 
 	if (seen)
@@ -525,15 +540,20 @@ void kasumi_root_detect(void)
 
 	kasumi_root_mask = KASUMI_ROOT_NONE;
 	kasumi_ksu_dispatcher_nr = -1;
+	kasumi_root_policy_owner = KSM_POLICY_OWNER_DISABLED;
 	kasumi_root_spoof_allowed = false;
+	kasumi_ksu_policy_available = false;
 
 	ksu_active = kasumi_ksu_detect();
+	kasumi_ksu_policy_available = ksu_active;
 	if (!ksu_active && (kasumi_root_mask & KASUMI_ROOT_KSU))
 		pr_warn("Kasumi: KernelSU detected without allowlist policy source\n");
 
 	if (kasumi_apatch_detect()) {
 		kasumi_root_mask |= KASUMI_ROOT_APATCH;
-		apatch_active = true;
+		apatch_active = kasumi_ap_get_mod_exclude != NULL;
+		if (!apatch_active)
+			pr_warn("Kasumi: APatch detected without module-exclude policy source\n");
 	} else {
 		apatch_active = false;
 	}
@@ -555,12 +575,14 @@ void kasumi_root_detect(void)
 	}
 
 	if (ksu_active) {
+		kasumi_root_policy_owner = KSM_POLICY_OWNER_KERNELSU;
 		kasumi_root_spoof_allowed = true;
 		pr_info("Kasumi: root policy owner: KernelSU\n");
 		return;
 	}
 
 	if (apatch_active) {
+		kasumi_root_policy_owner = KSM_POLICY_OWNER_APATCH;
 		kasumi_root_spoof_allowed = true;
 		pr_info("Kasumi: root policy owner: APatch\n");
 		return;
@@ -573,5 +595,9 @@ void kasumi_root_detect(void)
 
 bool kasumi_root_allows_spoofing(void)
 {
-	return READ_ONCE(kasumi_root_spoof_allowed);
+	u32 owner = kasumi_policy_effective_owner();
+
+	return owner == KSM_POLICY_OWNER_KERNELSU ||
+	       owner == KSM_POLICY_OWNER_APATCH ||
+	       owner == KSM_POLICY_OWNER_MANUAL;
 }

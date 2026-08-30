@@ -12,25 +12,24 @@
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 
 #include "kasumi_bootstrap.h"
 #include "kasumi_runtime.h"
 #include "kasumi_root_detection.h"
+#include "kasumi_path_policy.h"
 #include "kasumi_store.h"
-#include "kasumi_file_view.h"
+#include "kasumi_fop_bridge.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_proc_hooks.h"
 #include "kasumi_vfs_hooks.h"
-#include "kasumi_uname.h"
-#include "kasumi_sop_override.h"
-#include "kasumi_dop_override.h"
-#include "kasumi_xattr_sid_override.h"
 #include "kasumi_iop_override.h"
+#include "kasumi_dirhijack.h"
+#include "kasumi_sop_shadow.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
 #include "kasumi_fake_selinuxfs_access.h"
-#include "kasumi_syscall_redirect.h"
 
 #ifndef KASUMI_VERSION
 #define KASUMI_VERSION "0.1.0-dev"
@@ -38,7 +37,7 @@
 
 static int kasumi_no_tracepoint_param;
 module_param_named(kasumi_no_tracepoint, kasumi_no_tracepoint_param, int, 0600);
-MODULE_PARM_DESC(kasumi_no_tracepoint, "Deprecated compatibility knob; syscall hooks now patch syscall table entries directly.");
+MODULE_PARM_DESC(kasumi_no_tracepoint, "1=disable TSR; virtual path redirect is unavailable.");
 
 static int kasumi_skip_kallsyms_param;
 module_param_named(kasumi_skip_kallsyms, kasumi_skip_kallsyms_param, int, 0600);
@@ -47,6 +46,47 @@ MODULE_PARM_DESC(kasumi_skip_kallsyms, "1=skip kallsyms resolution, use per-symb
 static int kasumi_dummy_mode_param;
 module_param_named(kasumi_dummy_mode, kasumi_dummy_mode_param, int, 0600);
 MODULE_PARM_DESC(kasumi_dummy_mode, "1=exit immediately after init starts (for testing).");
+
+module_param_named(kasumi_fscaps, kasumi_fscaps_enabled, int, 0644);
+MODULE_PARM_DESC(kasumi_fscaps, "1=replay a redirected source's file capabilities onto exec (default 1).");
+
+module_param_named(kasumi_device_sources, kasumi_device_sources_enabled, int, 0644);
+MODULE_PARM_DESC(kasumi_device_sources, "1=serve char/blk/fifo source redirects via a vnode wrapper (default 1).");
+
+static char kasumi_owner_nonce[33];
+module_param_string(kasumi_owner_nonce, kasumi_owner_nonce,
+		    sizeof(kasumi_owner_nonce), 0400);
+MODULE_PARM_DESC(kasumi_owner_nonce, "Per-load userspace ownership token.");
+
+/* Keep ordinary delete_module() out of module_exit until PREPARE_UNLOAD has
+ * severed every external callback entry point.  The loader drops its initial
+ * reference only after ->init returns, leaving this one lifecycle reference.
+ */
+static bool kasumi_unload_pin_held;
+
+bool kasumi_bootstrap_quiesce_supported(void)
+{
+	if (!kasumi_module_refcount_ptr)
+		return false;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	return true;
+#else
+	return kasumi_fop_bridge_capable();
+#endif
+}
+
+bool kasumi_bootstrap_unload_pin_held(void)
+{
+	return READ_ONCE(kasumi_unload_pin_held);
+}
+
+void kasumi_bootstrap_release_unload_pin(void)
+{
+	if (WARN_ON_ONCE(!READ_ONCE(kasumi_unload_pin_held)))
+		return;
+	WRITE_ONCE(kasumi_unload_pin_held, false);
+	module_put(THIS_MODULE);
+}
 
 static noinline KASUMI_NOCFI void kasumi_resolve_system_dev(void)
 {
@@ -102,15 +142,63 @@ static int kasumi_resolve_runtime_symbols(void)
 		return -ENOENT;
 	}
 
-	kasumi_getname_kernel = (void *)kasumi_lookup_callable("getname_kernel");
-	if (!kasumi_getname_kernel)
-		pr_warn("Kasumi: getname_kernel not found, path redirect may fail\n");
-
 	kasumi_filp_open = (void *)kasumi_lookup_callable("filp_open");
 	kasumi_filp_close = (void *)kasumi_lookup_callable("filp_close");
-	kasumi_kernel_read = (void *)kasumi_lookup_callable("kernel_read");
 	kasumi_vfs_getattr = (void *)kasumi_lookup_callable("vfs_getattr");
+	kasumi_notify_change =
+		(void *)kasumi_lookup_callable_quiet("notify_change");
+	kasumi_vfs_getxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_getxattr");
+	kasumi_vfs_listxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_listxattr");
+	kasumi_vfs_setxattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_setxattr");
+	kasumi_vfs_removexattr_addr =
+		(void *)kasumi_lookup_callable_quiet("vfs_removexattr");
+	kasumi_mnt_want_write_addr =
+		(void *)kasumi_lookup_callable_quiet("mnt_want_write");
+	kasumi_mnt_drop_write_addr =
+		(void *)kasumi_lookup_callable_quiet("mnt_drop_write");
+	kasumi_vfs_path_lookup =
+		(void *)kasumi_lookup_callable_quiet("vfs_path_lookup");
+	kasumi_vfs_get_link =
+		(void *)kasumi_lookup_callable_quiet("vfs_get_link");
+	/* Directory-mutation delegates for redirected directory-source vnodes
+	 * (Final Phase 1b).  Quiet: absence only disables create/remove inside a
+	 * redirected directory (the op returns -EOPNOTSUPP), never crashes. */
+	kasumi_lookup_one_len =
+		(void *)kasumi_lookup_callable_quiet("lookup_one_len");
+	kasumi_vfs_create = (void *)kasumi_lookup_callable_quiet("vfs_create");
+	kasumi_vfs_mkdir = (void *)kasumi_lookup_callable_quiet("vfs_mkdir");
+	kasumi_vfs_mknod = (void *)kasumi_lookup_callable_quiet("vfs_mknod");
+	kasumi_vfs_symlink = (void *)kasumi_lookup_callable_quiet("vfs_symlink");
+	kasumi_vfs_unlink = (void *)kasumi_lookup_callable_quiet("vfs_unlink");
+	kasumi_vfs_rmdir = (void *)kasumi_lookup_callable_quiet("vfs_rmdir");
+	kasumi_vfs_link = (void *)kasumi_lookup_callable_quiet("vfs_link");
+	kasumi_vfs_rename = (void *)kasumi_lookup_callable_quiet("vfs_rename");
 	kasumi_dentry_open = (void *)kasumi_lookup_callable("dentry_open");
+	/* Data-plane delegates for char/blk/fifo source wrappers (special fops).
+	 * Optional: absence only disables read/write on a device/fifo redirect. */
+	kasumi_vfs_read = (void *)kasumi_lookup_callable_quiet("vfs_read");
+	kasumi_vfs_write = (void *)kasumi_lookup_callable_quiet("vfs_write");
+	/* Source file-capability reader for exec-path fscap replay (Item A).
+	 * Optional: absence only disables carrying a redirected setcap binary's
+	 * capabilities across exec, never crashes. */
+	kasumi_get_vfs_caps_from_disk =
+		(void *)kasumi_lookup_callable_quiet("get_vfs_caps_from_disk");
+	if (!kasumi_get_vfs_caps_from_disk)
+		pr_info("Kasumi: get_vfs_caps_from_disk unavailable, redirected file capabilities not carried across exec\n");
+	/* Public LSM secctx round-trip for cloning a source's SELinux context onto
+	 * a vnode.  Optional: absence only means vnodes fall back to the default
+	 * label (no crash), so resolve quietly and let callers null-check. */
+	kasumi_security_inode_getsecctx =
+		(void *)kasumi_lookup_callable_quiet("security_inode_getsecctx");
+	kasumi_security_inode_notifysecctx =
+		(void *)kasumi_lookup_callable_quiet("security_inode_notifysecctx");
+	kasumi_security_release_secctx =
+		(void *)kasumi_lookup_callable_quiet("security_release_secctx");
+	if (!kasumi_security_inode_getsecctx || !kasumi_security_inode_notifysecctx)
+		pr_info("Kasumi: secctx clone unavailable, vnode SELinux label falls back to default\n");
 	kasumi_d_absolute_path = (void *)kasumi_lookup_callable("d_absolute_path");
 	kasumi_dentry_path_raw = (void *)kasumi_lookup_callable("dentry_path_raw");
 	kasumi_strncpy_from_user_nofault = (void *)kasumi_lookup_callable("strncpy_from_user_nofault");
@@ -120,10 +208,37 @@ static int kasumi_resolve_runtime_symbols(void)
 	kasumi_copy_to_user_nofault = (void *)kasumi_lookup_callable("copy_to_user_nofault");
 	if (!kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault)
 		pr_warn("Kasumi: user nofault copy helpers not found, statx mount-id spoof disabled\n");
+	kasumi_task_work_add_ptr = (void *)kasumi_lookup_callable_quiet("task_work_add");
+	if (!kasumi_task_work_add_ptr) {
+		pr_err("Kasumi: FATAL - task_work_add not found\n");
+		return -ENOENT;
+	}
+	kasumi_llist_del_first_ptr =
+		(void *)kasumi_lookup_callable("llist_del_first");
+	if (!kasumi_llist_del_first_ptr) {
+		pr_err("Kasumi: FATAL - llist_del_first not found\n");
+		return -ENOENT;
+	}
+	kasumi_seq_read_iter_ptr =
+		(void *)kasumi_lookup_callable_quiet("seq_read_iter");
+	if (!kasumi_seq_read_iter_ptr)
+		pr_warn("Kasumi: seq_read_iter not found, legacy proc stream fallback disabled\n");
 	kasumi_call_srcu_ptr = (void *)kasumi_lookup_callable("call_srcu");
 	kasumi_srcu_barrier_ptr = (void *)kasumi_lookup_callable("srcu_barrier");
 	if (!kasumi_call_srcu_ptr || !kasumi_srcu_barrier_ptr) {
 		pr_err("Kasumi: FATAL - call_srcu/srcu_barrier not found\n");
+		return -ENOENT;
+	}
+	kasumi_synchronize_rcu_tasks_ptr =
+		(void *)kasumi_lookup_callable("synchronize_rcu_tasks");
+	if (!kasumi_synchronize_rcu_tasks_ptr) {
+		pr_err("Kasumi: FATAL - synchronize_rcu_tasks not found\n");
+		return -ENOENT;
+	}
+	kasumi_module_refcount_ptr =
+		(void *)kasumi_lookup_callable_quiet("module_refcount");
+	if (!kasumi_module_refcount_ptr) {
+		pr_err("Kasumi: FATAL - module_refcount not found\n");
 		return -ENOENT;
 	}
 	kasumi_d_path = (void *)kasumi_lookup_callable("d_path");
@@ -143,33 +258,17 @@ static int kasumi_resolve_runtime_symbols(void)
 	}
 	if (!kasumi_free_inode_nonrcu_ptr)
 		pr_warn("Kasumi: free_inode_nonrcu not found, sop fallback disabled\n");
-	if (!kasumi_filp_open || !kasumi_kernel_read)
-		pr_warn("Kasumi: filp_open/kernel_read not found, allowlist disabled\n");
-
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_callable("ksu_uid_should_umount");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_uid_should_umount_ptr = (kasumi_ksu_uid_should_umount_fn)addr;
-	}
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing()) {
-		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid_for_current");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-	if ((kasumi_root_mask & KASUMI_ROOT_KSU) &&
-	    kasumi_root_allows_spoofing() && !kasumi_ksu_is_allow_uid_ptr) {
-		unsigned long addr = kasumi_lookup_callable("__ksu_is_allow_uid");
-
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-
 	if (!kasumi_vfs_getattr || !kasumi_dentry_open)
 		pr_warn("Kasumi: vfs_getattr/dentry_open not found, merge whiteout/iterate disabled\n");
+	if (!kasumi_vfs_path_lookup)
+		pr_warn("Kasumi: vfs_path_lookup not found, virtual directory descendants disabled\n");
+	if (!kasumi_lookup_one_len || !kasumi_vfs_mkdir || !kasumi_vfs_unlink ||
+	    !kasumi_vfs_create)
+		pr_warn("Kasumi: dir-mutation delegates unavailable, create/remove inside a redirected directory disabled\n");
+	if (!kasumi_vfs_getxattr_addr || !kasumi_vfs_listxattr_addr ||
+	    !kasumi_vfs_setxattr_addr || !kasumi_vfs_removexattr_addr ||
+	    !kasumi_mnt_want_write_addr || !kasumi_mnt_drop_write_addr)
+		pr_warn("Kasumi: captured xattr helpers unavailable\n");
 	if (!kasumi_d_absolute_path && !kasumi_dentry_path_raw)
 		pr_warn("Kasumi: neither d_absolute_path nor dentry_path_raw found, inject/merge listing disabled\n");
 
@@ -213,9 +312,8 @@ int kasumi_bootstrap_init(void)
 	hash_init(kasumi_merge_dirs);
 
 	kasumi_percpu_base = vmalloc(nr_cpu_ids * sizeof(struct kasumi_percpu));
-	kasumi_getname_buf_base = vmalloc(nr_cpu_ids * KASUMI_PATH_BUF);
 	kasumi_iterate_buf_base = vmalloc(nr_cpu_ids * KASUMI_ITERATE_PATH_BUF);
-	if (!kasumi_percpu_base || !kasumi_getname_buf_base || !kasumi_iterate_buf_base) {
+	if (!kasumi_percpu_base || !kasumi_iterate_buf_base) {
 		ret = -ENOMEM;
 		pr_err("Kasumi: failed to allocate per-CPU buffers\n");
 		goto err_buffers;
@@ -224,35 +322,56 @@ int kasumi_bootstrap_init(void)
 
 	kasumi_resolve_system_dev();
 
-	(void)kasumi_syscall_redirect_init();
-
-	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param, 0);
+	ret = kasumi_fake_mi_init();
 	if (ret)
-		goto err_buffers;
+		pr_warn("Kasumi: fake mountinfo unavailable: %d\n", ret);
+
+	ret = kasumi_proc_hooks_init(0, kasumi_no_tracepoint_param);
+	if (ret)
+		goto err_redirect;
 
 	ret = kasumi_vfs_hooks_init(0);
 	if (ret)
-		goto err_proc;
+		goto err_active;
 
-	(void)kasumi_sop_override_init();
-	(void)kasumi_dop_override_init();
-	(void)kasumi_xattr_sid_override_init();
 	(void)kasumi_iop_override_init();
+	ret = kasumi_fop_bridge_init();
+	if (ret) {
+		pr_err("Kasumi: FATAL - old-KMI fops bridge unavailable: %d\n",
+		       ret);
+		goto err_fop_bridge;
+	}
 	(void)kasumi_fop_override_init();
-	(void)kasumi_fake_mi_init();
+	(void)kasumi_sop_shadow_init();
+	(void)kasumi_dirhijack_init();
 
+	/* On old KMI, the first ingress table published below is the module-init
+	 * commit point: bridge-open files may already pin THIS_MODULE. Keep every
+	 * later initialization step non-fatal.
+	 */
 	(void)kasumi_fake_selinuxfs_access_init();
+	if (kasumi_bootstrap_quiesce_supported()) {
+		__module_get(THIS_MODULE);
+		WRITE_ONCE(kasumi_unload_pin_held, true);
+	}
+	kasumi_proc_hooks_start();
 	pr_alert("Kasumi: Chikyuu ga buttobu kurai tanoshinjaoo!!\n");
 	return 0;
 
-err_proc:
+err_fop_bridge:
+	kasumi_fop_bridge_exit();
+	kasumi_iop_override_exit();
+	kasumi_vfs_hooks_exit(0);
+err_active:
 	kasumi_proc_hooks_exit();
+	kasumi_fake_mi_exit();
+	goto err_buffers;
+err_redirect:
+	kasumi_fake_mi_exit();
 err_buffers:
 	vfree(kasumi_percpu_base);
-	vfree(kasumi_getname_buf_base);
 	vfree(kasumi_iterate_buf_base);
 	kasumi_percpu_base = NULL;
-	kasumi_getname_buf_base = NULL;
 	kasumi_iterate_buf_base = NULL;
 err_cache:
 	if (kasumi_filldir_cache) {
@@ -264,55 +383,41 @@ err_cache:
 
 void kasumi_bootstrap_exit(void)
 {
-	struct kasumi_cmdline_rcu *old_cmdline;
-
 	pr_info("Kasumi: shutting down\n");
+	WARN_ON_ONCE(READ_ONCE(kasumi_unload_pin_held));
 
 	/*
-	 * PHASE 1: Sever every entry point that can drive a syscall hook.
-	 *
-	 *  1. syscall_redirect_exit() restores every patched sys_call_table
-	 *     entry and waits via SRCU for in-flight syscall-table wrappers and
-	 *     their handlers to drain.
-	 *
-	 * Ordering matters: relative to KSU's manager_exit, this is the
-	 * syscall_table -> hooks teardown.  Any cleanup that frees
-	 * resources reachable from h_openat/h_statfs/etc. (proc fd proxies,
-	 * fake mountinfo, fop/iop shadows, vfs ftrace hooks) MUST run after
-	 * this phase, otherwise a high-frequency syscall (e.g. read) will UAF
-	 * those resources mid-teardown.
+	 * The path view is served entirely through the VFS lookup/vnode layer and
+	 * the proc/mountinfo kprobes; there is no syscall dispatcher or sys_enter
+	 * tracepoint to sever.  Tear down handler-reachable state directly: free
+	 * the resources those VFS/proc hooks depend on (proc fd proxies, fake
+	 * mountinfo, fop/iop shadows, vfs hooks).
 	 */
-	kasumi_syscall_redirect_exit();
-
-	/* PHASE 2: handlers can no longer be reached, free their dependencies. */
-	kasumi_file_view_shutdown();
 	kasumi_proc_hooks_exit();
 	kasumi_vfs_hooks_exit(0);
+	kasumi_fake_selinuxfs_access_stop_new();
+	kasumi_dirhijack_stop_new();
+	kasumi_sop_shadow_stop_new();
+	kasumi_dirhijack_exit();
+	kasumi_fop_override_stop_new();
+	kasumi_fop_bridge_stop_new();
 	kasumi_fake_selinuxfs_access_exit();
 	kasumi_fop_override_exit();
+	kasumi_fop_bridge_exit();
 	kasumi_iop_override_exit();
-	kasumi_xattr_sid_override_exit();
-	kasumi_dop_override_exit();
-	kasumi_sop_override_exit();
+	kasumi_sop_shadow_exit();
 	kasumi_fake_mi_exit();
-	kasumi_uname_exit();
-
 	mutex_lock(&kasumi_config_mutex);
 	kasumi_cleanup_locked();
-	old_cmdline = rcu_dereference_protected(kasumi_spoof_cmdline_ptr,
-						lockdep_is_held(&kasumi_config_mutex));
-	rcu_assign_pointer(kasumi_spoof_cmdline_ptr, NULL);
+	kasumi_policy_shutdown_locked();
 	mutex_unlock(&kasumi_config_mutex);
 
 	rcu_barrier();
-	kfree(old_cmdline);
 	if (kasumi_filldir_cache)
 		kmem_cache_destroy(kasumi_filldir_cache);
 	vfree(kasumi_percpu_base);
-	vfree(kasumi_getname_buf_base);
 	vfree(kasumi_iterate_buf_base);
 	kasumi_percpu_base = NULL;
-	kasumi_getname_buf_base = NULL;
 	kasumi_iterate_buf_base = NULL;
 	pr_alert("Kasumi: Goseichou thank you!!!\n");
 }

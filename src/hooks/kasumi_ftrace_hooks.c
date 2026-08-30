@@ -89,17 +89,6 @@ static inline struct kretprobe_instance *kasumi_fake_ri_init(unsigned char *buf,
 	return ri;
 }
 
-/* Forward declarations: handlers implemented by feature modules. */
-extern int kasumi_krp_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_d_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_d_path_ret(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_iterate_dir_ret(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_vfs_getxattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_krp_vfs_getxattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs);
-extern int kasumi_kp_iterate_dir_pre(struct kprobe *p, struct pt_regs *regs);
-
-
 static void kasumi_ftrace_callback(unsigned long ip, unsigned long parent_ip,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 				struct ftrace_ops *op, struct pt_regs *regs)

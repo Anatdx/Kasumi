@@ -37,12 +37,12 @@
 #include <linux/fcntl.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
-#include <linux/utsname.h>
 #include <linux/mount.h>
 #include <linux/xattr.h>
 #include <linux/seq_file.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/xarray.h>
 #include <uapi/linux/magic.h>
 #ifndef EROFS_SUPER_MAGIC
 #define EROFS_SUPER_MAGIC 0xe0f5e1e2
@@ -52,6 +52,7 @@
 #include "kasumi_runtime.h"
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
+#include "kasumi_dirhijack.h"
 /* ======================================================================
  * Part 11: Core Logic - Privileged Check / Allowlist
  * ====================================================================== */
@@ -67,43 +68,593 @@ bool kasumi_is_privileged_process(void)
 	return false;
 }
 
-static bool kasumi_uid_in_allowlist(uid_t uid)
-{
-	void *p;
-
-	rcu_read_lock();
-	if (!READ_ONCE(kasumi_allowlist_loaded)) {
-		rcu_read_unlock();
-		return false;
-	}
-	p = xa_load(&kasumi_allow_uids_xa, uid);
-	rcu_read_unlock();
-	return p != NULL;
-}
-
-static void kasumi_clear_allowlist_cache(void)
-{
-	WRITE_ONCE(kasumi_allowlist_loaded, false);
-	synchronize_rcu();
-	xa_destroy(&kasumi_allow_uids_xa);
-}
-
 /*
- * Mirror KernelSU's isolated-process uid bucket so Kasumi hide/spoof rules
- * stay aligned with kernel_umount. Otherwise an app's isolated/app-zygote
- * helper process can end up in the "modules already detached, but fake view
- * not applied" gap that detectors look for during startup preload.
+ * KernelSU's kernel_umount caller gates ksu_uid_should_umount() with these
+ * Android app/isolated ranges. The scalar provider alone can return its
+ * default profile for shell or system UIDs, which are not policy targets.
+ * Keep the same outer boundary for every Kasumi policy owner.
  */
-#define KASUMI_KSU_PER_USER_RANGE      100000
-#define KASUMI_KSU_FIRST_ISOLATED_UID   99000
-#define KASUMI_KSU_LAST_ISOLATED_UID    99999
+#define KASUMI_ANDROID_PER_USER_RANGE      100000
+#define KASUMI_ANDROID_FIRST_APP_UID        10000
+#define KASUMI_ANDROID_LAST_APP_UID         19999
+#define KASUMI_ANDROID_FIRST_ISOLATED_UID   90000
+#define KASUMI_ANDROID_LAST_ISOLATED_UID    99999
+
+static inline bool kasumi_uid_is_app(uid_t uid)
+{
+	uid_t appid = uid % KASUMI_ANDROID_PER_USER_RANGE;
+
+	return appid >= KASUMI_ANDROID_FIRST_APP_UID &&
+	       appid <= KASUMI_ANDROID_LAST_APP_UID;
+}
 
 static inline bool kasumi_uid_is_isolated(uid_t uid)
 {
-	uid_t appid = uid % KASUMI_KSU_PER_USER_RANGE;
+	uid_t appid = uid % KASUMI_ANDROID_PER_USER_RANGE;
 
-	return appid >= KASUMI_KSU_FIRST_ISOLATED_UID &&
-	       appid <= KASUMI_KSU_LAST_ISOLATED_UID;
+	return appid >= KASUMI_ANDROID_FIRST_ISOLATED_UID &&
+	       appid <= KASUMI_ANDROID_LAST_ISOLATED_UID;
+}
+
+struct kasumi_policy_snapshot {
+	struct rcu_head rcu;
+	u64 generation;
+	u32 owner;
+	u32 flags;
+	u32 allow_count;
+	u32 deny_count;
+	struct xarray allow_uids;
+	struct xarray deny_uids;
+	u32 *allow_uid_list;
+	u32 *deny_uid_list;
+};
+
+static struct kasumi_policy_snapshot __rcu *kasumi_policy_current;
+static atomic64_t kasumi_policy_generation = ATOMIC64_INIT(0);
+static struct module *kasumi_ksu_provider_module;
+static struct module *kasumi_apatch_provider_module;
+static struct module *(*kasumi_module_address_ptr)(unsigned long addr);
+static int (*kasumi_core_kernel_text_ptr)(unsigned long addr);
+
+static KASUMI_NOCFI bool kasumi_policy_resolve_module_address(void)
+{
+	if (!kasumi_module_address_ptr)
+		kasumi_module_address_ptr =
+			(void *)kasumi_lookup_callable_quiet("__module_address");
+	return kasumi_module_address_ptr != NULL;
+}
+
+static KASUMI_NOCFI bool kasumi_policy_pin_stable_provider(unsigned long addr,
+							    struct module **owner)
+{
+	struct module *provider;
+	bool module_address;
+
+	if (!addr)
+		return false;
+	if (*owner)
+		return true;
+	if (!kasumi_policy_resolve_module_address())
+		return false;
+	if (!kasumi_core_kernel_text_ptr)
+		kasumi_core_kernel_text_ptr =
+			(void *)kasumi_lookup_callable_quiet("core_kernel_text");
+	preempt_disable();
+	provider = kasumi_module_address_ptr(addr);
+	module_address = provider != NULL;
+	if (provider && !try_module_get(provider))
+		provider = NULL;
+	preempt_enable();
+	if (provider)
+		*owner = provider;
+	if (module_address)
+		return provider != NULL;
+	/* Reject unpinnable vmalloc/KPM text; only built-in core text is stable. */
+	return kasumi_core_kernel_text_ptr && kasumi_core_kernel_text_ptr(addr);
+}
+
+static KASUMI_NOCFI bool kasumi_policy_pin_linux_module(unsigned long addr,
+						 struct module **owner,
+						 bool *is_module)
+{
+	struct module *provider;
+
+	if (!addr)
+		return false;
+	if (*owner) {
+		*is_module = true;
+		return true;
+	}
+	if (!kasumi_policy_resolve_module_address())
+		return false;
+	preempt_disable();
+	provider = kasumi_module_address_ptr(addr);
+	*is_module = provider != NULL;
+	if (provider && !try_module_get(provider))
+		provider = NULL;
+	preempt_enable();
+	if (provider)
+		*owner = provider;
+	return provider != NULL;
+}
+
+static void kasumi_policy_unpin_provider(void)
+{
+	if (kasumi_ksu_provider_module) {
+		module_put(kasumi_ksu_provider_module);
+		kasumi_ksu_provider_module = NULL;
+	}
+	if (kasumi_apatch_provider_module) {
+		module_put(kasumi_apatch_provider_module);
+		kasumi_apatch_provider_module = NULL;
+	}
+}
+
+static int kasumi_policy_owner_valid(u32 owner)
+{
+	switch (owner) {
+	case KSM_POLICY_OWNER_AUTO:
+	case KSM_POLICY_OWNER_KERNELSU:
+	case KSM_POLICY_OWNER_APATCH:
+	case KSM_POLICY_OWNER_MANUAL:
+	case KSM_POLICY_OWNER_DISABLED:
+		return 0;
+	case KSM_POLICY_OWNER_MAGISK:
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int kasumi_policy_values_valid(u32 owner, u32 flags,
+				      const u32 *allow_uids, u32 allow_count,
+				      const u32 *deny_uids, u32 deny_count)
+{
+	u32 supported = KSM_POLICY_FLAG_USE_ALLOW_UIDS |
+			KSM_POLICY_FLAG_USE_DENY_UIDS |
+			KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS;
+	u32 i;
+	int ret;
+
+	ret = kasumi_policy_owner_valid(owner);
+	if (ret)
+		return ret;
+	if (flags & ~supported)
+		return -EINVAL;
+	if ((flags & KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS) &&
+	    !(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS))
+		return -EINVAL;
+	if (owner == KSM_POLICY_OWNER_MANUAL &&
+	    !(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS))
+		return -EINVAL;
+	if (allow_count > KASUMI_ALLOWLIST_UID_MAX ||
+	    deny_count > KASUMI_ALLOWLIST_UID_MAX)
+		return -E2BIG;
+	if ((allow_count && !allow_uids) || (deny_count && !deny_uids))
+		return -EINVAL;
+	if (allow_count && !(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS))
+		return -EINVAL;
+	if (deny_count && !(flags & KSM_POLICY_FLAG_USE_DENY_UIDS))
+		return -EINVAL;
+	for (i = 0; i < allow_count; i++)
+		if (allow_uids[i] == 0)
+			return -EINVAL;
+	for (i = 0; i < deny_count; i++)
+		if (deny_uids[i] == 0)
+			return -EINVAL;
+	return 0;
+}
+
+static void kasumi_policy_snapshot_destroy(struct kasumi_policy_snapshot *policy)
+{
+	if (!policy)
+		return;
+	xa_destroy(&policy->allow_uids);
+	xa_destroy(&policy->deny_uids);
+	kfree(policy->allow_uid_list);
+	kfree(policy->deny_uid_list);
+	kfree(policy);
+}
+
+static void kasumi_policy_snapshot_free_rcu(struct rcu_head *head)
+{
+	struct kasumi_policy_snapshot *policy =
+		container_of(head, struct kasumi_policy_snapshot, rcu);
+
+	kasumi_policy_snapshot_destroy(policy);
+}
+
+static int kasumi_policy_build_uid_list(struct xarray *xa, u32 **snapshot,
+					u32 *snapshot_count, const u32 *uids,
+					u32 count)
+{
+	u32 *dense = NULL;
+	u32 i;
+	u32 j;
+	u32 out = 0;
+	u32 value;
+	int ret;
+
+	if (count) {
+		dense = kmalloc_array(count, sizeof(*dense), GFP_KERNEL);
+		if (!dense)
+			return -ENOMEM;
+	}
+	for (i = 0; i < count; i++) {
+		if (xa_load(xa, uids[i]))
+			continue;
+		ret = xa_err(xa_store(xa, uids[i], KASUMI_UID_ALLOW_MARKER,
+				      GFP_KERNEL));
+		if (ret) {
+			kfree(dense);
+			return ret;
+		}
+		dense[out++] = uids[i];
+	}
+	/* Canonical snapshots make GET results stable across input ordering. */
+	for (i = 1; i < out; i++) {
+		value = dense[i];
+		j = i;
+		while (j > 0 && dense[j - 1] > value) {
+			dense[j] = dense[j - 1];
+			j--;
+		}
+		dense[j] = value;
+	}
+	*snapshot = dense;
+	*snapshot_count = out;
+	return 0;
+}
+
+static struct kasumi_policy_snapshot *
+kasumi_policy_snapshot_create(u32 owner, u32 flags,
+			      const u32 *allow_uids, u32 allow_count,
+			      const u32 *deny_uids, u32 deny_count)
+{
+	struct kasumi_policy_snapshot *policy;
+	int ret;
+
+	ret = kasumi_policy_values_valid(owner, flags, allow_uids, allow_count,
+					 deny_uids, deny_count);
+	if (ret)
+		return ERR_PTR(ret);
+	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
+	if (!policy)
+		return ERR_PTR(-ENOMEM);
+	xa_init(&policy->allow_uids);
+	xa_init(&policy->deny_uids);
+	policy->owner = owner;
+	policy->flags = flags;
+
+	ret = kasumi_policy_build_uid_list(&policy->allow_uids,
+					   &policy->allow_uid_list,
+					   &policy->allow_count,
+					   allow_uids, allow_count);
+	if (ret)
+		goto err;
+	ret = kasumi_policy_build_uid_list(&policy->deny_uids,
+					   &policy->deny_uid_list,
+					   &policy->deny_count,
+					   deny_uids, deny_count);
+	if (ret)
+		goto err;
+	return policy;
+
+err:
+	kasumi_policy_snapshot_destroy(policy);
+	return ERR_PTR(ret);
+}
+
+static void kasumi_policy_publish_locked(struct kasumi_policy_snapshot *policy)
+{
+	struct kasumi_policy_snapshot *old;
+
+	lockdep_assert_held(&kasumi_config_mutex);
+	old = rcu_dereference_protected(kasumi_policy_current,
+					lockdep_is_held(&kasumi_config_mutex));
+	policy->generation = atomic64_inc_return(&kasumi_policy_generation);
+	rcu_assign_pointer(kasumi_policy_current, policy);
+	if (old)
+		call_rcu(&old->rcu, kasumi_policy_snapshot_free_rcu);
+}
+
+static int kasumi_policy_publish_values_locked(u32 owner, u32 flags,
+					       const u32 *allow_uids,
+					       u32 allow_count,
+					       const u32 *deny_uids,
+					       u32 deny_count)
+{
+	struct kasumi_policy_snapshot *policy;
+
+	lockdep_assert_held(&kasumi_config_mutex);
+	policy = kasumi_policy_snapshot_create(owner, flags, allow_uids,
+					       allow_count, deny_uids,
+					       deny_count);
+	if (IS_ERR(policy))
+		return PTR_ERR(policy);
+	kasumi_policy_publish_locked(policy);
+	return 0;
+}
+
+u32 kasumi_policy_configured_owner(void)
+{
+	const struct kasumi_policy_snapshot *policy;
+	u32 owner = KSM_POLICY_OWNER_AUTO;
+
+	rcu_read_lock();
+	policy = rcu_dereference(kasumi_policy_current);
+	if (policy)
+		owner = policy->owner;
+	rcu_read_unlock();
+	return owner;
+}
+
+static u32 kasumi_policy_validate_effective_owner(u32 owner)
+{
+	if (owner == KSM_POLICY_OWNER_AUTO)
+		owner = READ_ONCE(kasumi_root_policy_owner);
+	if (owner == KSM_POLICY_OWNER_KERNELSU &&
+	    (!(READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU) ||
+	     !READ_ONCE(kasumi_ksu_policy_available)))
+		return KSM_POLICY_OWNER_DISABLED;
+	if (owner == KSM_POLICY_OWNER_APATCH &&
+	    (!(READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_APATCH) ||
+	     !kasumi_ap_get_mod_exclude))
+		return KSM_POLICY_OWNER_DISABLED;
+	if (owner == KSM_POLICY_OWNER_MAGISK || owner == KSM_POLICY_OWNER_AUTO)
+		return KSM_POLICY_OWNER_DISABLED;
+	return owner;
+}
+
+u32 kasumi_policy_effective_owner(void)
+{
+	return kasumi_policy_validate_effective_owner(
+		kasumi_policy_configured_owner());
+}
+
+int kasumi_policy_replace(u32 owner, u32 flags,
+			  const u32 *allow_uids, u32 allow_count,
+			  const u32 *deny_uids, u32 deny_count)
+{
+	int ret;
+
+	mutex_lock(&kasumi_config_mutex);
+	if (READ_ONCE(kasumi_enabled))
+		ret = -EBUSY;
+	else
+		ret = kasumi_policy_publish_values_locked(owner, flags,
+							  allow_uids, allow_count,
+							  deny_uids, deny_count);
+	mutex_unlock(&kasumi_config_mutex);
+	return ret;
+}
+
+int kasumi_set_policy_owner(u32 owner, u32 flags)
+{
+	const struct kasumi_policy_snapshot *old;
+	const u32 *allow_uids = NULL;
+	const u32 *deny_uids = NULL;
+	u32 allow_count = 0;
+	u32 deny_count = 0;
+	int ret;
+
+	mutex_lock(&kasumi_config_mutex);
+	if (READ_ONCE(kasumi_enabled)) {
+		mutex_unlock(&kasumi_config_mutex);
+		return -EBUSY;
+	}
+	old = rcu_dereference_protected(kasumi_policy_current,
+					lockdep_is_held(&kasumi_config_mutex));
+	if (old) {
+		allow_uids = old->allow_uid_list;
+		allow_count = old->allow_count;
+		deny_uids = old->deny_uid_list;
+		deny_count = old->deny_count;
+	}
+	if (!(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS)) {
+		allow_uids = NULL;
+		allow_count = 0;
+	}
+	if (!(flags & KSM_POLICY_FLAG_USE_DENY_UIDS)) {
+		deny_uids = NULL;
+		deny_count = 0;
+	}
+	ret = kasumi_policy_publish_values_locked(owner, flags, allow_uids,
+						  allow_count, deny_uids,
+						  deny_count);
+	mutex_unlock(&kasumi_config_mutex);
+	return ret;
+}
+
+int kasumi_replace_policy_uid_list(u32 list, const u32 *uids, u32 count)
+{
+	const struct kasumi_policy_snapshot *old;
+	const u32 *allow_uids = NULL;
+	const u32 *deny_uids = NULL;
+	u32 owner = KSM_POLICY_OWNER_AUTO;
+	u32 flags = 0;
+	u32 allow_count = 0;
+	u32 deny_count = 0;
+	int ret;
+
+	if (list != KSM_POLICY_UID_LIST_ALLOW &&
+	    list != KSM_POLICY_UID_LIST_DENY)
+		return -EINVAL;
+	if (count > KASUMI_ALLOWLIST_UID_MAX)
+		return -E2BIG;
+	if (count && !uids)
+		return -EINVAL;
+
+	mutex_lock(&kasumi_config_mutex);
+	if (READ_ONCE(kasumi_enabled)) {
+		mutex_unlock(&kasumi_config_mutex);
+		return -EBUSY;
+	}
+	old = rcu_dereference_protected(kasumi_policy_current,
+					lockdep_is_held(&kasumi_config_mutex));
+	if (old) {
+		owner = old->owner;
+		flags = old->flags;
+		allow_uids = old->allow_uid_list;
+		allow_count = old->allow_count;
+		deny_uids = old->deny_uid_list;
+		deny_count = old->deny_count;
+	}
+	if (list == KSM_POLICY_UID_LIST_ALLOW) {
+		allow_uids = uids;
+		allow_count = count;
+		flags |= KSM_POLICY_FLAG_USE_ALLOW_UIDS;
+	} else {
+		deny_uids = uids;
+		deny_count = count;
+		flags |= KSM_POLICY_FLAG_USE_DENY_UIDS;
+	}
+	ret = kasumi_policy_publish_values_locked(owner, flags, allow_uids,
+						  allow_count, deny_uids,
+						  deny_count);
+	mutex_unlock(&kasumi_config_mutex);
+	return ret;
+}
+
+int kasumi_clear_policy_uid_list(u32 list)
+{
+	const struct kasumi_policy_snapshot *old;
+	const u32 *allow_uids = NULL;
+	const u32 *deny_uids = NULL;
+	u32 owner = KSM_POLICY_OWNER_AUTO;
+	u32 flags = 0;
+	u32 allow_count = 0;
+	u32 deny_count = 0;
+	int ret;
+
+	if (list != KSM_POLICY_UID_LIST_ALLOW &&
+	    list != KSM_POLICY_UID_LIST_DENY &&
+	    list != KSM_POLICY_UID_LIST_ALL)
+		return -EINVAL;
+
+	mutex_lock(&kasumi_config_mutex);
+	if (READ_ONCE(kasumi_enabled)) {
+		mutex_unlock(&kasumi_config_mutex);
+		return -EBUSY;
+	}
+	old = rcu_dereference_protected(kasumi_policy_current,
+					lockdep_is_held(&kasumi_config_mutex));
+	if (old) {
+		owner = old->owner;
+		flags = old->flags;
+		allow_uids = old->allow_uid_list;
+		allow_count = old->allow_count;
+		deny_uids = old->deny_uid_list;
+		deny_count = old->deny_count;
+	}
+	if (list == KSM_POLICY_UID_LIST_ALLOW ||
+	    list == KSM_POLICY_UID_LIST_ALL) {
+		allow_uids = NULL;
+		allow_count = 0;
+		flags &= ~KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS;
+		/* MANUAL with an empty allow set is a valid fail-closed policy. */
+		if (owner != KSM_POLICY_OWNER_MANUAL)
+			flags &= ~KSM_POLICY_FLAG_USE_ALLOW_UIDS;
+	}
+	if (list == KSM_POLICY_UID_LIST_DENY ||
+	    list == KSM_POLICY_UID_LIST_ALL) {
+		deny_uids = NULL;
+		deny_count = 0;
+		flags &= ~KSM_POLICY_FLAG_USE_DENY_UIDS;
+	}
+	ret = kasumi_policy_publish_values_locked(owner, flags, allow_uids,
+						  allow_count, deny_uids,
+						  deny_count);
+	mutex_unlock(&kasumi_config_mutex);
+	return ret;
+}
+
+void kasumi_policy_get_state(struct kasumi_policy_state_arg *state)
+{
+	const struct kasumi_policy_snapshot *policy;
+
+	if (!state)
+		return;
+	rcu_read_lock();
+	policy = rcu_dereference(kasumi_policy_current);
+	if (policy) {
+		state->generation = policy->generation;
+		state->owner = policy->owner;
+		state->flags = policy->flags;
+		state->allow_count = policy->allow_count;
+		state->deny_count = policy->deny_count;
+	} else {
+		state->generation = 0;
+		state->owner = KSM_POLICY_OWNER_AUTO;
+		state->flags = 0;
+		state->allow_count = 0;
+		state->deny_count = 0;
+	}
+	state->effective_owner =
+		kasumi_policy_validate_effective_owner(state->owner);
+	state->detected_roots = READ_ONCE(kasumi_root_mask);
+	state->max_uid_count = KASUMI_ALLOWLIST_UID_MAX;
+	state->enabled = READ_ONCE(kasumi_enabled);
+	rcu_read_unlock();
+}
+
+int kasumi_policy_copy_uids(u32 list, u32 *uids, u32 capacity,
+			    u32 *copied, u32 *total, u64 *generation)
+{
+	const struct kasumi_policy_snapshot *policy;
+	const u32 *source = NULL;
+	u32 count = 0;
+	u32 nr;
+	u64 gen = 0;
+
+	if (list != KSM_POLICY_UID_LIST_ALLOW &&
+	    list != KSM_POLICY_UID_LIST_DENY)
+		return -EINVAL;
+	if (capacity && !uids)
+		return -EINVAL;
+
+	rcu_read_lock();
+	policy = rcu_dereference(kasumi_policy_current);
+	if (policy) {
+		gen = policy->generation;
+		if (list == KSM_POLICY_UID_LIST_ALLOW) {
+			source = policy->allow_uid_list;
+			count = policy->allow_count;
+		} else {
+			source = policy->deny_uid_list;
+			count = policy->deny_count;
+		}
+	}
+	nr = min(capacity, count);
+	if (nr)
+		memcpy(uids, source, nr * sizeof(*uids));
+	rcu_read_unlock();
+
+	if (copied)
+		*copied = nr;
+	if (total)
+		*total = count;
+	if (generation)
+		*generation = gen;
+	return 0;
+}
+
+int kasumi_policy_reset(void)
+{
+	return kasumi_policy_replace(KSM_POLICY_OWNER_AUTO, 0, NULL, 0, NULL, 0);
+}
+
+void kasumi_policy_shutdown_locked(void)
+{
+	struct kasumi_policy_snapshot *old;
+
+	lockdep_assert_held(&kasumi_config_mutex);
+	old = rcu_dereference_protected(kasumi_policy_current,
+					lockdep_is_held(&kasumi_config_mutex));
+	RCU_INIT_POINTER(kasumi_policy_current, NULL);
+	if (old)
+		call_rcu(&old->rcu, kasumi_policy_snapshot_free_rcu);
+	kasumi_policy_unpin_provider();
 }
 
 static bool kasumi_current_is_app_zygote(void)
@@ -120,90 +671,174 @@ static bool kasumi_current_is_app_zygote(void)
 		      suffix, suffix_len) == 0;
 }
 
-static KASUMI_NOCFI bool kasumi_apatch_should_apply_hide(uid_t uid)
+static KASUMI_NOCFI enum kasumi_policy_scope
+kasumi_policy_scope_for_uid(uid_t uid, bool require_enabled)
 {
-	if (kasumi_uid_is_isolated(uid))
-		return true;
-	if (!kasumi_ap_get_mod_exclude)
-		return false;
-	return kasumi_ap_get_mod_exclude(uid) != 0;
-}
+	struct kasumi_policy_snapshot *policy;
+	u32 configured_owner;
+	u32 owner;
+	u32 flags;
+	enum kasumi_policy_scope scope = KASUMI_POLICY_SCOPE_NONE;
+	bool allow_gate = true;
+	bool denied = false;
 
-
-KASUMI_NOCFI bool kasumi_should_apply_hide_rules(void)
-{
-	uid_t uid = __kuid_val(current_uid());
-
-	/* uid 0 (root) never sees spoofed view */
-	if (unlikely(uid == 0))
-		return false;
-	if (!kasumi_root_allows_spoofing())
-		return false;
-
-	if (kasumi_root_mask & KASUMI_ROOT_APATCH)
-		return kasumi_apatch_should_apply_hide(uid);
-
-	/*
-	 * Primary: semantically-correct kernel symbol "should this uid be
-	 * module-unmounted", which matches our hide intent exactly.
-	 */
-	if (kasumi_ksu_uid_should_umount_ptr)
-		return kasumi_ksu_uid_should_umount_ptr(uid) ||
-		       kasumi_uid_is_isolated(uid);
-
-	/*
-	 * Fallback: cached allowlist (populated from ksu_get_allow_list(allow=false)
-	 * or from parsing /data/adb/ksu/.allowlist). Presence in this set means
-	 * the uid is explicitly marked non-su in the KSU allowlist — treated as
-	 * "should apply hide". If we never loaded the list, conservatively do
-	 * NOT hide (avoid wrongly hiding root flow).
+	/* Provider/list state is published by SET_ENABLED; a disabled provider
+	 * projects nothing for anyone. */
+	if (require_enabled && !smp_load_acquire(&kasumi_enabled))
+		return KASUMI_POLICY_SCOPE_NONE;
+	/* Non-app, non-isolated UIDs -- system_server, init, native daemons, root,
+	 * shell -- default to VIEW so the system actually applies the module: PMS
+	 * and the OverlayManager must scan and enable a redirected priv-app / RRO,
+	 * init reads module files at boot, and so on. A detector cannot obtain a
+	 * system/root/shell UID, so there is no concealment need here; app and
+	 * isolated UIDs continue through the per-observer policy below. */
+	if (!kasumi_uid_is_app(uid) && !kasumi_uid_is_isolated(uid))
+		return KASUMI_POLICY_SCOPE_VIEW;
+	/* Isolated app processes always receive concealment, independently of
+	 * their transient UID and of any host-app allow/deny list.
 	 */
 	if (kasumi_uid_is_isolated(uid))
-		return true;
-	if (!READ_ONCE(kasumi_allowlist_loaded))
-		return false;
-	return kasumi_uid_in_allowlist(uid);
-}
+		return KASUMI_POLICY_SCOPE_SPOOF;
 
-static KASUMI_NOCFI bool kasumi_uid_should_umount_strict(uid_t uid)
-{
-	/* uid 0 (root) never sees spoofed view */
-	if (unlikely(uid == 0))
-		return false;
-	if (!kasumi_root_allows_spoofing())
-		return false;
+	rcu_read_lock();
+	policy = rcu_dereference(kasumi_policy_current);
+	configured_owner = policy ? policy->owner : KSM_POLICY_OWNER_AUTO;
+	flags = policy ? policy->flags : 0;
+	owner = configured_owner == KSM_POLICY_OWNER_AUTO ?
+		READ_ONCE(kasumi_root_policy_owner) : configured_owner;
 
-	if (kasumi_root_mask & KASUMI_ROOT_APATCH) {
-		if (!kasumi_ap_get_mod_exclude)
-			return false;
-		return kasumi_ap_get_mod_exclude(uid) != 0;
+	/* AUTO is valid only when root detection selected one supported provider. */
+	if (configured_owner == KSM_POLICY_OWNER_AUTO &&
+	    !READ_ONCE(kasumi_root_spoof_allowed))
+		goto out;
+
+	switch (owner) {
+	case KSM_POLICY_OWNER_KERNELSU: {
+		kasumi_ksu_uid_should_umount_fn provider;
+
+		if (!(READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_KSU))
+			break;
+		provider = READ_ONCE(kasumi_ksu_uid_should_umount_ptr);
+		if (!provider)
+			break;
+		scope = provider(uid) ? KASUMI_POLICY_SCOPE_SPOOF :
+			KASUMI_POLICY_SCOPE_VIEW;
+		break;
+	}
+	case KSM_POLICY_OWNER_APATCH: {
+		int (*provider)(uid_t uid) = READ_ONCE(kasumi_ap_get_mod_exclude);
+
+		if ((READ_ONCE(kasumi_root_mask) & KASUMI_ROOT_APATCH) &&
+		    provider)
+			scope = provider(uid) != 0 ?
+				KASUMI_POLICY_SCOPE_SPOOF : KASUMI_POLICY_SCOPE_VIEW;
+		break;
+	}
+	case KSM_POLICY_OWNER_MANUAL:
+		/* Manual policy has no inverse provider set. Its explicit allow
+		 * list therefore names spoof targets and never implicitly grants a
+		 * virtual view to every other application.
+		 */
+		if (flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS)
+			scope = KASUMI_POLICY_SCOPE_SPOOF;
+		break;
+	case KSM_POLICY_OWNER_DISABLED:
+	case KSM_POLICY_OWNER_MAGISK:
+	case KSM_POLICY_OWNER_AUTO:
+	default:
+		break;
 	}
 
-	if (kasumi_ksu_uid_should_umount_ptr)
-		return kasumi_ksu_uid_should_umount_ptr(uid);
+	/* MANUAL is fail-closed without an explicit allow policy. */
+	if (owner == KSM_POLICY_OWNER_MANUAL &&
+	    !(flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS))
+		allow_gate = false;
+	else if (flags & KSM_POLICY_FLAG_USE_ALLOW_UIDS)
+		allow_gate = policy && xa_load(&policy->allow_uids, uid) != NULL;
 
-	if (!READ_ONCE(kasumi_allowlist_loaded))
-		return false;
-	return kasumi_uid_in_allowlist(uid);
+	/* A deny entry is the final decision and wins over every other source. */
+	if ((flags & KSM_POLICY_FLAG_USE_DENY_UIDS) && policy)
+		denied = xa_load(&policy->deny_uids, uid) != NULL;
+
+out:
+	rcu_read_unlock();
+	return allow_gate && !denied ? scope : KASUMI_POLICY_SCOPE_NONE;
+}
+
+KASUMI_NOCFI enum kasumi_policy_scope kasumi_policy_current_scope(void)
+{
+	return kasumi_policy_scope_for_uid(__kuid_val(task_uid(current)), true);
+}
+
+bool kasumi_policy_current_is_view_target(void)
+{
+	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_VIEW;
+}
+
+bool kasumi_policy_current_is_spoof_target(void)
+{
+	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_SPOOF;
+}
+
+bool kasumi_policy_current_is_isolated(void)
+{
+	return kasumi_uid_is_isolated(__kuid_val(task_uid(current)));
+}
+
+KASUMI_NOCFI bool kasumi_policy_uid_is_view_target(uid_t uid)
+{
+	return kasumi_policy_scope_for_uid(uid, false) ==
+		KASUMI_POLICY_SCOPE_VIEW;
+}
+
+KASUMI_NOCFI bool kasumi_policy_uid_is_spoof_target(uid_t uid)
+{
+	return kasumi_policy_scope_for_uid(uid, false) ==
+		KASUMI_POLICY_SCOPE_SPOOF;
 }
 
 bool kasumi_current_is_selinux_guard_target(void)
 {
-	uid_t uid = __kuid_val(current_uid());
+	uid_t uid = __kuid_val(task_uid(current));
 
 	/*
-	 * SELinux Guard is narrower than normal hide/spoof policy. Only the
-	 * hidden app's app-zygote process receives fake SELinux answers; su/ksu,
-	 * root managers, shells, and daemons must observe the real policy even if
-	 * other hide rules would apply to their UID bucket.
+	 * Ordinary hidden apps retain the narrow app-zygote oracle guard. Android
+	 * isolated UIDs follow the all-isolated SPOOF boundary.
 	 */
-	return kasumi_current_is_app_zygote() &&
-	       kasumi_uid_should_umount_strict(uid);
+	return kasumi_policy_current_is_spoof_target() &&
+	       (kasumi_uid_is_isolated(uid) || kasumi_current_is_app_zygote());
 }
 
-static void kasumi_add_allow_uid(uid_t uid)
+static void kasumi_policy_mark_ksu_available(void)
 {
-	xa_store(&kasumi_allow_uids_xa, uid, KASUMI_UID_ALLOW_MARKER, GFP_KERNEL);
+	u32 root_mask = READ_ONCE(kasumi_root_mask);
+	bool ambiguous;
+
+	root_mask |= KASUMI_ROOT_KSU;
+	root_mask &= ~KASUMI_ROOT_NON_ROOT;
+	ambiguous = root_mask &
+		(KASUMI_ROOT_APATCH | KASUMI_ROOT_MAGISK | KASUMI_ROOT_MULTI);
+	/* A newly available second provider makes AUTO ambiguous and fail-closed. */
+	if (ambiguous) {
+		WRITE_ONCE(kasumi_root_spoof_allowed, false);
+		root_mask |= KASUMI_ROOT_MULTI;
+		WRITE_ONCE(kasumi_root_policy_owner, KSM_POLICY_OWNER_DISABLED);
+	} else {
+		WRITE_ONCE(kasumi_root_policy_owner, KSM_POLICY_OWNER_KERNELSU);
+	}
+	WRITE_ONCE(kasumi_root_mask, root_mask);
+	WRITE_ONCE(kasumi_ksu_policy_available, true);
+	if (!ambiguous)
+		WRITE_ONCE(kasumi_root_spoof_allowed, true);
+}
+
+static void kasumi_policy_mark_ksu_unavailable(void)
+{
+	WRITE_ONCE(kasumi_ksu_policy_available, false);
+	if (READ_ONCE(kasumi_root_policy_owner) == KSM_POLICY_OWNER_KERNELSU) {
+		WRITE_ONCE(kasumi_root_policy_owner, KSM_POLICY_OWNER_DISABLED);
+		WRITE_ONCE(kasumi_root_spoof_allowed, false);
+	}
 }
 
 /*
@@ -212,146 +847,166 @@ static void kasumi_add_allow_uid(uid_t uid)
  * time, so the module has zero direct VFS symbol dependencies.
  */
 /*
- * Reload the KSU allowlist cache. Tries three paths in order:
- *   1. ksu_uid_should_umount symbol — authoritative, no caching needed.
- *   2. ksu_get_allow_list(allow=false) — explicitly non-su allowlist entries
- *      (= apps marked for module unmount), cached into xarray.
- *   3. Parse /data/adb/ksu/.allowlist on disk with strict version gates.
- * Path 1 shortcuts: kasumi_should_apply_hide_rules will call the symbol directly.
+ * Reload the KernelSU provider. Only ksu_uid_should_umount is authoritative:
+ * bulk and on-disk profiles omit live default-profile semantics, so using
+ * either as a substitute could select the wrong apps.
  */
-KASUMI_NOCFI bool kasumi_reload_ksu_allowlist(void)
+static bool kasumi_policy_prepare_ksu_locked(void)
 {
-	struct file *fp;
-	loff_t off = 0;
-	u32 magic = 0, version = 0;
-	ssize_t ret;
-	struct kasumi_app_profile profile;
-	int count = 0;
+	unsigned long addr;
 
-	if (!mutex_trylock(&kasumi_config_mutex))
-		return false;
-
-	if (!(kasumi_root_mask & KASUMI_ROOT_KSU) ||
-	    !kasumi_root_allows_spoofing()) {
-		mutex_unlock(&kasumi_config_mutex);
-		return false;
+	lockdep_assert_held(&kasumi_config_mutex);
+	if (!kasumi_ksu_uid_should_umount_ptr) {
+		addr = kasumi_lookup_callable_quiet("ksu_uid_should_umount");
+		if (addr && kasumi_valid_kernel_addr(addr) &&
+		    kasumi_policy_pin_stable_provider(addr,
+					       &kasumi_ksu_provider_module))
+			WRITE_ONCE(kasumi_ksu_uid_should_umount_ptr,
+				   (kasumi_ksu_uid_should_umount_fn)addr);
 	}
-
-	/* Resolve symbols lazily (KSU may load after us). */
-	if (!kasumi_ksu_uid_should_umount_ptr && kasumi_kallsyms_lookup_name) {
-		unsigned long addr = kasumi_kallsyms_lookup_name("ksu_uid_should_umount");
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_uid_should_umount_ptr = (kasumi_ksu_uid_should_umount_fn)addr;
-	}
-	if (!kasumi_ksu_is_allow_uid_ptr && kasumi_kallsyms_lookup_name) {
-		unsigned long addr = kasumi_kallsyms_lookup_name("__ksu_is_allow_uid_for_current");
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-	if (!kasumi_ksu_is_allow_uid_ptr && kasumi_kallsyms_lookup_name) {
-		unsigned long addr = kasumi_kallsyms_lookup_name("__ksu_is_allow_uid");
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_is_allow_uid_ptr = (kasumi_ksu_is_allow_uid_fn)addr;
-	}
-	if (!kasumi_ksu_get_allow_list_ptr && kasumi_kallsyms_lookup_name) {
-		unsigned long addr = kasumi_kallsyms_lookup_name("ksu_get_allow_list");
-		if (addr && kasumi_valid_kernel_addr(addr))
-			kasumi_ksu_get_allow_list_ptr = (kasumi_ksu_get_allow_list_fn)addr;
-	}
-
-	/* Path 1: primary symbol resolved — no cache needed, gate is real-time. */
 	if (kasumi_ksu_uid_should_umount_ptr) {
-		kasumi_clear_allowlist_cache();
-		mutex_unlock(&kasumi_config_mutex);
+		if (!kasumi_policy_pin_stable_provider(
+			(unsigned long)kasumi_ksu_uid_should_umount_ptr,
+			&kasumi_ksu_provider_module)) {
+			WRITE_ONCE(kasumi_ksu_uid_should_umount_ptr, NULL);
+			kasumi_policy_mark_ksu_unavailable();
+			return false;
+		}
+		kasumi_policy_mark_ksu_available();
 		return true;
 	}
 
-	/* Path 2: bulk API — cache "non-su allowlist entries" (= umount-marked apps). */
-	if (kasumi_ksu_get_allow_list_ptr) {
-		int *arr = kmalloc(KASUMI_ALLOWLIST_UID_MAX * sizeof(int), GFP_KERNEL);
-
-		if (arr) {
-			u16 out_len = 0, out_total = 0;
-			bool ok = kasumi_ksu_get_allow_list_ptr(arr,
-							     (u16)KASUMI_ALLOWLIST_UID_MAX,
-							     &out_len, &out_total, false);
-
-			if (ok) {
-				kasumi_clear_allowlist_cache();
-				for (count = 0; count < out_len && count < KASUMI_ALLOWLIST_UID_MAX; count++)
-					if (arr[count] > 0)
-						kasumi_add_allow_uid((uid_t)arr[count]);
-				WRITE_ONCE(kasumi_allowlist_loaded, true);
-				if (out_len < out_total)
-					kasumi_log("allowlist truncated at %u (total %u)\n",
-						 out_len, out_total);
-				kfree(arr);
-				mutex_unlock(&kasumi_config_mutex);
-				return true;
-			}
-			kfree(arr);
-		}
-	}
-
-	/* Path 3: parse /data/adb/ksu/.allowlist directly. */
-	if (!kasumi_filp_open || !kasumi_kernel_read) {
-		mutex_unlock(&kasumi_config_mutex);
-		return false;
-	}
-
-	fp = kasumi_filp_open(KASUMI_KSU_ALLOWLIST_PATH, O_RDONLY, 0);
-	if (IS_ERR(fp)) {
-		kasumi_clear_allowlist_cache();
-		mutex_unlock(&kasumi_config_mutex);
-		return false;
-	}
-
-	ret = kasumi_kernel_read(fp, &magic, sizeof(magic), &off);
-	if (ret != sizeof(magic) || magic != KASUMI_KSU_ALLOWLIST_MAGIC)
-		goto bad;
-	ret = kasumi_kernel_read(fp, &version, sizeof(version), &off);
-	if (ret != sizeof(version) || version != KASUMI_KSU_FILE_FORMAT_VERSION) {
-		pr_warn("Kasumi: allowlist file version mismatch (got %u, expect %u)\n",
-			version, KASUMI_KSU_FILE_FORMAT_VERSION);
-		goto bad;
-	}
-
-	kasumi_clear_allowlist_cache();
-
-	while (kasumi_kernel_read(fp, &profile, sizeof(profile), &off) == sizeof(profile)) {
-		/* Skip mismatched per-profile versions: layout may differ. */
-		if (profile.version != KASUMI_KSU_APP_PROFILE_VER)
-			continue;
-		/* Match upstream ksu_uid_should_umount semantic: marked non-su and
-		 * either use_default (assumed true — user explicit add) or umount_modules. */
-		if (!profile.allow_su && profile.curr_uid > 0 &&
-		    (profile.nrp_config.use_default ||
-		     profile.nrp_config.profile.umount_modules)) {
-			kasumi_add_allow_uid((uid_t)profile.curr_uid);
-			if (++count >= KASUMI_ALLOWLIST_UID_MAX) {
-				kasumi_log("allowlist truncated at %d\n", count);
-				break;
-			}
-		}
-	}
-
-	if (kasumi_filp_close)
-		kasumi_filp_close(fp, NULL);
-	else
-		fput(fp);
-	WRITE_ONCE(kasumi_allowlist_loaded, true);
-	mutex_unlock(&kasumi_config_mutex);
-	return true;
-
-bad:
-	pr_warn("Kasumi: allowlist load failed (magic/version or read error)\n");
-	if (kasumi_filp_close)
-		kasumi_filp_close(fp, NULL);
-	else
-		fput(fp);
-	kasumi_clear_allowlist_cache();
-	mutex_unlock(&kasumi_config_mutex);
+	/*
+	 * Bulk/file fallbacks cannot reproduce ksu_uid_should_umount(): they omit
+	 * the live default non-root profile or have version-specific layouts. An
+	 * approximate cache risks selecting the wrong apps, so fail closed.
+	 */
+	kasumi_policy_mark_ksu_unavailable();
 	return false;
+}
+
+static bool kasumi_policy_prepare_apatch_addr_locked(unsigned long addr,
+						      bool lifetime_stable)
+{
+	bool is_module = false;
+
+	lockdep_assert_held(&kasumi_config_mutex);
+	if (!addr)
+		return false;
+	if (kasumi_policy_pin_linux_module(addr,
+					   &kasumi_apatch_provider_module,
+					   &is_module))
+		return true;
+	if (is_module)
+		goto unavailable;
+	if (lifetime_stable)
+		return true;
+	if (kasumi_policy_pin_stable_provider(addr, &kasumi_apatch_provider_module))
+		return true;
+unavailable:
+	WRITE_ONCE(kasumi_ap_get_mod_exclude, NULL);
+	WRITE_ONCE(kasumi_root_spoof_allowed, false);
+	WRITE_ONCE(kasumi_root_policy_owner, KSM_POLICY_OWNER_DISABLED);
+	return false;
+}
+
+bool kasumi_policy_prepare_enable_locked(void)
+{
+	unsigned long apatch_addr = 0;
+	unsigned long ksu_addr;
+	bool apatch_stable = false;
+	bool apatch_available;
+	bool ksu_available;
+	u32 configured_owner;
+	u32 provider_owner;
+	u32 root_mask;
+	bool ready = true;
+
+	lockdep_assert_held(&kasumi_config_mutex);
+	configured_owner = kasumi_policy_configured_owner();
+	provider_owner = configured_owner;
+	root_mask = READ_ONCE(kasumi_root_mask) &
+		(KASUMI_ROOT_KSU_RDR | KASUMI_ROOT_MAGISK);
+	/* AUTO is the default and must notice providers loaded after Kasumi. */
+	if (provider_owner == KSM_POLICY_OWNER_AUTO) {
+		ksu_addr = kasumi_lookup_callable_quiet("ksu_uid_should_umount");
+		ksu_available = ksu_addr && kasumi_valid_kernel_addr(ksu_addr);
+		apatch_available = kasumi_probe_apatch_policy(&apatch_addr,
+							 &apatch_stable);
+		if (ksu_available)
+			root_mask |= KASUMI_ROOT_KSU;
+		if (apatch_available)
+			root_mask |= KASUMI_ROOT_APATCH;
+		if (root_mask & (KASUMI_ROOT_KSU | KASUMI_ROOT_APATCH |
+				 KASUMI_ROOT_MAGISK))
+			root_mask &= ~KASUMI_ROOT_NON_ROOT;
+		else
+			root_mask |= KASUMI_ROOT_NON_ROOT;
+		if ((root_mask & KASUMI_ROOT_KSU) &&
+		    (root_mask & (KASUMI_ROOT_APATCH | KASUMI_ROOT_MAGISK)))
+			root_mask |= KASUMI_ROOT_MULTI;
+		WRITE_ONCE(kasumi_root_mask, root_mask);
+	}
+	if (provider_owner == KSM_POLICY_OWNER_AUTO) {
+		if (root_mask & KASUMI_ROOT_MULTI) {
+			provider_owner = KSM_POLICY_OWNER_DISABLED;
+			WRITE_ONCE(kasumi_root_policy_owner,
+				   KSM_POLICY_OWNER_DISABLED);
+			WRITE_ONCE(kasumi_root_spoof_allowed, false);
+			ready = false;
+		} else if ((root_mask & KASUMI_ROOT_KSU) &&
+			 !(root_mask & (KASUMI_ROOT_APATCH | KASUMI_ROOT_MAGISK)))
+			provider_owner = KSM_POLICY_OWNER_KERNELSU;
+		else if ((root_mask & KASUMI_ROOT_APATCH) &&
+			 !(root_mask & (KASUMI_ROOT_KSU | KASUMI_ROOT_MAGISK)))
+			provider_owner = KSM_POLICY_OWNER_APATCH;
+		else {
+			provider_owner = KSM_POLICY_OWNER_DISABLED;
+			ready = false;
+		}
+	}
+	if (provider_owner == KSM_POLICY_OWNER_KERNELSU)
+		ready = kasumi_policy_prepare_ksu_locked();
+	else if (provider_owner == KSM_POLICY_OWNER_APATCH) {
+		if (!apatch_addr)
+			apatch_available = kasumi_probe_apatch_policy(
+				&apatch_addr, &apatch_stable);
+		ready = apatch_available &&
+			kasumi_policy_prepare_apatch_addr_locked(apatch_addr,
+								 apatch_stable);
+		if (ready)
+			WRITE_ONCE(kasumi_ap_get_mod_exclude,
+				   (int (*)(uid_t))apatch_addr);
+		if (ready) {
+			root_mask = READ_ONCE(kasumi_root_mask) |
+				KASUMI_ROOT_APATCH;
+			root_mask &= ~KASUMI_ROOT_NON_ROOT;
+			WRITE_ONCE(kasumi_root_mask, root_mask);
+		}
+	}
+	if (configured_owner == KSM_POLICY_OWNER_AUTO) {
+		if (ready && provider_owner != KSM_POLICY_OWNER_DISABLED) {
+			WRITE_ONCE(kasumi_root_policy_owner, provider_owner);
+			WRITE_ONCE(kasumi_root_spoof_allowed, true);
+		} else {
+			WRITE_ONCE(kasumi_root_policy_owner,
+				   KSM_POLICY_OWNER_DISABLED);
+			WRITE_ONCE(kasumi_root_spoof_allowed, false);
+		}
+	}
+	return ready;
+}
+
+void kasumi_policy_disable_provider_locked(void)
+{
+	lockdep_assert_held(&kasumi_config_mutex);
+	WRITE_ONCE(kasumi_ksu_uid_should_umount_ptr, NULL);
+	WRITE_ONCE(kasumi_ap_get_mod_exclude, NULL);
+	kasumi_apatch_policy_lifetime_stable = false;
+	kasumi_policy_mark_ksu_unavailable();
+	/* Readers hold rcu_read_lock() while calling the provider. */
+	synchronize_rcu();
+	kasumi_policy_unpin_provider();
 }
 
 /* ======================================================================
@@ -366,19 +1021,13 @@ char *kasumi_resolve_target(const char *pathname)
 	size_t path_len;
 	pid_t pid;
 
-	if (unlikely(!kasumi_enabled || !pathname))
+	if (unlikely(!kasumi_enabled || !pathname ||
+		     !kasumi_policy_current_is_view_target()))
 		return NULL;
 
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
 		return NULL;
-	/*
-	 * ADD_RULE is an explicit path translation contract, not an app hide
-	 * policy decision. Keep it independent from kasumi_should_apply_hide_rules()
-	 * so root/manual tests and userspace-controlled redirects still work when
-	 * the hide allowlist has not selected the current UID.
-	 */
-
 	path_len = strlen(pathname);
 	hash = full_name_hash(NULL, pathname, path_len);
 
@@ -419,6 +1068,941 @@ char *kasumi_resolve_target(const char *pathname)
 	return target;
 }
 
+#define KASUMI_SYMLINK_LIMIT 40
+
+static bool kasumi_relative_path_safe(const char *path)
+{
+	const char *component = path;
+
+	while (component && *component) {
+		const char *slash = strchr(component, '/');
+		size_t length = slash ? (size_t)(slash - component) :
+			strlen(component);
+
+		if ((length == 1 && component[0] == '.') ||
+		    (length == 2 && component[0] == '.' && component[1] == '.'))
+			return false;
+		component = slash ? slash + 1 : NULL;
+	}
+	return true;
+}
+
+static bool KASUMI_NOCFI kasumi_rule_get_source_flags_depth(
+	const char *pathname, unsigned int lookup_flags,
+	struct kasumi_rule_source *source, unsigned int symlink_depth);
+
+void kasumi_project_visible_stat(struct kstat *result,
+				 const struct kstat *source_stat,
+				 const struct kstat *visible_template,
+				 bool preserve_visible_metadata,
+				 unsigned long visible_ino,
+				 unsigned long visible_dev)
+{
+	if (!result || !source_stat)
+		return;
+	if (preserve_visible_metadata && visible_template) {
+		*result = *visible_template;
+		result->mode = (source_stat->mode & S_IFMT) |
+			       (visible_template->mode & ~S_IFMT);
+		result->rdev = source_stat->rdev;
+		result->size = source_stat->size;
+		result->blocks = source_stat->blocks;
+		result->blksize = source_stat->blksize;
+		result->result_mask |= source_stat->result_mask &
+			(STATX_TYPE | STATX_MODE | STATX_SIZE | STATX_BLOCKS);
+	} else {
+		*result = *source_stat;
+	}
+	result->ino = visible_ino;
+	result->dev = visible_dev;
+}
+
+static int kasumi_visible_access_ids(const struct kstat *stat, int mode,
+				     const struct cred *cred, kuid_t uid,
+				     kgid_t gid)
+{
+	umode_t granted;
+
+	if (!stat)
+		return -ENOENT;
+	if (!mode)
+		return 0;
+	if (uid_eq(uid, stat->uid))
+		granted = (stat->mode >> 6) & 7;
+	else if (gid_eq(gid, stat->gid) || in_group_p(stat->gid))
+		granted = (stat->mode >> 3) & 7;
+	else
+		granted = stat->mode & 7;
+	if (!(mode & ~granted))
+		return 0;
+
+	/* Match access(2)'s namespace-root DAC override while retaining the
+	 * ordinary rule that a regular executable needs at least one x bit. */
+	if (uid_eq(uid, make_kuid(cred->user_ns, 0)) &&
+	    (!(mode & MAY_EXEC) || !S_ISREG(stat->mode) ||
+	     (stat->mode & 0111)))
+		return 0;
+	return -EACCES;
+}
+
+int kasumi_visible_access(const struct kstat *stat, int mode,
+			  bool effective_ids)
+{
+	const struct cred *cred = current_cred();
+	kuid_t uid = effective_ids ? cred->euid : cred->uid;
+	kgid_t gid = effective_ids ? cred->egid : cred->gid;
+
+	return kasumi_visible_access_ids(stat, mode, cred, uid, gid);
+}
+
+int kasumi_visible_open_access(const struct kstat *stat, int mode)
+{
+	const struct cred *cred = current_cred();
+
+	return kasumi_visible_access_ids(stat, mode, cred, cred->fsuid,
+					 cred->fsgid);
+}
+
+static bool kasumi_rule_refresh_exact_source(
+	struct kasumi_rule_source *source)
+{
+	struct kstat source_stat;
+	int ret;
+
+	if (!source || !source->path.dentry || !source->path.mnt)
+		return false;
+	if (!kasumi_vfs_getattr)
+		return source->stat_valid;
+	memset(&source_stat, 0, sizeof(source_stat));
+	ret = kasumi_vfs_getattr_unprojected(&source->path, &source_stat,
+				 STATX_BASIC_STATS | STATX_BTIME,
+				 AT_STATX_SYNC_AS_STAT);
+	if (ret) {
+		kasumi_path_put(&source->path);
+		source->stat_valid = false;
+		source->error = ret;
+		return false;
+	}
+	/* The pinned path fixes object identity across rename/unlink, but mutable
+	 * inode metadata must retain ordinary VFS behaviour after rule install. */
+	source->source_mode = source_stat.mode;
+	kasumi_project_visible_stat(&source->stat, &source_stat, &source->stat,
+				    source->preserve_visible_metadata,
+				    source->visible_ino,
+				    source->visible_dev);
+	source->stat_valid = true;
+	return true;
+}
+
+static bool kasumi_rule_source_from_path(struct path *resolved,
+					 struct kasumi_rule_source *source)
+{
+	struct inode *inode;
+	struct kstat stat;
+	int ret;
+
+	inode = resolved && resolved->dentry ? d_inode(resolved->dentry) : NULL;
+	if (!inode) {
+		kasumi_path_put(resolved);
+		source->error = -ENOENT;
+		return false;
+	}
+	memset(&stat, 0, sizeof(stat));
+	ret = kasumi_vfs_getattr_unprojected(resolved, &stat,
+				 STATX_BASIC_STATS | STATX_BTIME,
+				 AT_STATX_SYNC_AS_STAT);
+	if (ret) {
+		kasumi_path_put(resolved);
+		source->error = ret;
+		return false;
+	}
+	source->path = *resolved;
+	source->stat = stat;
+	source->visible_ino = kasumi_vnode_source_ino(
+		inode->i_sb ? inode->i_sb->s_dev : 0, inode->i_ino);
+	/* Scheme A: dynamic (directory/merge) sources have no cached visible dev.
+	 * Publish the captured /system dev — a real device and the correct one for
+	 * the common /system masquerade — rather than the anonymous vnode minor. */
+	source->visible_dev = kasumi_system_dev ? kasumi_system_dev :
+						  kasumi_vnode_device();
+	source->stat.ino = source->visible_ino;
+	source->stat.dev = source->visible_dev;
+	source->source_mode = stat.mode;
+	source->stat_valid = true;
+	source->preserve_visible_metadata = false;
+	return true;
+}
+
+static int kasumi_read_link_target(const struct path *link, char *target,
+				   size_t target_size)
+{
+	struct delayed_call done = {};
+	const char *value;
+	size_t length;
+	int ret = 0;
+
+	if (!link || !link->dentry || !target || target_size < 2 ||
+	    !kasumi_vfs_get_link)
+		return -EOPNOTSUPP;
+	value = kasumi_vfs_get_link(link->dentry, &done);
+	if (IS_ERR(value)) {
+		ret = PTR_ERR(value);
+		goto out;
+	}
+	if (!value) {
+		ret = -EIO;
+		goto out;
+	}
+	length = strnlen(value, target_size);
+	if (length >= target_size) {
+		ret = -ENAMETOOLONG;
+		goto out;
+	}
+	memcpy(target, value, length + 1);
+out:
+	do_delayed_call(&done);
+	return ret;
+}
+
+static bool KASUMI_NOCFI kasumi_follow_absolute_link(
+	const char *target, const char *remaining, unsigned int lookup_flags,
+	struct kasumi_rule_source *source, unsigned int symlink_depth)
+{
+	struct path resolved;
+	char *next;
+	size_t target_len;
+	size_t remaining_len;
+	int ret;
+
+	if (lookup_flags & LOOKUP_BENEATH) {
+		source->error = -EXDEV;
+		return false;
+	}
+	if (symlink_depth >= KASUMI_SYMLINK_LIMIT) {
+		source->error = -ELOOP;
+		return false;
+	}
+	target_len = strlen(target);
+	remaining_len = remaining ? strlen(remaining) : 0;
+	if (target_len + remaining_len + 1 > KSM_MAX_LEN_PATHNAME) {
+		source->error = -ENAMETOOLONG;
+		return false;
+	}
+	next = kmalloc(target_len + remaining_len + 1, GFP_KERNEL);
+	if (!next) {
+		source->error = -ENOMEM;
+		return false;
+	}
+	memcpy(next, target, target_len);
+	if (remaining_len) {
+		if (next[target_len - 1] == '/' &&
+		    remaining[0] == '/') {
+			memcpy(next + target_len, remaining + 1, remaining_len);
+		} else {
+			memcpy(next + target_len, remaining, remaining_len + 1);
+		}
+	} else {
+		next[target_len] = '\0';
+	}
+	if (kasumi_rule_get_source_flags_depth(next, lookup_flags, source,
+					       symlink_depth + 1)) {
+		kfree(next);
+		return true;
+	}
+	if (source->error) {
+		kfree(next);
+		return false;
+	}
+	if (kasumi_should_hide(next)) {
+		source->error = -ENOENT;
+		kfree(next);
+		return false;
+	}
+	ret = kasumi_kern_path(next, lookup_flags, &resolved);
+	kfree(next);
+	if (ret) {
+		source->error = ret;
+		return false;
+	}
+	return kasumi_rule_source_from_path(&resolved, source);
+}
+
+static bool KASUMI_NOCFI
+kasumi_directory_rule_source(const char *pathname, size_t path_len,
+			     unsigned int lookup_flags,
+			     struct kasumi_rule_source *source,
+			     unsigned int symlink_depth)
+{
+	struct kasumi_entry *entry;
+	struct path directory = {};
+	struct path resolved;
+	char *relative;
+	char *cursor;
+	size_t prefix_len = path_len;
+	bool pinned = false;
+	int ret;
+
+	if (!kasumi_vfs_path_lookup || !kasumi_vfs_getattr)
+		return false;
+	while (prefix_len > 1) {
+		size_t slash = prefix_len;
+		u32 hash;
+
+		while (slash > 0 && pathname[slash - 1] != '/')
+			slash--;
+		if (slash <= 1)
+			break;
+		prefix_len = slash - 1;
+		if (!kasumi_relative_path_safe(pathname + prefix_len + 1))
+			return false;
+		if (!test_bit(jhash(pathname, (u32)prefix_len, 0) &
+			      (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom) ||
+		    !test_bit(jhash(pathname, (u32)prefix_len, 1) &
+			      (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom))
+			continue;
+		hash = full_name_hash(NULL, pathname, prefix_len);
+		rcu_read_lock();
+		hlist_for_each_entry_rcu(entry,
+			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+			if (entry->src_hash != hash ||
+			    strlen(entry->src) != prefix_len ||
+			    memcmp(entry->src, pathname, prefix_len) != 0 ||
+			    !entry->source_path_valid ||
+			    !S_ISDIR(entry->source_mode))
+				continue;
+			directory = entry->source_path;
+			kasumi_path_get(&directory);
+			pinned = true;
+			break;
+		}
+		rcu_read_unlock();
+		if (pinned)
+			break;
+	}
+	if (!pinned)
+		return false;
+	relative = kstrdup(pathname + prefix_len + 1, GFP_KERNEL);
+	if (!relative) {
+		kasumi_path_put(&directory);
+		source->error = -ENOMEM;
+		return false;
+	}
+	ret = kasumi_vfs_path_lookup(directory.dentry, directory.mnt, relative,
+				     lookup_flags | LOOKUP_NO_SYMLINKS,
+				     &resolved);
+	if (!ret) {
+		kasumi_path_put(&directory);
+		kfree(relative);
+		return kasumi_rule_source_from_path(&resolved, source);
+	}
+	if (ret != -ELOOP || (lookup_flags & LOOKUP_NO_SYMLINKS)) {
+		source->error = ret;
+		goto out_relative;
+	}
+	if (kasumi_vfs_get_link) {
+		cursor = relative;
+		while (*cursor) {
+			struct path probe;
+			char target[KSM_MAX_LEN_PATHNAME];
+			char *slash = strchr(cursor, '/');
+			bool final = !slash;
+			char saved = '\0';
+
+			if (slash) {
+				saved = *slash;
+				*slash = '\0';
+			}
+			ret = kasumi_vfs_path_lookup(
+				directory.dentry, directory.mnt, relative,
+				lookup_flags & ~(LOOKUP_FOLLOW |
+						 LOOKUP_NO_SYMLINKS), &probe);
+			if (slash)
+				*slash = saved;
+			if (ret) {
+				source->error = ret;
+				goto out_relative;
+			}
+			if (d_is_symlink(probe.dentry)) {
+				if (lookup_flags & LOOKUP_NO_SYMLINKS) {
+					kasumi_path_put(&probe);
+					source->error = -ELOOP;
+					goto out_relative;
+				}
+				if (!(final && !(lookup_flags & LOOKUP_FOLLOW))) {
+					if (lookup_flags & LOOKUP_CACHED) {
+						kasumi_path_put(&probe);
+						source->error = -EAGAIN;
+						goto out_relative;
+					}
+					ret = kasumi_read_link_target(
+						&probe, target, sizeof(target));
+					if (ret) {
+						kasumi_path_put(&probe);
+						if (lookup_flags &
+						    LOOKUP_NO_MAGICLINKS) {
+							source->error = -ELOOP;
+							goto out_relative;
+						}
+						goto lookup_full;
+					}
+					if (target[0] == '/' &&
+					    !(lookup_flags & LOOKUP_IN_ROOT)) {
+						const char *remaining = slash ? slash : "";
+
+						bool found;
+
+						kasumi_path_put(&probe);
+						kasumi_path_put(&directory);
+						found = kasumi_follow_absolute_link(
+							target, remaining, lookup_flags,
+							source, symlink_depth);
+						kfree(relative);
+						return found;
+					}
+				}
+			}
+			kasumi_path_put(&probe);
+			if (!slash)
+				break;
+			cursor = slash + 1;
+		}
+	}
+lookup_full:
+	ret = kasumi_vfs_path_lookup(directory.dentry, directory.mnt, relative,
+				     lookup_flags, &resolved);
+	if (ret) {
+		source->error = ret;
+		goto out_relative;
+	}
+	kasumi_path_put(&directory);
+	kfree(relative);
+	return kasumi_rule_source_from_path(&resolved, source);
+
+out_relative:
+	kasumi_path_put(&directory);
+	kfree(relative);
+	return false;
+}
+
+static bool KASUMI_NOCFI kasumi_rule_get_source_flags_depth(
+	const char *pathname, unsigned int lookup_flags,
+	struct kasumi_rule_source *source, unsigned int symlink_depth)
+{
+	struct kasumi_entry *entry;
+	struct path exact_link = {};
+	size_t path_len;
+	u32 hash;
+	pid_t pid;
+	bool found = false;
+	bool followed_exact_link = false;
+
+	if (unlikely(!kasumi_enabled || !pathname || !source ||
+		     !kasumi_policy_current_is_view_target()))
+		return false;
+	pid = task_tgid_vnr(current);
+	if (READ_ONCE(kasumi_daemon_pid) > 0 &&
+	    pid == READ_ONCE(kasumi_daemon_pid))
+		return false;
+	if (atomic_read(&kasumi_rule_count) == 0)
+		return false;
+	if (symlink_depth >= KASUMI_SYMLINK_LIMIT) {
+		source->error = -ELOOP;
+		return false;
+	}
+
+	path_len = strlen(pathname);
+	if (test_bit(jhash(pathname, (u32)path_len, 0) &
+		     (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom) &&
+	    test_bit(jhash(pathname, (u32)path_len, 1) &
+		     (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom)) {
+		hash = full_name_hash(NULL, pathname, path_len);
+		rcu_read_lock();
+		hlist_for_each_entry_rcu(entry,
+			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+			if (entry->src_hash != hash ||
+			    strcmp(entry->src, pathname) != 0)
+				continue;
+			if (entry->source_path_valid && entry->source_path.dentry &&
+			    entry->source_path.mnt) {
+				if (!(lookup_flags & LOOKUP_FOLLOW) &&
+				    entry->source_nofollow_path_valid) {
+					source->path = entry->source_nofollow_path;
+					source->stat = entry->source_nofollow_stat;
+					source->source_mode =
+						entry->source_nofollow_mode;
+					source->visible_ino =
+						entry->nofollow_visible_ino;
+					source->visible_dev =
+						entry->nofollow_visible_dev;
+					source->stat_valid =
+						entry->source_nofollow_stat_valid;
+					source->preserve_visible_metadata = false;
+				} else {
+					if ((lookup_flags & LOOKUP_NO_SYMLINKS) &&
+					    entry->source_nofollow_path_valid) {
+						source->error = -ELOOP;
+						break;
+					}
+					source->path = entry->source_path;
+					source->stat = entry->visible_stat;
+					source->source_mode = entry->source_mode;
+					source->visible_ino = entry->visible_ino;
+					source->visible_dev = entry->visible_dev;
+					source->stat_valid =
+						entry->visible_stat_valid;
+					source->preserve_visible_metadata =
+						entry->preserve_visible_metadata;
+					if (entry->source_nofollow_path_valid) {
+						exact_link =
+							entry->source_nofollow_path;
+						kasumi_path_get(&exact_link);
+						followed_exact_link = true;
+					}
+				}
+				kasumi_path_get(&source->path);
+				found = true;
+			}
+			break;
+		}
+		rcu_read_unlock();
+	}
+	if (found && !kasumi_rule_refresh_exact_source(source)) {
+		if (followed_exact_link)
+			kasumi_path_put(&exact_link);
+		return false;
+	}
+	if (found && followed_exact_link) {
+		char target[KSM_MAX_LEN_PATHNAME];
+		int ret = kasumi_read_link_target(&exact_link, target,
+						  sizeof(target));
+
+		kasumi_path_put(&exact_link);
+		if (ret) {
+			if (lookup_flags & LOOKUP_NO_MAGICLINKS) {
+				kasumi_path_put(&source->path);
+				source->error = -ELOOP;
+				return false;
+			}
+			return true;
+		}
+		if (target[0] == '/' && !(lookup_flags & LOOKUP_IN_ROOT)) {
+			struct kasumi_rule_source redirected = {};
+
+			if (kasumi_follow_absolute_link(target, "", lookup_flags,
+							&redirected,
+							symlink_depth)) {
+				kasumi_path_put(&source->path);
+				*source = redirected;
+				return true;
+			}
+			if (redirected.error) {
+				kasumi_path_put(&source->path);
+				source->error = redirected.error;
+				return false;
+			}
+		}
+	}
+	if (found || source->error)
+		return found;
+	return kasumi_directory_rule_source(pathname, path_len, lookup_flags,
+					    source, symlink_depth);
+}
+
+bool KASUMI_NOCFI kasumi_rule_get_source_flags(
+	const char *pathname, unsigned int lookup_flags,
+	struct kasumi_rule_source *source)
+{
+	if (source) {
+		source->error = 0;
+		source->preserve_visible_metadata = false;
+	}
+	return kasumi_rule_get_source_flags_depth(pathname, lookup_flags,
+						 source, 0);
+}
+
+bool kasumi_rule_get_source(const char *pathname,
+			    struct kasumi_rule_source *source)
+{
+	return kasumi_rule_get_source_flags(pathname, LOOKUP_FOLLOW, source);
+}
+
+static int kasumi_source_path_depth(const struct path *source,
+				    const struct path *root)
+{
+	struct dentry *cursor;
+	unsigned int depth = 0;
+
+	if (!source || !root || source->mnt != root->mnt ||
+	    !source->dentry || !root->dentry)
+		return -1;
+	cursor = source->dentry;
+	for (;;) {
+		struct dentry *parent;
+
+		if (cursor == root->dentry)
+			return (int)depth;
+		parent = READ_ONCE(cursor->d_parent);
+		if (!parent || parent == cursor || ++depth >= KSM_MAX_LEN_PATHNAME)
+			return -1;
+		cursor = parent;
+	}
+}
+
+static bool kasumi_compose_visible_path(const struct kasumi_entry *entry,
+					const struct path *source,
+					char *visible_path,
+					size_t visible_path_size)
+{
+	struct dentry *cursor = source->dentry;
+	char *end;
+	size_t relative_len;
+	size_t root_len;
+
+	if (!entry || !entry->src || !entry->source_path.dentry ||
+	    visible_path_size < 2)
+		return false;
+	end = visible_path + visible_path_size;
+	*--end = '\0';
+	while (cursor != entry->source_path.dentry) {
+		const unsigned char *name;
+		struct dentry *parent;
+		unsigned int name_len;
+
+		name_len = READ_ONCE(cursor->d_name.len);
+		name = READ_ONCE(cursor->d_name.name);
+		parent = READ_ONCE(cursor->d_parent);
+		if (!name || !name_len || !parent || parent == cursor ||
+		    (size_t)(end - visible_path) <= name_len)
+			return false;
+		end -= name_len;
+		memcpy(end, name, name_len);
+		*--end = '/';
+		cursor = parent;
+	}
+
+	root_len = strlen(entry->src);
+	relative_len = strlen(end);
+	if (root_len == 1 && entry->src[0] == '/' && relative_len) {
+		if (relative_len + 1 > visible_path_size)
+			return false;
+		memmove(visible_path, end, relative_len + 1);
+		return true;
+	}
+	if (root_len + relative_len + 1 > visible_path_size)
+		return false;
+	memmove(visible_path + root_len, end, relative_len + 1);
+	memcpy(visible_path, entry->src, root_len);
+	return true;
+}
+
+static bool kasumi_rule_get_visible_path_canonical(
+	const struct path *source, char *visible_path, size_t visible_path_size)
+{
+	struct kasumi_entry *entry;
+	char *source_buffer;
+	char *source_path;
+	size_t best_length = 0;
+	int bkt;
+	bool found = false;
+
+	if (!kasumi_d_absolute_path)
+		return false;
+	source_buffer = kmalloc(KSM_MAX_LEN_PATHNAME, GFP_ATOMIC);
+	if (!source_buffer)
+		return false;
+	source_path = kasumi_d_absolute_path(source, source_buffer,
+					     KSM_MAX_LEN_PATHNAME);
+	if (IS_ERR_OR_NULL(source_path) || source_path[0] != '/')
+		goto out;
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		size_t root_length;
+		const char *suffix;
+		size_t suffix_length;
+		size_t visible_root_length;
+
+		if (!entry->source_path_valid || !S_ISDIR(entry->source_mode) ||
+		    !entry->source_canonical)
+			continue;
+		root_length = strlen(entry->source_canonical);
+		if (root_length < best_length ||
+		    strncmp(source_path, entry->source_canonical, root_length) ||
+		    (!(root_length == 1 && entry->source_canonical[0] == '/') &&
+		     source_path[root_length] &&
+		     source_path[root_length] != '/'))
+			continue;
+		suffix = root_length == 1 && entry->source_canonical[0] == '/' ?
+			source_path : source_path + root_length;
+		suffix_length = strlen(suffix);
+		visible_root_length = strlen(entry->src);
+		if (visible_root_length == 1 && entry->src[0] == '/' &&
+		    suffix[0] == '/') {
+			if (suffix_length + 1 > visible_path_size)
+				continue;
+			memcpy(visible_path, suffix, suffix_length + 1);
+		} else {
+			if (visible_root_length + suffix_length + 1 >
+			    visible_path_size)
+				continue;
+			memcpy(visible_path, entry->src, visible_root_length);
+			memcpy(visible_path + visible_root_length, suffix,
+			       suffix_length + 1);
+		}
+		best_length = root_length;
+		found = true;
+	}
+	rcu_read_unlock();
+out:
+	kfree(source_buffer);
+	return found;
+}
+
+/* ---- Slice 4c-v2: pure-virtual directory topology rule-table queries ----- */
+
+int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
+					 struct path *leaf_src, umode_t *leaf_mode,
+					 unsigned long *leaf_ino)
+{
+	struct kasumi_entry *entry;
+	char *full;
+	size_t dlen, clen, full_len;
+	int kind = KASUMI_VPATH_NONE;
+	int bkt;
+
+	if (!dir || !child || !*child)
+		return KASUMI_VPATH_NONE;
+	dlen = strlen(dir);
+	clen = strlen(child);
+	full = kmalloc(dlen + 1 + clen + 1, GFP_KERNEL);
+	if (!full)
+		return KASUMI_VPATH_NONE;
+	memcpy(full, dir, dlen);
+	full[dlen] = '/';
+	memcpy(full + dlen + 1, child, clen);
+	full[dlen + 1 + clen] = '\0';
+	full_len = dlen + 1 + clen;
+
+	rcu_read_lock();
+	/* Exact rule at dir/child -> a leaf redirect. */
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		if (!entry->src || !entry->source_path_valid ||
+		    strcmp(entry->src, full) != 0)
+			continue;
+		if (entry->source_nofollow_path_valid) {
+			if (leaf_src) {
+				*leaf_src = entry->source_nofollow_path;
+				kasumi_path_get(leaf_src);
+			}
+			if (leaf_mode)
+				*leaf_mode = entry->source_nofollow_mode;
+			if (leaf_ino)
+				*leaf_ino = entry->nofollow_visible_ino;
+		} else {
+			if (leaf_src) {
+				*leaf_src = entry->source_path;
+				kasumi_path_get(leaf_src);
+			}
+			if (leaf_mode)
+				*leaf_mode = entry->source_mode;
+			if (leaf_ino)
+				*leaf_ino = entry->visible_ino;
+		}
+		kind = KASUMI_VPATH_LEAF;
+		break;
+	}
+	/* Otherwise, a prefix of some rule -> a deeper virtual directory. */
+	if (kind == KASUMI_VPATH_NONE) {
+		hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+			if (!entry->src)
+				continue;
+			if (strncmp(entry->src, full, full_len) == 0 &&
+			    entry->src[full_len] == '/') {
+				kind = KASUMI_VPATH_VDIR;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+	kfree(full);
+	return kind;
+}
+
+int KASUMI_NOCFI kasumi_rule_vpath_emit(const char *dir, struct list_head *out)
+{
+	struct kasumi_entry *entry;
+	size_t dlen;
+	int count = 0;
+	int bkt;
+
+	if (!dir || !out)
+		return 0;
+	dlen = strlen(dir);
+
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		const char *rest;
+		const char *slash;
+		size_t seg_len;
+		bool is_leaf;
+		bool dup = false;
+		struct kasumi_name_list *item, *ex;
+		umode_t m;
+
+		if (!entry->src)
+			continue;
+		if (strncmp(entry->src, dir, dlen) != 0 || entry->src[dlen] != '/')
+			continue;
+		rest = entry->src + dlen + 1;
+		if (!*rest)
+			continue;
+		slash = strchr(rest, '/');
+		seg_len = slash ? (size_t)(slash - rest) : strlen(rest);
+		if (!seg_len)
+			continue;
+		is_leaf = (slash == NULL);
+		list_for_each_entry(ex, out, list) {
+			if (strlen(ex->name) == seg_len &&
+			    memcmp(ex->name, rest, seg_len) == 0) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		item = kmalloc(sizeof(*item), GFP_ATOMIC);
+		if (!item)
+			continue;
+		item->name = kmalloc(seg_len + 1, GFP_ATOMIC);
+		if (!item->name) {
+			kfree(item);
+			continue;
+		}
+		memcpy(item->name, rest, seg_len);
+		item->name[seg_len] = '\0';
+		if (is_leaf) {
+			m = entry->source_nofollow_path_valid ?
+				entry->source_nofollow_mode : entry->source_mode;
+			item->type = (unsigned char)((m & S_IFMT) >> 12);
+			item->ino = entry->source_nofollow_path_valid ?
+				entry->nofollow_visible_ino : entry->visible_ino;
+		} else {
+			char *vpath = kmalloc(dlen + 1 + seg_len + 1, GFP_ATOMIC);
+
+			item->type = DT_DIR;
+			if (vpath) {
+				memcpy(vpath, dir, dlen);
+				vpath[dlen] = '/';
+				memcpy(vpath + dlen + 1, rest, seg_len);
+				vpath[dlen + 1 + seg_len] = '\0';
+				item->ino = kasumi_vnode_vpath_ino(vpath);
+				kfree(vpath);
+			} else {
+				item->ino = 0;
+			}
+		}
+		list_add_tail(&item->list, out);
+		count++;
+	}
+	rcu_read_unlock();
+	return count;
+}
+
+bool kasumi_rule_get_visible_path(const struct path *source,
+				  char *visible_path,
+				  size_t visible_path_size)
+{
+	struct kasumi_entry *best = NULL;
+	struct kasumi_entry *entry;
+	unsigned int best_depth = UINT_MAX;
+	int bkt;
+	bool found = false;
+
+	if (!source || !source->dentry || !source->mnt || !visible_path ||
+	    !visible_path_size || !READ_ONCE(kasumi_enabled) ||
+	    atomic_read(&kasumi_rule_count) == 0 ||
+	    !kasumi_policy_current_is_view_target())
+		return false;
+
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		int depth;
+
+		if (!entry->source_path_valid || !S_ISDIR(entry->source_mode))
+			continue;
+		depth = kasumi_source_path_depth(source, &entry->source_path);
+		if (depth < 0 || (unsigned int)depth >= best_depth)
+			continue;
+		best = entry;
+		best_depth = (unsigned int)depth;
+		if (!best_depth)
+			break;
+	}
+	if (best)
+		found = kasumi_compose_visible_path(best, source, visible_path,
+						    visible_path_size);
+	rcu_read_unlock();
+	return found || kasumi_rule_get_visible_path_canonical(
+				source, visible_path, visible_path_size);
+}
+
+static bool kasumi_visible_rule_prefix(const char *pathname, size_t length,
+				       bool directory_only)
+{
+	struct kasumi_entry *entry;
+	u32 hash;
+	bool found = false;
+
+	if (!test_bit(jhash(pathname, (u32)length, 0) &
+		      (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom) ||
+	    !test_bit(jhash(pathname, (u32)length, 1) &
+		      (KASUMI_BLOOM_SIZE - 1), kasumi_path_bloom))
+		return false;
+	hash = full_name_hash(NULL, pathname, length);
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(entry,
+		&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+		if (entry->src_hash != hash || strlen(entry->src) != length ||
+		    memcmp(entry->src, pathname, length) != 0 ||
+		    !entry->source_path_valid ||
+		    (directory_only && !S_ISDIR(entry->source_mode)))
+			continue;
+		found = true;
+		break;
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+bool kasumi_rule_path_is_virtual(const char *pathname)
+{
+	size_t prefix_len;
+	size_t path_len;
+	bool exact = true;
+
+	if (!pathname || pathname[0] != '/' || !READ_ONCE(kasumi_enabled) ||
+	    atomic_read(&kasumi_rule_count) == 0 ||
+	    !kasumi_policy_current_is_view_target())
+		return false;
+	path_len = strlen(pathname);
+	if (!path_len)
+		return false;
+	prefix_len = path_len;
+	for (;;) {
+		size_t slash;
+
+		if (kasumi_visible_rule_prefix(pathname, prefix_len, !exact))
+			return true;
+		if (prefix_len <= 1)
+			break;
+		slash = prefix_len;
+		while (slash > 0 && pathname[slash - 1] != '/')
+			slash--;
+		prefix_len = slash <= 1 ? 1 : slash - 1;
+		exact = false;
+	}
+	return false;
+}
+
 KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 {
 	struct kasumi_merge_entry *me;
@@ -433,7 +2017,8 @@ KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 	if (target)
 		return target;
 
-	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
+	if (unlikely(!kasumi_enabled || !pathname || !*pathname ||
+		     !kasumi_policy_current_is_view_target()))
 		return NULL;
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
@@ -539,7 +2124,6 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 
 bool kasumi_should_hide(const char *pathname)
 {
-	size_t len;
 	pid_t pid;
 
 	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
@@ -547,26 +2131,11 @@ bool kasumi_should_hide(const char *pathname)
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
 		return false;
-	if (kasumi_hide_rule_matches(pathname))
-		return true;
 	if (unlikely(kasumi_is_privileged_process()))
 		return false;
-	if (!kasumi_should_apply_hide_rules())
+	if (!kasumi_policy_current_is_view_target())
 		return false;
-
-	len = strlen(pathname);
-
-	/* Stealth: always hide the mirror device */
-	if (likely(kasumi_stealth_enabled)) {
-		size_t name_len = strlen(kasumi_current_mirror_name);
-		size_t path_len = strlen(kasumi_current_mirror_path);
-
-		if ((len == name_len && strcmp(pathname, kasumi_current_mirror_name) == 0) ||
-		    (len == path_len && strcmp(pathname, kasumi_current_mirror_path) == 0))
-			return true;
-	}
-
-	return false;
+	return kasumi_hide_rule_matches(pathname);
 }
 
 static bool __maybe_unused kasumi_should_replace(const char *pathname)
