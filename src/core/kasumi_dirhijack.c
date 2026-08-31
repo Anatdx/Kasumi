@@ -1294,7 +1294,7 @@ static KASUMI_NOCFI int kasumi_dh_register_vtopo(const char *visible_path)
 		qn.name = seg;
 		qn.len = (u32)seg_len;
 		qn.hash = full_name_hash(rpath.dentry, seg, seg_len);
-		cached = d_lookup(rpath.dentry, &qn);
+		cached = kasumi_d_lookup(rpath.dentry, &qn);
 		if (cached) {
 			d_drop(cached);
 			dput(cached);
@@ -1385,7 +1385,7 @@ kasumi_dh_register(const char *visible_path, const struct path *source,
 	qname.name = child;
 	qname.len = (u32)child_len;
 	qname.hash = full_name_hash(ppath.dentry, child, child_len);
-	cached = d_lookup(ppath.dentry, &qname);
+	cached = kasumi_d_lookup(ppath.dentry, &qname);
 	if (cached) {
 		d_drop(cached);
 		dput(cached);
@@ -1489,7 +1489,7 @@ KASUMI_NOCFI int kasumi_dirhijack_del(const char *visible_path)
 
 		/* A d_splice_alias path can leave more than one held dentry for the
 		 * same governed name.  Retire every matching shadow, not only the
-		 * object currently returned by d_lookup(). */
+		 * object currently returned by kasumi_d_lookup(). */
 			hash_for_each_safe(kasumi_dh_dops, bkt, htmp, dm, node) {
 			if (dm->dir == m->dir && dm->name_len == child_len &&
 			    dm->name_hash == full_name_hash(m->dir->dir_inode,
@@ -1513,7 +1513,7 @@ KASUMI_NOCFI int kasumi_dirhijack_del(const char *visible_path)
 		qname.name = child;
 		qname.len = (u32)child_len;
 		qname.hash = full_name_hash(ppath.dentry, child, child_len);
-		cached = d_lookup(ppath.dentry, &qname);
+		cached = kasumi_d_lookup(ppath.dentry, &qname);
 		if (cached) {
 			d_drop(cached);
 			dput(cached);

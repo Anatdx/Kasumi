@@ -170,6 +170,10 @@ extern ssize_t (*kasumi_vfs_write)(struct file *, const char __user *, size_t,
 extern char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 extern char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 extern char *(*kasumi_d_path)(const struct path *, char *, int);
+extern struct dentry *(*kasumi_d_lookup_ptr)(const struct dentry *,
+					     const struct qstr *);
+struct dentry *kasumi_d_lookup(const struct dentry *parent,
+			       const struct qstr *name);
 extern struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 extern void *kasumi_vfs_getxattr_addr;
 extern void *kasumi_vfs_listxattr_addr;

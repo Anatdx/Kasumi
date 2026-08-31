@@ -242,12 +242,17 @@ static int kasumi_resolve_runtime_symbols(void)
 		return -ENOENT;
 	}
 	kasumi_d_path = (void *)kasumi_lookup_callable("d_path");
+	kasumi_d_lookup_ptr = (void *)kasumi_lookup_callable("d_lookup");
 	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_callable("d_hash_and_lookup");
 	kasumi_path_get_ptr = (void *)kasumi_lookup_callable("path_get");
 	kasumi_path_put_ptr = (void *)kasumi_lookup_callable("path_put");
 	kasumi_free_inode_nonrcu_ptr = (void *)kasumi_lookup_callable("free_inode_nonrcu");
 	if (!kasumi_d_path)
 		pr_warn("Kasumi: d_path not found, path resolution in populate/merge/hide may fail\n");
+	if (!kasumi_d_lookup_ptr) {
+		pr_err("Kasumi: FATAL - d_lookup not found\n");
+		return -ENOENT;
+	}
 	if (!kasumi_d_hash_and_lookup)
 		pr_warn("Kasumi: d_hash_and_lookup not found, merge dedup and hide filter disabled\n");
 	if (!kasumi_path_get_ptr)

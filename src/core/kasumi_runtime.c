@@ -411,6 +411,8 @@ void (*kasumi_security_release_secctx)(char *, u32);
 char *(*kasumi_d_absolute_path)(const struct path *, char *, int);
 char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 char *(*kasumi_d_path)(const struct path *, char *, int);
+struct dentry *(*kasumi_d_lookup_ptr)(const struct dentry *,
+				      const struct qstr *);
 struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 void *kasumi_vfs_getxattr_addr;
 void *kasumi_vfs_listxattr_addr;
@@ -479,11 +481,17 @@ void (*kasumi_srcu_barrier_ptr)(struct srcu_struct *ssp);
 void (*kasumi_synchronize_rcu_tasks_ptr)(void);
 int (*kasumi_module_refcount_ptr)(struct module *module);
 
-/* Avoid a load-time dependency on a GKI-trimmed export. */
+/* Avoid load-time dependencies on GKI-trimmed exports. */
 noinline KASUMI_NOCFI struct llist_node *
 kasumi_llist_del_first(struct llist_head *head)
 {
 	return kasumi_llist_del_first_ptr(head);
+}
+
+noinline KASUMI_NOCFI struct dentry *
+kasumi_d_lookup(const struct dentry *parent, const struct qstr *name)
+{
+	return kasumi_d_lookup_ptr(parent, name);
 }
 
 noinline KASUMI_NOCFI ssize_t kasumi_seq_read_iter(
