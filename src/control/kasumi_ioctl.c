@@ -775,6 +775,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		else
 			kasumi_feature_enabled_mask &= ~KSM_FEATURE_MOUNT_HIDE;
 		kasumi_fake_mi_invalidate_all();
+		kasumi_log("mount hide %s\n", a.enable ? "enabled" : "disabled");
 		/* path_pattern reserved for future custom hide rules */
 		return 0;
 	}
@@ -794,6 +795,9 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			return -EOPNOTSUPP;
 		WRITE_ONCE(kasumi_mount_hide_mode, mode);
 		kasumi_fake_mi_invalidate_all();
+		kasumi_log("mount hide mode: %s\n",
+			   mode == KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
+			   "aggressive" : "normal");
 		return 0;
 	}
 
@@ -929,7 +933,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		/* mountinfo/mounts hide */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: fd_install fop proxy\n");
+				     "mountinfo/mounts: fd-install fop proxy\n");
 		else if (kasumi_mount_hide_vfsmnt_registered && kasumi_mount_hide_mountinfo_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
 				     "mountinfo/mounts: kprobe (show_mountinfo, show_vfsmnt)\n");
@@ -962,7 +966,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		/* maps spoof */
 		if (kasumi_proc_proxy_registered)
 			n = scnprintf(kbuf + written, buf_size - written,
-				     "maps: fd_install fop proxy\n");
+				     "maps: fd-install fop proxy\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "maps: none\n");
 		written += n;

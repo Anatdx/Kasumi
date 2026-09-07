@@ -137,9 +137,13 @@ enum kasumi_proc_proxy_kind {
 #define KASUMI_PROXY_STATE_OPEN      0
 #define KASUMI_PROXY_STATE_RELEASED  1
 
+typedef int (*kasumi_proc_mount_show_fn)(struct seq_file *,
+					 struct vfsmount *);
+
 struct kasumi_mount_file_proxy {
 	const struct file_operations *orig_fops;
 	struct file_operations proxy_fops;
+	kasumi_proc_mount_show_fn orig_mount_show;
 	enum kasumi_proc_proxy_kind kind;
 	enum kasumi_policy_scope scope;
 	fmode_t orig_f_mode;
@@ -185,9 +189,6 @@ static struct kasumi_canonical_observer_view
 	kasumi_canonical_observers[KASUMI_CANONICAL_OBSERVERS];
 static DEFINE_MUTEX(kasumi_canonical_observers_lock);
 
-typedef int (*kasumi_proc_mount_show_fn)(struct seq_file *,
-					 struct vfsmount *);
-
 /* Stable prefix of fs/mount.h::proc_mounts on Android 12/5.10 through
  * Android 16/6.12.  Older kernels append a cursor; only this prefix is used. */
 struct kasumi_proc_mounts_prefix {
@@ -196,15 +197,45 @@ struct kasumi_proc_mounts_prefix {
 	kasumi_proc_mount_show_fn show;
 };
 
-static kasumi_proc_mount_show_fn kasumi_show_mountinfo;
-static kasumi_proc_mount_show_fn kasumi_show_vfsmnt;
+static kasumi_proc_mount_show_fn kasumi_show_mountinfo_raw;
+static kasumi_proc_mount_show_fn kasumi_show_vfsmnt_raw;
+
+/* The old Clang CFI kernels used by Android 12/5.10 through Android 14/5.15
+ * require an address-taken callback to enter through its CFI jump table.  The
+ * raw show_* bodies resolved for kprobes are therefore not valid values for
+ * proc_mounts->show.  Keep the callback itself module-owned (so Clang emits
+ * the correct typed thunk) and make only its outbound raw call CFI-free.
+ *
+ * This also avoids opening another proc file to discover a kernel thunk.  The
+ * only proc file touched is the caller's already-open, fd-install-bound file,
+ * so lazy first-read timing and the open-bound namespace/root remain intact.
+ */
+static KASUMI_NOCFI int kasumi_show_mountinfo_bridge(struct seq_file *seq,
+						      struct vfsmount *mnt)
+{
+	if (!kasumi_show_mountinfo_raw)
+		return -EOPNOTSUPP;
+	return kasumi_show_mountinfo_raw(seq, mnt);
+}
+
+static KASUMI_NOCFI int kasumi_show_vfsmnt_bridge(struct seq_file *seq,
+						   struct vfsmount *mnt)
+{
+	if (!kasumi_show_vfsmnt_raw)
+		return -EOPNOTSUPP;
+	return kasumi_show_vfsmnt_raw(seq, mnt);
+}
 
 static struct kprobe kasumi_kp_fd_install;
+static struct kprobe kasumi_kp_internal_fd_install;
 static bool kasumi_fd_install_registered;
+static bool kasumi_internal_fd_install_registered;
 static u32 kasumi_ns_id_seed;
 static int kasumi_mount_proxy_install_file(
 	struct file *file, enum kasumi_proc_proxy_kind kind,
 	enum kasumi_policy_scope scope);
+static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode,
+						   struct file *file);
 
 struct kasumi_vfs_readlink_ri_data {
 	char __user *buffer;
@@ -368,10 +399,38 @@ kasumi_proc_proxy_kind_for_file(struct file *file,
 	return KASUMI_PROC_PROXY_NONE;
 }
 
-static int kasumi_fd_install_pre(struct kprobe *kp, struct pt_regs *regs)
+static void kasumi_fd_install_file(struct file *file)
 {
 	enum kasumi_proc_proxy_kind kind;
 	enum kasumi_policy_scope scope;
+	const struct file_operations *fops;
+
+	if (!READ_ONCE(kasumi_enabled))
+		return;
+	if (kasumi_fake_mi_is_internal_read())
+		return;
+	fops = file ? READ_ONCE(file->f_op) : NULL;
+	if (!fops || READ_ONCE(fops->release) == kasumi_mount_proxy_release)
+		return;
+	/* The fd-install ingress normally receives a private, freshly opened file.
+	 * Refuse an already-shared object rather than replacing f_op for other
+	 * holders.
+	 */
+	if (file_count(file) != 1)
+		return;
+	kind = kasumi_proc_proxy_kind_for_file(file, &scope);
+	if (kind == KASUMI_PROC_PROXY_NONE)
+		return;
+	/* The freshly opened file has not been published yet. Installing
+	 * its proxy here avoids an fd-reuse window and needs no sleeping path
+	 * lookup; procfs magic plus the final dentry name already identify every
+	 * supported view.
+	 */
+	(void)kasumi_mount_proxy_install_file(file, kind, scope);
+}
+
+static int kasumi_fd_install_pre(struct kprobe *kp, struct pt_regs *regs)
+{
 	struct file *file;
 
 	(void)kp;
@@ -382,24 +441,27 @@ static int kasumi_fd_install_pre(struct kprobe *kp, struct pt_regs *regs)
 #else
 	return 0;
 #endif
-	if (!READ_ONCE(kasumi_enabled))
-		return 0;
-	if (kasumi_fake_mi_is_internal_read())
-		return 0;
-	/* fd_install normally receives a private, freshly opened file. Refuse an
-	 * already-shared object rather than replacing f_op for other holders.
-	 */
-	if (file_count(file) != 1)
-		return 0;
-	kind = kasumi_proc_proxy_kind_for_file(file, &scope);
-	if (kind == KASUMI_PROC_PROXY_NONE)
-		return 0;
-	/* fd_install has not published this freshly opened file yet. Installing
-	 * its proxy here avoids an fd-reuse window and needs no sleeping path
-	 * lookup; procfs magic plus the final dentry name already identify every
-	 * supported view.
-	 */
-	(void)kasumi_mount_proxy_install_file(file, kind, scope);
+	kasumi_fd_install_file(file);
+	return 0;
+}
+
+/* Android 12/13 5.10 LTO calls __fd_install(files, fd, file) directly from
+ * do_sys_openat2(), bypassing the public fd_install() wrapper entirely.
+ */
+static int kasumi_internal_fd_install_pre(struct kprobe *kp,
+					  struct pt_regs *regs)
+{
+	struct file *file;
+
+	(void)kp;
+#if defined(__aarch64__)
+	file = (struct file *)regs->regs[2];
+#elif defined(__x86_64__)
+	file = (struct file *)regs->dx;
+#else
+	return 0;
+#endif
+	kasumi_fd_install_file(file);
 	return 0;
 }
 
@@ -734,14 +796,11 @@ kasumi_mount_proxy_proc_mounts(struct file *file)
 	struct seq_file *seq;
 	struct kasumi_proc_mounts_prefix *p;
 
-	if (!file || !file->private_data || !kasumi_show_mountinfo ||
-	    !kasumi_show_vfsmnt)
+	if (!file || !file->private_data)
 		return NULL;
 	seq = file->private_data;
 	p = seq->private;
 	if (!p || !p->ns || !p->root.dentry || !p->root.mnt || !p->show)
-		return NULL;
-	if (p->show != kasumi_show_mountinfo && p->show != kasumi_show_vfsmnt)
 		return NULL;
 	return p;
 }
@@ -1065,7 +1124,7 @@ static int kasumi_mount_proxy_produce_whole(
 		ret = -EOPNOTSUPP;
 		goto fail;
 	}
-	orig_show = READ_ONCE(pm->show);
+	orig_show = proxy->orig_mount_show;
 
 	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO ||
 	    proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
@@ -1078,10 +1137,11 @@ static int kasumi_mount_proxy_produce_whole(
 		size_t mounts_len = 0;
 		int attempt;
 
-		if ((proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO &&
-		     orig_show != kasumi_show_mountinfo) ||
-		    (proxy->kind == KASUMI_PROC_PROXY_MOUNTS &&
-		     orig_show != kasumi_show_vfsmnt)) {
+		/* Fd installation captured the kernel's exact canonical callback without
+		 * opening or reading a second proc file.  It must still be installed
+		 * before the first lazy render starts.
+		 */
+		if (!orig_show || READ_ONCE(pm->show) != orig_show) {
 			ret = -EIO;
 			goto fail;
 		}
@@ -1108,7 +1168,7 @@ static int kasumi_mount_proxy_produce_whole(
 			event_before = READ_ONCE(seq->poll_event);
 
 			ret = kasumi_mount_proxy_reset_seq(
-				proxy, file, kasumi_show_mountinfo);
+				proxy, file, kasumi_show_mountinfo_bridge);
 			if (ret)
 				break;
 			ret = kasumi_mount_proxy_slurp_orig(proxy, file);
@@ -1161,7 +1221,7 @@ static int kasumi_mount_proxy_produce_whole(
 			memcpy(pair_mountinfo, proxy->stream_raw, pair_mountinfo_len);
 
 			ret = kasumi_mount_proxy_reset_seq(
-				proxy, file, kasumi_show_vfsmnt);
+				proxy, file, kasumi_show_vfsmnt_bridge);
 			if (ret)
 				break;
 			ret = kasumi_mount_proxy_slurp_orig(proxy, file);
@@ -1259,11 +1319,6 @@ static ssize_t kasumi_mount_proxy_serve_whole(
 		return -EINVAL;
 	if (!count)
 		return 0;
-
-	/* Keep the reader-ns g_cache fresh for the atomic consumers (cp_statx
-	 * mnt_id projection etc.), preserving the side effect the old
-	 * fake_mi_serve/mounts-prepare path had. Sleepable; outside stream_lock. */
-	kasumi_fake_mi_prepare(false);
 
 	mutex_lock(&proxy->stream_lock);
 	if (proxy->stream_failed || *ppos != proxy->stream_user_pos) {
@@ -1526,11 +1581,8 @@ static KASUMI_NOCFI loff_t kasumi_mount_proxy_llseek(struct file *file,
 		return -ESPIPE;
 	mutex_lock(&proxy->stream_lock);
 	if (whence == SEEK_SET && offset == 0) {
-		kasumi_proc_mount_show_fn show =
-			proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO ?
-			kasumi_show_mountinfo : kasumi_show_vfsmnt;
-
-		ret = kasumi_mount_proxy_restore_seq(proxy, file, show);
+		ret = kasumi_mount_proxy_restore_seq(
+			proxy, file, proxy->orig_mount_show);
 		if (ret)
 			goto out;
 		proxy->stream_raw_len = 0;
@@ -1613,6 +1665,7 @@ static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode, struct f
 	struct kasumi_mount_file_proxy *proxy =
 		container_of(file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
 	const struct file_operations *orig_fops = proxy->orig_fops;
+	struct kasumi_proc_mounts_prefix *pm;
 	int ret = 0;
 	int srcu_idx;
 
@@ -1624,6 +1677,11 @@ static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode, struct f
 	atomic_dec(&kasumi_proxy_live);
 
 	WRITE_ONCE(file->f_mode, proxy->orig_f_mode);
+	if (proxy->orig_mount_show) {
+		pm = kasumi_mount_proxy_proc_mounts(file);
+		if (pm)
+			WRITE_ONCE(pm->show, proxy->orig_mount_show);
+	}
 	if (orig_fops->release)
 		ret = orig_fops->release(inode, file);
 
@@ -1643,8 +1701,10 @@ static int kasumi_mount_proxy_install_file(
 	enum kasumi_policy_scope scope)
 {
 	struct kasumi_mount_file_proxy *proxy;
+	struct kasumi_proc_mounts_prefix *pm = NULL;
 	const struct file_operations *orig_fops;
 	const struct file_operations *new_fops;
+	kasumi_proc_mount_show_fn orig_mount_show = NULL;
 	if (!file || kind == KASUMI_PROC_PROXY_NONE ||
 	    atomic_read(&kasumi_proxy_shutdown))
 		return -ESHUTDOWN;
@@ -1656,6 +1716,20 @@ static int kasumi_mount_proxy_install_file(
 	    scope != KASUMI_POLICY_SCOPE_VIEW &&
 	    scope != KASUMI_POLICY_SCOPE_SPOOF)
 		return -EINVAL;
+	if (kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	    kind == KASUMI_PROC_PROXY_MOUNTS) {
+		/* Passive capture only: @file is the caller's completed proc open at
+		 * fd installation.  Never open/read another proc file to discover this
+		 * canonical CFI callback, which would advance observable timing.
+		 */
+		pm = kasumi_mount_proxy_proc_mounts(file);
+		if (!pm)
+			return -EOPNOTSUPP;
+		orig_mount_show = READ_ONCE(pm->show);
+		if (!orig_mount_show ||
+		    !kasumi_valid_kernel_addr((unsigned long)orig_mount_show))
+			return -EOPNOTSUPP;
+	}
 	orig_fops = READ_ONCE(file->f_op);
 	if (!orig_fops || orig_fops->release == kasumi_mount_proxy_release)
 		return -EALREADY;
@@ -1664,6 +1738,7 @@ static int kasumi_mount_proxy_install_file(
 		return -ENOMEM;
 
 	proxy->orig_fops = orig_fops;
+	proxy->orig_mount_show = orig_mount_show;
 	proxy->kind = kind;
 	proxy->scope = scope;
 	proxy->orig_f_mode = READ_ONCE(file->f_mode);
@@ -1701,7 +1776,7 @@ static int kasumi_mount_proxy_install_file(
 	proxy->stream_failed = false;
 
 	spin_lock(&kasumi_proxy_list_lock);
-	/* fd_install has not published file yet, but keep this comparison under
+	/* Fd installation has not published file yet, but keep this comparison under
 	 * the same lock as list publication so duplicate installers cannot
 	 * overwrite and leak one another.
 	 */
@@ -2132,7 +2207,10 @@ static int kasumi_cp_statx_pre(struct kprobe *kp, struct pt_regs *regs)
 void kasumi_proc_read_hooks_init(void)
 {
 	unsigned long readlink_addr = kasumi_lookup_name("vfs_readlink");
-	unsigned long fd_install_addr = kasumi_lookup_name("fd_install");
+	unsigned long fd_install_addr =
+		kasumi_lookup_name_quiet("fd_install");
+	unsigned long internal_fd_install_addr =
+		kasumi_lookup_name_quiet("__fd_install");
 	unsigned long cp_statx_addr = kasumi_lookup_name("cp_statx");
 	unsigned long caps_addr = kasumi_lookup_name("get_vfs_caps_from_disk");
 	unsigned long show_vfsmnt_addr = kasumi_lookup_name("show_vfsmnt");
@@ -2141,10 +2219,15 @@ void kasumi_proc_read_hooks_init(void)
 
 	atomic_set(&kasumi_proxy_shutdown, 0);
 	atomic_set(&kasumi_proxy_live, 0);
-	kasumi_show_vfsmnt = (kasumi_proc_mount_show_fn)show_vfsmnt_addr;
-	kasumi_show_mountinfo = (kasumi_proc_mount_show_fn)show_mountinfo_addr;
-	if (!kasumi_show_vfsmnt || !kasumi_show_mountinfo)
-		pr_warn("Kasumi: proc mount pair snapshot callbacks unavailable\n");
+	/* Raw bodies are kprobe targets and NOCFI bridge delegates only.  Never
+	 * store them directly in proc_mounts->show on old jump-table CFI kernels.
+	 */
+	kasumi_show_vfsmnt_raw =
+		(kasumi_proc_mount_show_fn)show_vfsmnt_addr;
+	kasumi_show_mountinfo_raw =
+		(kasumi_proc_mount_show_fn)show_mountinfo_addr;
+	if (!kasumi_show_vfsmnt_raw || !kasumi_show_mountinfo_raw)
+		pr_warn("Kasumi: proc mount render callbacks unavailable\n");
 	kasumi_ns_id_seed = (u32)(unsigned long)&kasumi_krp_vfs_readlink ^
 			    (u32)((unsigned long)&kasumi_krp_vfs_readlink >> 32);
 
@@ -2193,22 +2276,45 @@ void kasumi_proc_read_hooks_init(void)
 		pr_warn("Kasumi: get_vfs_caps_from_disk not found, redirected fscaps disabled\n");
 	}
 
-	if (fd_install_addr) {
-		kasumi_kp_fd_install.addr = (kprobe_opcode_t *)fd_install_addr;
-		kasumi_kp_fd_install.pre_handler = kasumi_fd_install_pre;
-		if (!register_kprobe(&kasumi_kp_fd_install)) {
-			kasumi_fd_install_registered = true;
-			use_proxy_filter = true;
-		} else {
-			pr_warn("Kasumi: register_kprobe(fd_install) failed\n");
+	if (kasumi_show_vfsmnt_raw && kasumi_show_mountinfo_raw) {
+		if (internal_fd_install_addr) {
+			kasumi_kp_internal_fd_install.addr =
+				(kprobe_opcode_t *)internal_fd_install_addr;
+			kasumi_kp_internal_fd_install.pre_handler =
+				kasumi_internal_fd_install_pre;
+			if (!register_kprobe(&kasumi_kp_internal_fd_install)) {
+				kasumi_internal_fd_install_registered = true;
+				use_proxy_filter = true;
+			} else {
+				pr_warn("Kasumi: register_kprobe(__fd_install) failed\n");
+			}
 		}
+		if (fd_install_addr) {
+			kasumi_kp_fd_install.addr =
+				(kprobe_opcode_t *)fd_install_addr;
+			kasumi_kp_fd_install.pre_handler = kasumi_fd_install_pre;
+			if (!register_kprobe(&kasumi_kp_fd_install)) {
+				kasumi_fd_install_registered = true;
+				use_proxy_filter = true;
+			} else {
+				pr_warn("Kasumi: register_kprobe(fd_install) failed\n");
+			}
+		}
+		if (!internal_fd_install_addr && !fd_install_addr)
+			pr_warn("Kasumi: no fd-install ingress found\n");
 	} else {
-		pr_warn("Kasumi: fd_install not found\n");
+		pr_warn("Kasumi: proc fd proxy disabled without both mount render callbacks\n");
 	}
 
 	if (use_proxy_filter) {
 		kasumi_proc_proxy_registered = 1;
-		pr_info("Kasumi: proc views filtered by fd_install fop proxy\n");
+		if (kasumi_internal_fd_install_registered &&
+		    kasumi_fd_install_registered)
+			pr_info("Kasumi: proc views filtered by __fd_install+fd_install fop proxy\n");
+		else if (kasumi_internal_fd_install_registered)
+			pr_info("Kasumi: proc views filtered by __fd_install fop proxy\n");
+		else
+			pr_info("Kasumi: proc views filtered by fd_install fop proxy\n");
 	}
 
 	if (!use_proxy_filter) {
@@ -2239,6 +2345,10 @@ void kasumi_proc_read_hooks_init(void)
 void kasumi_proc_read_hooks_stop_new(void)
 {
 	atomic_set(&kasumi_proxy_shutdown, 1);
+	if (kasumi_internal_fd_install_registered) {
+		unregister_kprobe(&kasumi_kp_internal_fd_install);
+		kasumi_internal_fd_install_registered = false;
+	}
 	if (kasumi_fd_install_registered) {
 		unregister_kprobe(&kasumi_kp_fd_install);
 		kasumi_fd_install_registered = false;
@@ -2292,6 +2402,6 @@ void kasumi_proc_read_hooks_exit(void)
 	}
 
 	kasumi_canonical_observers_clear();
-	kasumi_show_mountinfo = NULL;
-	kasumi_show_vfsmnt = NULL;
+	kasumi_show_mountinfo_raw = NULL;
+	kasumi_show_vfsmnt_raw = NULL;
 }
